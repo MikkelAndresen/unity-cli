@@ -6,7 +6,7 @@ using UnityEngine;
 
 namespace UnityCliConnector.Tools
 {
-    [UnityCliTool(Name = "screenshot", Description = "Capture a screenshot of the Unity editor. Views: scene, game.")]
+    [UnityCliTool(Name = "screenshot", Description = "Capture a screenshot of the Unity editor. Views: scene, game.", SkipCompilationGate = true)]
     public static class EditorScreenshot
     {
         private const int DefaultWidth = 1920;

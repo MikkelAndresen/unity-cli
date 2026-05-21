@@ -8,7 +8,7 @@ using UnityEngine;
 
 namespace UnityCliConnector.Tools
 {
-    [UnityCliTool(Name = "profiler", Description = "Control Unity Profiler. Actions: hierarchy, enable, disable, status, clear.")]
+    [UnityCliTool(Name = "profiler", Description = "Control Unity Profiler. Actions: hierarchy, enable, disable, status, clear.", SkipCompilationGate = true)]
     public static class ManageProfiler
     {
         public class Parameters

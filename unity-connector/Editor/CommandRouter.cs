@@ -1,4 +1,5 @@
 using System;
+using System.Reflection;
 using System.Threading;
 using System.Threading.Tasks;
 using Newtonsoft.Json.Linq;
@@ -36,6 +37,17 @@ namespace UnityCliConnector
             var handler = ToolDiscovery.FindHandler(command);
             if (handler == null)
                 return new ErrorResponse($"Unknown command: {command}");
+
+            // Central compilation gate: short-circuit when the editor has compile
+            // errors so individual tools don't need to repeat the check. Tools
+            // that must remain callable in a broken state opt out via
+            // [UnityCliTool(SkipCompilationGate = true)].
+            var toolAttr = handler.DeclaringType?.GetCustomAttribute<UnityCliToolAttribute>();
+            if (toolAttr is { SkipCompilationGate: false })
+            {
+                var gate = CompilationGate.CheckOrNull(parameters);
+                if (gate != null) return gate;
+            }
 
             try
             {

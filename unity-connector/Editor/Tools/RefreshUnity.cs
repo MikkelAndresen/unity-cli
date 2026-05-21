@@ -7,7 +7,7 @@ using UnityEngine.SceneManagement;
 
 namespace UnityCliConnector.Tools
 {
-    [UnityCliTool(Description = "Refresh Unity assets and optionally request script compilation.")]
+    [UnityCliTool(Description = "Refresh Unity assets and optionally request script compilation.", SkipCompilationGate = true)]
     public static class RefreshUnity
     {
         public class Parameters

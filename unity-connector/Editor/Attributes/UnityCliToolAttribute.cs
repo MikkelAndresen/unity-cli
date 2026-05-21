@@ -13,6 +13,13 @@ namespace UnityCliConnector
         public string Description { get; set; } = "";
         public string Name { get; set; }
         public string Group { get; set; } = "";
+
+        /// When true, CommandRouter skips the compilation gate for this tool — the
+        /// handler runs even if the editor has outstanding compile errors. Use for
+        /// diagnostic tools (read_console, compile_errors, …) that must remain
+        /// callable in a broken state. Callers can still force-skip per call via
+        /// the `skip_compile_check` parameter.
+        public bool SkipCompilationGate { get; set; }
     }
 
     /// <summary>

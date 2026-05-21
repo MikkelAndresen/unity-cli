@@ -8,7 +8,7 @@ using UnityEngine;
 
 namespace UnityCliConnector.Tools
 {
-    [UnityCliTool(Name = "console", Description = "Read or clear Unity console logs.")]
+    [UnityCliTool(Name = "console", Description = "Read or clear Unity console logs.", SkipCompilationGate = true)]
     public static class ReadConsole
     {
         private static MethodInfo _startGettingEntriesMethod, _endGettingEntriesMethod, _clearMethod, _getCountMethod, _getEntryMethod;
