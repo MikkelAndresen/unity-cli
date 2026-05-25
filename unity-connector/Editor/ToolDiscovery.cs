@@ -3,15 +3,43 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Reflection;
 using Newtonsoft.Json.Linq;
+using UnityEditor.Compilation;
+using Assembly = System.Reflection.Assembly;
 
 namespace UnityCliConnector
 {
     /// <summary>
     /// Finds [UnityCliTool] handlers on demand via reflection.
-    /// No caching, no registration — every call scans live.
+    ///
+    /// Discovery is restricted to assemblies whose sources live entirely under
+    /// Packages/ — i.e. tools shipped in a package, not in the project's
+    /// /Assets tree. A coding agent with RW on /Assets cannot author a new
+    /// [UnityCliTool] and have it become callable.
     /// </summary>
     public static class ToolDiscovery
     {
+        // Asmdef names whose sources are all under Packages/. Built lazily; the
+        // editor resets statics on domain reload, which is also when new
+        // packages become discoverable, so the cache naturally invalidates.
+        static HashSet<string> s_TrustedAssemblyNames;
+
+        static bool IsTrustedAssembly(Assembly assembly)
+        {
+            if (s_TrustedAssemblyNames == null)
+            {
+                s_TrustedAssemblyNames = new HashSet<string>(StringComparer.Ordinal);
+                foreach (var a in CompilationPipeline.GetAssemblies(AssembliesType.Editor))
+                {
+                    if (a.sourceFiles == null || a.sourceFiles.Length == 0) continue;
+                    bool allUnderPackages = a.sourceFiles.All(p =>
+                        p.StartsWith("Packages/", StringComparison.Ordinal) ||
+                        p.StartsWith("Packages\\", StringComparison.Ordinal));
+                    if (allUnderPackages) s_TrustedAssemblyNames.Add(a.name);
+                }
+            }
+            return s_TrustedAssemblyNames.Contains(assembly.GetName().Name);
+        }
+
         public static MethodInfo FindHandler(string command)
         {
             MethodInfo found = null;
@@ -19,6 +47,8 @@ namespace UnityCliConnector
 
             foreach (var assembly in AppDomain.CurrentDomain.GetAssemblies())
             {
+                if (!IsTrustedAssembly(assembly)) continue;
+
                 Type[] types;
                 try { types = assembly.GetTypes(); }
                 catch (ReflectionTypeLoadException) { continue; }
@@ -61,6 +91,8 @@ namespace UnityCliConnector
 
             foreach (var assembly in AppDomain.CurrentDomain.GetAssemblies())
             {
+                if (!IsTrustedAssembly(assembly)) continue;
+
                 Type[] types;
                 try { types = assembly.GetTypes(); }
                 catch (ReflectionTypeLoadException) { continue; }
