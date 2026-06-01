@@ -187,5 +187,45 @@ namespace UnityCliConnector.Tools
             if ((mode & WarningMask) != 0) return LogType.Warning;
             return LogType.Log;
         }
+
+        /// Reflection seam for other connector code that needs to iterate the
+        /// in-memory editor console without duplicating the LogEntries binding.
+        /// Returns false when reflection is unavailable (init failed); the visitor
+        /// receives (mode, message, file, line) for each entry. StartGettingEntries
+        /// / EndGettingEntries are paired by this method.
+        internal static bool TryForEachEntry(Action<int, string, string, int> visitor)
+        {
+            if (visitor == null) throw new ArgumentNullException(nameof(visitor));
+            if (_startGettingEntriesMethod == null || _endGettingEntriesMethod == null ||
+                _getCountMethod == null || _getEntryMethod == null ||
+                _modeField == null || _messageField == null || _logEntryType == null)
+                return false;
+
+            try
+            {
+                _startGettingEntriesMethod.Invoke(null, null);
+                int total = (int)_getCountMethod.Invoke(null, null);
+                object logEntry = Activator.CreateInstance(_logEntryType);
+                for (int i = 0; i < total; i++)
+                {
+                    _getEntryMethod.Invoke(null, new object[] { i, logEntry });
+                    int mode = (int)_modeField.GetValue(logEntry);
+                    string message = _messageField.GetValue(logEntry) as string;
+                    string file = _fileField?.GetValue(logEntry) as string;
+                    int line = _lineField != null ? (int)_lineField.GetValue(logEntry) : 0;
+                    visitor(mode, message, file, line);
+                }
+                return true;
+            }
+            finally
+            {
+                try { _endGettingEntriesMethod.Invoke(null, null); } catch { }
+            }
+        }
+
+        internal static bool IsReflectionAvailable =>
+            _startGettingEntriesMethod != null && _endGettingEntriesMethod != null &&
+            _getCountMethod != null && _getEntryMethod != null &&
+            _modeField != null && _messageField != null && _logEntryType != null;
     }
 }
