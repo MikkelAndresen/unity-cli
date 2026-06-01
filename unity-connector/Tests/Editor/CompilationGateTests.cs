@@ -220,12 +220,33 @@ namespace UnityCliConnector.Tests
         }
 
         [Test]
+        public void TryConvertEntry_StickyError_Bit_Converts()
+        {
+            // The persistent "All compiler errors have to be fixed…" banner is a
+            // StickyError, not a ScriptCompileError. It still means the editor has
+            // unresolved compile failures, so the gate must treat it as blocking.
+            var ok = ConsoleLogEntries.TryConvertEntry(
+                mode: ConsoleLogEntries.StickyErrorMask,
+                message: "All compiler errors have to be fixed before you can enter play mode!",
+                file: null, line: 0, includeWarnings: false, out var diag);
+
+            Assert.IsTrue(ok, "sticky compile-error banner should be treated as a compile error");
+            Assert.AreEqual("error", diag.Severity);
+        }
+
+        [Test]
         public void TryConvertEntry_NonCompileMode_Rejected()
         {
-            // Runtime LogType.Error bit (1 << 0) — not a ScriptCompileError.
+            // Runtime LogType.Error bit (1 << 0) — not a ScriptCompileError. Also
+            // covers ScriptingError (1 << 8), the bit Debug.LogError sets, which we
+            // intentionally keep OUT of CompileBlockingMask.
             Assert.IsFalse(ConsoleLogEntries.TryConvertEntry(
                 mode: 1 << 0, message: "runtime error", file: null, line: 0,
                 includeWarnings: true, out _));
+            Assert.IsFalse(ConsoleLogEntries.TryConvertEntry(
+                mode: 1 << 8, message: "Debug.LogError text", file: null, line: 0,
+                includeWarnings: true, out _),
+                "ScriptingError (Debug.LogError) must not trip the compilation gate");
         }
 
         [Test]

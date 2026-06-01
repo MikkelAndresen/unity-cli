@@ -19,6 +19,17 @@ namespace UnityCliConnector
 		public const int ScriptCompileErrorMask = 1 << 11;
 		public const int ScriptCompileWarningMask = 1 << 12;
 
+		// Sticky errors — most notably the persistent "All compiler errors have to
+		// be fixed before you can enter play mode!" banner — flag unresolved compile
+		// failures even when the per-error ScriptCompileError entries are no longer
+		// the live console selection. Mirrors ReadConsole.ErrorMask's StickyError bit.
+		// We deliberately do NOT fold in ScriptingError (1<<8): that bit is also set
+		// by runtime Debug.LogError, which must not trip a *compilation* gate.
+		public const int StickyErrorMask = 1 << 13;
+
+		// What the console fallback treats as a compile-blocking error.
+		internal const int CompileBlockingMask = ScriptCompileErrorMask | StickyErrorMask;
+
 		// Internal seam for unit tests: when set, bypasses reflection entirely and
 		// returns the supplied diagnostics. Production code must not set this.
 		internal static Func<bool, List<CompileDiag>> TestOverride;
@@ -57,7 +68,7 @@ namespace UnityCliConnector
 			bool includeWarnings, out CompileDiag diag)
 		{
 			diag = default;
-			var isError = (mode & ScriptCompileErrorMask) != 0;
+			var isError = (mode & CompileBlockingMask) != 0;
 			var isWarning = (mode & ScriptCompileWarningMask) != 0;
 			if (!isError && !(includeWarnings && isWarning)) return false;
 			if (string.IsNullOrEmpty(message)) return false;
