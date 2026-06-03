@@ -13,7 +13,11 @@ namespace UnityCliConnector
 	/// Failure mode: if ReadConsole's reflection is unavailable on this Unity
 	/// version, <c>TryGetCompileDiagnostics</c> returns false and callers degrade
 	/// rather than throwing.
-	internal static class ConsoleLogEntries
+	///
+	/// Public so sibling packages (e.g. unity-cli-extensions) can read the same
+	/// live diagnostics via <see cref="CompilationGate.GetLiveDiagnostics"/> instead
+	/// of scraping Editor.log. The test seams below stay internal.
+	public static class ConsoleLogEntries
 	{
 		// Mode bits for script-compile entries. Stable across recent Unity versions.
 		public const int ScriptCompileErrorMask = 1 << 11;

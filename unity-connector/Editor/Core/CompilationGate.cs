@@ -54,6 +54,54 @@ namespace UnityCliConnector
 				});
 		}
 
+		/// Live, correctly-invalidated compile diagnostics — the same set the gate
+		/// blocks on, exposed for tools that want to *report* errors (e.g. the
+		/// extensions `compile_errors` tool) rather than gate on them. Merges the
+		/// CompilationPipeline cache (this session) with the in-memory console
+		/// fallback, deduped by file:line:col.
+		///
+		/// Prefer this over scraping Editor.log: the log is append-only, so a fixed
+		/// error's lines linger in the file long after a clean recompile.
+		public static IReadOnlyList<ConsoleLogEntries.CompileDiag> GetLiveDiagnostics(bool includeWarnings = false)
+		{
+			var result = new List<ConsoleLogEntries.CompileDiag>();
+			var seen = new HashSet<string>();
+
+			// Primary: live CompilationPipeline cache (this editor session).
+			foreach (var kv in ByAssembly)
+			{
+				if (kv.Value == null) continue;
+				foreach (var m in kv.Value)
+				{
+					var isError = m.type == CompilerMessageType.Error;
+					var isWarning = m.type == CompilerMessageType.Warning;
+					if (!isError && !(includeWarnings && isWarning)) continue;
+					if (!seen.Add(DedupKey(m.file, m.line, m.column))) continue;
+
+					// Reuse the header parser only to lift the CSxxxx code / clean message
+					// out of m.message; the compiler's own file/line/column stay authoritative.
+					var parsed = ConsoleLogEntries.Parse(m.message, m.file, m.line, isError);
+					result.Add(new ConsoleLogEntries.CompileDiag
+					{
+						File = m.file,
+						Line = m.line,
+						Col = m.column,
+						Severity = isError ? "error" : "warning",
+						Code = parsed.Code,
+						Message = parsed.Message
+					});
+				}
+			}
+
+			// Fallback: in-memory editor console via reflection (cleared on recompile).
+			if (ConsoleLogEntries.TryGetCompileDiagnostics(includeWarnings, out var consoleDiags))
+				foreach (var d in consoleDiags)
+					if (seen.Add(DedupKey(d.File, d.Line, d.Col)))
+						result.Add(d);
+
+			return result;
+		}
+
 		private static List<object> CollectErrors()
 		{
 			var result = new List<object>();

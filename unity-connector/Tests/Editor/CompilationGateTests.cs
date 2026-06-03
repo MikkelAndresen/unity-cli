@@ -154,6 +154,70 @@ namespace UnityCliConnector.Tests
             Assert.AreEqual(2, errors.Count, "different column on same line is a distinct diagnostic");
         }
 
+        // ─── GetLiveDiagnostics (public API consumed by extensions) ──
+
+        [Test]
+        public void GetLiveDiagnostics_MergesPipelineAndConsole_DedupedByLocation()
+        {
+            CompilationGate.SeedForTests("Library/ScriptAssemblies/Foo.dll", new[]
+            {
+                MakeCompilerMessage("Assets/Foo.cs", 10, 5,
+                    "Assets/Foo.cs(10,5): error CS1031: Type expected", CompilerMessageType.Error)
+            });
+            ConsoleLogEntries.TestOverride = _ => new List<ConsoleLogEntries.CompileDiag>
+            {
+                // Same location as the pipeline entry → collapses (pipeline added first).
+                new ConsoleLogEntries.CompileDiag
+                {
+                    File = "Assets/Foo.cs", Line = 10, Col = 5,
+                    Severity = "error", Code = "CS1031", Message = "duplicate"
+                },
+                // Distinct location → kept.
+                new ConsoleLogEntries.CompileDiag
+                {
+                    File = "Assets/Bar.cs", Line = 3, Col = 1,
+                    Severity = "error", Code = "CS0103", Message = "bork"
+                }
+            };
+
+            var diags = CompilationGate.GetLiveDiagnostics(includeWarnings: false);
+
+            Assert.AreEqual(2, diags.Count, "matching location should collapse to one");
+            // Pipeline entry: code lifted from the message header, col kept from the compiler.
+            Assert.AreEqual("Assets/Foo.cs", diags[0].File);
+            Assert.AreEqual(5, diags[0].Col);
+            Assert.AreEqual("CS1031", diags[0].Code);
+            Assert.AreEqual("Type expected", diags[0].Message);
+            // Console-only entry survives.
+            Assert.AreEqual("Assets/Bar.cs", diags[1].File);
+        }
+
+        [Test]
+        public void GetLiveDiagnostics_ExcludesWarnings_UnlessRequested()
+        {
+            CompilationGate.SeedForTests("Library/ScriptAssemblies/Foo.dll", new[]
+            {
+                MakeCompilerMessage("Assets/Foo.cs", 1, 1,
+                    "Assets/Foo.cs(1,1): warning CS0168: unused", CompilerMessageType.Warning)
+            });
+            ConsoleLogEntries.TestOverride = _ => new List<ConsoleLogEntries.CompileDiag>();
+
+            Assert.AreEqual(0, CompilationGate.GetLiveDiagnostics(includeWarnings: false).Count,
+                "warnings must not surface when includeWarnings=false");
+
+            var withWarnings = CompilationGate.GetLiveDiagnostics(includeWarnings: true);
+            Assert.AreEqual(1, withWarnings.Count);
+            Assert.AreEqual("warning", withWarnings[0].Severity);
+            Assert.AreEqual("CS0168", withWarnings[0].Code);
+        }
+
+        [Test]
+        public void GetLiveDiagnostics_CleanState_ReturnsEmpty()
+        {
+            ConsoleLogEntries.TestOverride = _ => new List<ConsoleLogEntries.CompileDiag>();
+            Assert.AreEqual(0, CompilationGate.GetLiveDiagnostics().Count);
+        }
+
         // ─── ConsoleLogEntries.Parse branches ───────────────────
 
         [Test]
