@@ -151,6 +151,7 @@ Unity 커넥터의 동작:
 | `reserialize` | Unity 시리얼라이저를 통해 에셋 재직렬화 |
 | `screenshot` | Scene/Game 뷰를 PNG로 캡처 |
 | `profiler` | 프로파일러 하이어라키 읽기, 녹화 제어 |
+| `modal` | 에디터를 막고 있는 모달 다이얼로그 확인 및 응답 (macOS) |
 | `list` | 사용 가능한 모든 도구와 파라미터 스키마 표시 |
 | `status` | Unity Editor 연결 상태 확인 |
 | `update` | CLI 바이너리 자동 업데이트 |
@@ -305,6 +306,24 @@ unity-cli test --filter MyTestClass
 
 Unity Test Framework 패키지가 필요합니다. 열린 씬에 저장되지 않은 변경이 있으면 기본적으로 테스트를 막습니다. `--auto-save-scenes`로 먼저 저장하거나, `--allow-dirty-scenes`로 그대로 실행할 수 있습니다. PlayMode 테스트는 도메인 리로드를 트리거하며, CLI가 자동으로 결과를 폴링합니다.
 
+### 모달 다이얼로그 (macOS)
+
+```bash
+# 에디터를 막고 있는 다이얼로그의 텍스트와 버튼 표시
+unity-cli modal
+
+# 버튼을 제목(대소문자·둥근 따옴표 무시) 또는 인덱스로 클릭
+unity-cli modal answer --button "Don't Save"
+unity-cli modal answer --index 2
+
+# 확인한 다이얼로그가 다른 것으로 바뀌었으면 클릭하지 않음
+unity-cli modal answer --button Cancel --id 27186
+```
+
+모달 다이얼로그(`EditorUtility.DisplayDialog`, 저장 확인, 파일 패널)는 Unity 메인 스레드를 멈추게 하므로, 누군가 응답하기 전까지 일반 명령은 실행되지 않습니다. 다이얼로그가 열려 있는 동안 heartbeat는 상태 `modal`과 함께 다이얼로그의 텍스트와 버튼을 기록합니다. 다른 모든 명령은 멈춰 있지 않고 즉시 그 내용을 담은 에러로 실패합니다. 실행 중인 명령이 다이얼로그를 띄운 경우에도 CLI는 같은 에러를 반환하며, 해당 명령은 다이얼로그에 응답한 뒤 Unity 안에서 이어서 실행됩니다.
+
+Connector는 Unity 프로세스 내부에서 메인 큐로 작업을 보내 다이얼로그에 응답합니다. AppKit은 모달 루프 중에도 메인 큐를 처리하기 때문입니다. 손쉬운 사용(Accessibility) 권한이 필요 없고, Unity 자신의 창에만 접근할 수 있습니다. IMGUI로 그린 다이얼로그(`EditorWindow.ShowModal`)는 네이티브 버튼이 없어 목록에는 나오지만 응답할 수 없습니다. Connector가 로드되기 전에 뜨는 다이얼로그(예: 시작 시 Safe Mode 확인)는 처리할 수 없습니다.
+
 ### 도구 목록
 
 ```bash
@@ -333,7 +352,7 @@ unity-cli status
 #   PID:     12345
 ```
 
-명령 전송 전에 CLI가 자동으로 Unity 상태를 확인합니다. Unity가 바쁜 상태(컴파일, 리로드)이면 응답 가능해질 때까지 대기합니다.
+명령 전송 전에 CLI가 자동으로 Unity 상태를 확인합니다. Unity가 바쁜 상태(컴파일, 리로드)이면 응답 가능해질 때까지 대기합니다. 모달 다이얼로그가 열려 있으면(상태 `modal`) 즉시 실패하고 다이얼로그 내용을 보여줍니다. [모달 다이얼로그](#모달-다이얼로그-macos)를 참고하세요.
 
 ## 글로벌 옵션
 

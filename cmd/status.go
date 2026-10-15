@@ -30,6 +30,9 @@ func statusCmd(inst *client.Instance) error {
 	fmt.Printf("  Version: %s\n", status.UnityVersion)
 	fmt.Printf("  Connector: %s\n", connectorVersionLabel(status.ConnectorVersion))
 	fmt.Printf("  PID:     %d\n", status.PID)
+	if isModal(status) {
+		fmt.Print(describeModal(status.Modal))
+	}
 	return checkConnectorVersion(status, Version, flagIgnoreVersionMismatch)
 }
 
@@ -112,8 +115,8 @@ func waitForAlive(resolve instanceResolver, timeoutMs int) (*client.Instance, er
 }
 
 // waitForReady polls indefinitely until the heartbeat state becomes "ready".
-// Returns true if compilation had errors.
-func waitForReady(resolve instanceResolver) bool {
+// Returns true if compilation had errors, or an error if a modal dialog blocks the editor.
+func waitForReady(resolve instanceResolver) (bool, error) {
 	fmt.Fprintf(os.Stderr, "Waiting for compilation...\n")
 
 	deadline := time.Now().Add(5 * time.Minute)
@@ -123,16 +126,19 @@ func waitForReady(resolve instanceResolver) bool {
 		if err != nil {
 			continue
 		}
+		if isModal(status) {
+			return false, modalBlockedError(status, "editor refresh --compile", true)
+		}
 		if status.State == "ready" {
 			if status.CompileErrors {
 				fmt.Fprintf(os.Stderr, "Compilation finished with errors.\n")
 			} else {
 				fmt.Fprintf(os.Stderr, "Compilation complete.\n")
 			}
-			return status.CompileErrors
+			return status.CompileErrors, nil
 		}
 	}
 
 	fmt.Fprintf(os.Stderr, "Timed out waiting for compilation (5m).\n")
-	return true
+	return true, nil
 }

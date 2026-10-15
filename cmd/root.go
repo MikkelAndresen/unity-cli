@@ -97,9 +97,12 @@ func Execute() error {
 	if err := checkConnectorVersion(alive, Version, flagIgnoreVersionMismatch); err != nil {
 		return err
 	}
+	if category != modalCommand && isModal(alive) {
+		return modalBlockedError(alive, category, false)
+	}
 
 	timeout := flagTimeout
-	send := func(command string, params interface{}) (*client.CommandResponse, error) {
+	send := sendWatchingModal(func(command string, params interface{}) (*client.CommandResponse, error) {
 		inst, err := resolve()
 		if err != nil {
 			return nil, err
@@ -108,7 +111,7 @@ func Execute() error {
 			return nil, err
 		}
 		return client.Send(inst, command, params, timeout)
-	}
+	}, resolve)
 
 	var resp *client.CommandResponse
 
@@ -123,9 +126,9 @@ func Execute() error {
 		if err := checkConnectorVersion(currentInst, Version, flagIgnoreVersionMismatch); err != nil {
 			return err
 		}
-		testSend := func(command string, params interface{}) (*client.CommandResponse, error) {
+		testSend := sendWatchingModal(func(command string, params interface{}) (*client.CommandResponse, error) {
 			return client.Send(currentInst, command, params, 0)
-		}
+		}, resolve)
 		resp, err = testCmd(subArgs, testSend, currentInst.Port)
 	case "exec":
 		subArgs = readStdinIfPiped(subArgs)
@@ -370,6 +373,10 @@ Profiler:
   profiler status                Show profiler state
   profiler clear                 Clear all captured frames
 
+Modal Dialogs (macOS):
+  modal                         Show the modal dialog blocking the editor
+  modal answer --button <title> Click a button by title (or --index <n>)
+
 Custom Tools:
   list                          List all registered tools with parameter schemas
   <name>                        Call a custom tool directly
@@ -567,6 +574,32 @@ Examples:
   unity-cli test --filter MyNamespace.MyTests
   unity-cli test --mode EditMode --filter MyNamespace.MyTests.SpecificTest
 `)
+	case "modal":
+		fmt.Print(`Usage: unity-cli modal [list|answer] [options]
+
+Inspect or answer a modal dialog that blocks the Unity Editor (macOS only).
+
+A modal dialog (DisplayDialog, save prompts, file panels) freezes Unity's
+main thread. While one is open, every other command fails immediately with
+the dialog's text and buttons instead of hanging; a command that opened the
+dialog itself resumes inside Unity once the dialog is answered.
+
+Subcommands:
+  list                List the open dialog: id, kind, texts, buttons (default)
+  answer              Click one of the dialog's buttons
+    --button <title>  Button title; falls back to case- and apostrophe-insensitive match
+    --index <n>       Button index as reported by list
+    --id <id>         Only click if the open dialog still has this id
+
+Answering happens inside the Unity process; no Accessibility permission is
+used and only Unity's own windows are reachable. IMGUI modal windows have no
+native buttons and cannot be answered.
+
+Examples:
+  unity-cli modal
+  unity-cli modal answer --button "Don't Save"
+  unity-cli modal answer --index 0 --id 27186
+`)
 	case "list":
 		fmt.Print(`Usage: unity-cli list
 
@@ -580,6 +613,8 @@ Example:
 
 Show the current Unity Editor state: port, project path, version, PID.
 Reports "not responding" if heartbeat is older than 3 seconds.
+State "modal" means a dialog blocks the editor; its text and buttons are
+printed (see "unity-cli modal --help").
 
 Example:
   unity-cli status

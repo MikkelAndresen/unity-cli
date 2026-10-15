@@ -17,6 +17,7 @@ unity-connector/      # C# Unity Editor package (UPM)
   Editor/
     Core/             # Shared utilities (Response, ParamCoercion, ToolParams, StringCaseUtility)
     Tools/            # Tool implementations (auto-registered via [UnityCliTool] attribute)
+    Modal/            # macOS modal dialog handling: AppKit via objc_msgSend, runs during the modal loop
     TestRunner/       # Test runner (RunTests, TestRunnerState)
 ```
 

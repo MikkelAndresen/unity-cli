@@ -151,6 +151,7 @@ Before compiling or reloading, the Connector records the state (`compiling`, `re
 | `reserialize` | Re-serialize assets through Unity's serializer |
 | `screenshot` | Capture scene/game view as PNG |
 | `profiler` | Read profiler hierarchy, control recording |
+| `modal` | Inspect and answer a modal dialog blocking the editor (macOS) |
 | `list` | Show all available tools with parameter schemas |
 | `status` | Show Unity Editor connection state |
 | `update` | Self-update the CLI binary |
@@ -305,6 +306,24 @@ unity-cli test --filter MyTestClass
 
 Requires the Unity Test Framework package. Tests are blocked by default when any open scene has unsaved changes. Use `--auto-save-scenes` to save them first, or `--allow-dirty-scenes` to run anyway. PlayMode tests trigger a domain reload — the CLI polls for results automatically.
 
+### Modal Dialogs (macOS)
+
+```bash
+# Show the dialog currently blocking the editor, with its text and buttons
+unity-cli modal
+
+# Click a button by title (case and curly-apostrophe insensitive) or by index
+unity-cli modal answer --button "Don't Save"
+unity-cli modal answer --index 2
+
+# Refuse to click if a different dialog has replaced the one you inspected
+unity-cli modal answer --button Cancel --id 27186
+```
+
+A modal dialog (`EditorUtility.DisplayDialog`, save prompts, file panels) freezes Unity's main thread, so normal commands cannot run until someone answers it. While one is open, the heartbeat reports state `modal` together with the dialog's text and buttons. Every other command fails right away with that description instead of hanging. If a command opens a dialog while running, the CLI returns the same error; the command resumes inside Unity once the dialog is answered.
+
+The connector answers the dialog from inside the Unity process by dispatching to the main queue, which AppKit keeps draining during a modal loop. No Accessibility permission is involved, and only Unity's own windows are reachable. Dialogs drawn with IMGUI (`EditorWindow.ShowModal`) have no native buttons; they are listed but cannot be answered. Dialogs shown before the connector loads (e.g. the Safe Mode prompt at startup) are out of reach.
+
 ### List Tools
 
 ```bash
@@ -333,7 +352,7 @@ unity-cli status
 #   PID:     12345
 ```
 
-The CLI also checks Unity's state automatically before sending any command. If Unity is busy (compiling, reloading), it waits for Unity to become responsive.
+The CLI also checks Unity's state automatically before sending any command. If Unity is busy (compiling, reloading), it waits for Unity to become responsive. If a modal dialog is open (state `modal`), it fails immediately and shows the dialog; see [Modal Dialogs](#modal-dialogs-macos).
 
 ## Global Options
 

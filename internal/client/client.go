@@ -22,6 +22,27 @@ type Instance struct {
 	ConnectorVersion string `json:"connectorVersion,omitempty"`
 	Timestamp        int64  `json:"timestamp,omitempty"`
 	CompileErrors    bool   `json:"compileErrors,omitempty"`
+	// Modal is set while State is "modal": the dialog blocking Unity's main thread.
+	Modal *ModalDialog `json:"modal,omitempty"`
+}
+
+// ModalDialog mirrors the connector's UnityCliConnector.Modal.ModalDialog.
+type ModalDialog struct {
+	ID          int64         `json:"id"`
+	Kind        string        `json:"kind"`
+	Title       string        `json:"title"`
+	Texts       []string      `json:"texts"`
+	Buttons     []ModalButton `json:"buttons"`
+	WindowClass string        `json:"window_class"`
+}
+
+// ModalButton is one clickable button of a ModalDialog.
+type ModalButton struct {
+	Index     int    `json:"index"`
+	Title     string `json:"title"`
+	IsDefault bool   `json:"is_default"`
+	IsCancel  bool   `json:"is_cancel"`
+	Enabled   bool   `json:"enabled"`
 }
 
 // CommandRequest is the JSON body sent to Unity's HTTP server.

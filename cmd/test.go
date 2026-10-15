@@ -110,6 +110,9 @@ func pollTestResults(port int) (*client.CommandResponse, error) {
 		if err == nil && inst.State == "stopped" {
 			return nil, fmt.Errorf("unity editor has stopped (port %d)", port)
 		}
+		if err == nil && isModal(inst) {
+			return nil, modalBlockedError(inst, "test --mode PlayMode", true)
+		}
 	}
 
 	return nil, fmt.Errorf("timed out waiting for test results (10m)")
