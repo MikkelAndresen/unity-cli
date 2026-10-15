@@ -5,6 +5,7 @@ using System.Text;
 using Newtonsoft.Json;
 using UnityEditor;
 using UnityEngine;
+using UnityCliConnector.Modal;
 
 namespace UnityCliConnector
 {
@@ -20,6 +21,15 @@ namespace UnityCliConnector
         static string s_ForcedState;
         static double s_CompileRequestTime;
         static string s_FilePath;
+
+        // Snapshot of main-thread-only values so the file can be rewritten from the
+        // modal watchdog's thread while the main thread is blocked.
+        static readonly object s_WriteLock = new();
+        static string s_ProjectPath;
+        static string s_UnityVersion;
+        static int s_Pid;
+        static string s_LastState = "ready";
+        static bool s_LastCompileErrors;
 
         static Heartbeat()
         {
@@ -92,25 +102,57 @@ namespace UnityCliConnector
 
         static void Write()
         {
+            if (s_ProjectPath == null)
+            {
+                s_ProjectPath = Application.dataPath.Replace("/Assets", "");
+                s_UnityVersion = Application.unityVersion;
+                s_Pid = System.Diagnostics.Process.GetCurrentProcess().Id;
+                GetFilePath();
+            }
+
+            s_LastState = s_ForcedState ?? GetState();
+            s_LastCompileErrors = EditorUtility.scriptCompilationFailed;
+            WriteFile();
+        }
+
+        /// <summary>
+        /// Rewrites the heartbeat from the last main-thread snapshot plus the current
+        /// modal dialog. Safe to call from any thread; used by ModalWatchdog while the
+        /// main thread is parked in a modal loop.
+        /// </summary>
+        internal static void WriteFromAnyThread()
+        {
+            if (s_ProjectPath == null) return;
+            WriteFile();
+        }
+
+        static void WriteFile()
+        {
+            var modal = s_LastState == "stopped" ? null : ModalWatchdog.Current;
             var status = new
             {
-                state = s_ForcedState ?? GetState(),
-                projectPath = Application.dataPath.Replace("/Assets", ""),
+                state = modal != null ? "modal" : s_LastState,
+                projectPath = s_ProjectPath,
                 port = HttpServer.Port,
-                pid = System.Diagnostics.Process.GetCurrentProcess().Id,
-                unityVersion = Application.unityVersion,
+                pid = s_Pid,
+                unityVersion = s_UnityVersion,
                 connectorVersion = GetConnectorVersion(),
                 timestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
-                compileErrors = EditorUtility.scriptCompilationFailed,
+                compileErrors = s_LastCompileErrors,
+                modal,
             };
 
-            try
+            lock (s_WriteLock)
             {
-                Directory.CreateDirectory(s_Dir);
-                File.WriteAllText(GetFilePath(), JsonConvert.SerializeObject(status));
-            }
-            catch
-            {
+                try
+                {
+                    Directory.CreateDirectory(s_Dir);
+                    File.WriteAllText(s_FilePath, JsonConvert.SerializeObject(status,
+                        new JsonSerializerSettings { NullValueHandling = NullValueHandling.Ignore }));
+                }
+                catch
+                {
+                }
             }
         }
 
