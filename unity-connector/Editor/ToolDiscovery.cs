@@ -54,6 +54,44 @@ namespace UnityCliConnector
             return found;
         }
 
+        static readonly object s_OffMainThreadLock = new();
+        static HashSet<string> s_OffMainThreadTools;
+
+        /// <summary>
+        /// Whether <paramref name="command"/> is a tool marked
+        /// [UnityCliTool(RunOffMainThread = true)]. Called from the HTTP request
+        /// thread, so the set is built once per domain instead of rescanning on every
+        /// request; a recompile reloads the domain and resets it.
+        /// </summary>
+        public static bool IsOffMainThreadTool(string command)
+        {
+            lock (s_OffMainThreadLock)
+            {
+                s_OffMainThreadTools ??= ScanOffMainThreadTools();
+                return s_OffMainThreadTools.Contains(command);
+            }
+        }
+
+        static HashSet<string> ScanOffMainThreadTools()
+        {
+            var names = new HashSet<string>();
+            foreach (var assembly in AppDomain.CurrentDomain.GetAssemblies())
+            {
+                Type[] types;
+                try { types = assembly.GetTypes(); }
+                catch (ReflectionTypeLoadException) { continue; }
+
+                foreach (var type in types)
+                {
+                    if (type.IsClass == false) continue;
+                    var attr = type.GetCustomAttribute<UnityCliToolAttribute>();
+                    if (attr is not { RunOffMainThread: true }) continue;
+                    names.Add(attr.Name ?? StringCaseUtility.ToSnakeCase(type.Name));
+                }
+            }
+            return names;
+        }
+
         public static List<object> GetToolSchemas()
         {
             var tools = new List<object>();

@@ -49,6 +49,24 @@ namespace UnityCliConnector
                 if (gate != null) return gate;
             }
 
+            return await Invoke(handler, command, parameters);
+        }
+
+        /// <summary>
+        /// Runs a [UnityCliTool(RunOffMainThread = true)] handler on the calling
+        /// thread. Skips the command lock on purpose: the command holding it may be
+        /// the very one stuck behind a modal dialog this tool is meant to answer.
+        /// </summary>
+        public static Task<object> DispatchOffMainThread(string command, JObject parameters)
+        {
+            var handler = ToolDiscovery.FindHandler(command);
+            if (handler == null)
+                return Task.FromResult<object>(new ErrorResponse($"Unknown command: {command}"));
+            return Invoke(handler, command, parameters);
+        }
+
+        static async Task<object> Invoke(MethodInfo handler, string command, JObject parameters)
+        {
             try
             {
                 var result = handler.Invoke(null, new object[] { parameters ?? new JObject() });

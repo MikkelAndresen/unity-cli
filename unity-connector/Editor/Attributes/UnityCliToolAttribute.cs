@@ -20,6 +20,13 @@ namespace UnityCliConnector
         /// callable in a broken state. Callers can still force-skip per call via
         /// the `skip_compile_check` parameter.
         public bool SkipCompilationGate { get; set; }
+
+        /// When true, the HTTP server invokes HandleCommand directly on the request
+        /// thread instead of queueing it for EditorApplication.update, bypassing the
+        /// command lock and the compilation gate. This keeps the tool callable while
+        /// the main thread is blocked (e.g. by a modal dialog). The handler must not
+        /// call Unity APIs except through a thread-safe path of its own.
+        public bool RunOffMainThread { get; set; }
     }
 
     /// <summary>

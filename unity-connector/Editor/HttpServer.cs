@@ -226,7 +226,11 @@ namespace UnityCliConnector
 
                     try
                     {
-                        var context = await listener.GetContextAsync();
+                        // ConfigureAwait(false) moves the accept loop and request handling
+                        // off Unity's SynchronizationContext. Otherwise every continuation
+                        // waits for the main thread, and a modal dialog would stop the
+                        // server from accepting even RunOffMainThread commands.
+                        var context = await listener.GetContextAsync().ConfigureAwait(false);
                         _ = HandleRequest(context);
                     }
                     catch (ObjectDisposedException)
@@ -245,21 +249,26 @@ namespace UnityCliConnector
             }
             finally
             {
-                if (!ct.IsCancellationRequested && !s_Stopping && ReferenceEquals(s_Listener, listener))
+                // The loop now ends on a thread-pool thread; listener bookkeeping is
+                // owned by the main thread (Start/StopListener), so hand it back there.
+                s_MainContext?.Post(_ =>
                 {
-                    try
+                    if (!ct.IsCancellationRequested && !s_Stopping && ReferenceEquals(s_Listener, listener))
                     {
-                        listener.Stop();
-                        listener.Close();
+                        try
+                        {
+                            listener.Stop();
+                            listener.Close();
+                        }
+                        catch
+                        {
+                        }
+                        s_Listener = null;
+                        if (ReferenceEquals(s_Cts, cts))
+                            s_Cts = null;
+                        s_RestartPending = true;
                     }
-                    catch
-                    {
-                    }
-                    s_Listener = null;
-                    if (ReferenceEquals(s_Cts, cts))
-                        s_Cts = null;
-                    s_RestartPending = true;
-                }
+                }, null);
             }
         }
 
@@ -311,6 +320,10 @@ namespace UnityCliConnector
                     {
                         result = new ErrorResponse("Missing 'command' field");
                         response.StatusCode = 400;
+                    }
+                    else if (ToolDiscovery.IsOffMainThreadTool(command))
+                    {
+                        result = await CommandRouter.DispatchOffMainThread(command, parameters);
                     }
                     else
                     {
