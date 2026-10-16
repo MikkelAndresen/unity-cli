@@ -11,7 +11,7 @@ import (
 	"strings"
 )
 
-const repoAPI = "https://api.github.com/repos/youngwoocho02/unity-cli/releases/latest"
+const repoAPI = "https://api.github.com/repos/MikkelAndresen/unity-cli/releases/latest"
 
 type ghRelease struct {
 	TagName string    `json:"tag_name"`
