@@ -25,13 +25,13 @@ CLI 전체가 Go ~800줄(+ help text ~300줄), Unity 커넥터가 C# ~2,300줄�
 ### Linux / macOS
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/youngwoocho02/unity-cli/master/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/MikkelAndresen/unity-cli/main/install.sh | sh
 ```
 
 ### Windows (PowerShell)
 
 ```powershell
-irm https://raw.githubusercontent.com/youngwoocho02/unity-cli/master/install.ps1 | iex
+irm https://raw.githubusercontent.com/MikkelAndresen/unity-cli/main/install.ps1 | iex
 ```
 
 ### 기타 방법
@@ -42,7 +42,7 @@ go install github.com/youngwoocho02/unity-cli@latest
 
 # 수동 다운로드 (플랫폼 선택)
 # Linux amd64 / Linux arm64 / macOS amd64 / macOS arm64 / Windows amd64
-curl -fsSL https://github.com/youngwoocho02/unity-cli/releases/latest/download/unity-cli-linux-amd64 -o unity-cli
+curl -fsSL https://github.com/MikkelAndresen/unity-cli/releases/latest/download/unity-cli-linux-amd64 -o unity-cli
 chmod +x unity-cli && sudo mv unity-cli /usr/local/bin/
 ```
 
@@ -63,12 +63,12 @@ unity-cli update --check
 **Package Manager → Add package from git URL**에서 추가:
 
 ```
-https://github.com/youngwoocho02/unity-cli.git?path=unity-connector
+https://github.com/MikkelAndresen/unity-cli.git?path=unity-connector
 ```
 
 또는 `Packages/manifest.json`에 직접 추가:
 ```json
-"com.youngwoocho02.unity-cli-connector": "https://github.com/youngwoocho02/unity-cli.git?path=unity-connector"
+"com.youngwoocho02.unity-cli-connector": "https://github.com/MikkelAndresen/unity-cli.git?path=unity-connector"
 ```
 
 특정 버전을 고정하려면 URL 끝에 태그를 추가하세요 (예: `#v0.2.21`).
