@@ -125,6 +125,58 @@ func TestBuildParams_BaseParams(t *testing.T) {
 	}
 }
 
+func TestExecRequestTimeout_WidensForAwaitTimeout(t *testing.T) {
+	p, err := buildParams([]string{"--await_timeout", "100000"}, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	// A 100s await budget plus compile slack must outlast the 120s default, otherwise
+	// the client reports a deadline instead of the connector's timed_out marker.
+	if got := execRequestTimeout(120000, p); got != 130000 {
+		t.Errorf("expected 130000, got %d", got)
+	}
+}
+
+func TestExecRequestTimeout_ShortAwaitKeepsFlagTimeout(t *testing.T) {
+	p, err := buildParams([]string{"--await_timeout", "500"}, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got := execRequestTimeout(120000, p); got != 120000 {
+		t.Errorf("expected 120000, got %d", got)
+	}
+}
+
+func TestExecRequestTimeout_NoAwaitTimeout(t *testing.T) {
+	p, err := buildParams([]string{"return 1;"}, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got := execRequestTimeout(120000, p); got != 120000 {
+		t.Errorf("expected 120000, got %d", got)
+	}
+}
+
+func TestExecRequestTimeout_WaitForeverKeepsFlagTimeout(t *testing.T) {
+	// await_timeout 0 means the connector never gives up; no client number helps.
+	p := map[string]interface{}{"await_timeout": 0}
+	if got := execRequestTimeout(120000, p); got != 120000 {
+		t.Errorf("expected 120000, got %d", got)
+	}
+	if got := execRequestTimeout(0, p); got != 0 {
+		t.Errorf("expected 0 (no client deadline) to stay 0, got %d", got)
+	}
+}
+
+func TestExecRequestTimeout_CamelCaseAndStringForms(t *testing.T) {
+	if got := execRequestTimeout(120000, map[string]interface{}{"awaitTimeout": "200000"}); got != 230000 {
+		t.Errorf("expected 230000, got %d", got)
+	}
+	if got := execRequestTimeout(120000, map[string]interface{}{"await_timeout": 200000.0}); got != 230000 {
+		t.Errorf("expected 230000, got %d", got)
+	}
+}
+
 func sliceEqual(a, b []string) bool {
 	if len(a) == 0 && len(b) == 0 {
 		return true

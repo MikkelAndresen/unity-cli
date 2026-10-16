@@ -216,6 +216,22 @@ echo 'Debug.Log("hello"); return null;' | unity-cli exec
 echo 'var go = new GameObject("Marker"); go.tag = "EditorOnly"; return go.name;' | unity-cli exec
 ```
 
+**Async and coroutines.** `await` works in the body, and a `Task` you return is awaited for you — the response carries its result, not the `Task` object. Nothing blocks the editor's main thread while waiting, so work that needs the editor to keep ticking (an editor callback, a play-mode transition) still completes.
+
+```bash
+unity-cli exec "await Task.Delay(100); return EditorApplication.timeSinceStartup;"
+unity-cli exec "return Task.Run(() => AssetDatabase.Refresh());"
+unity-cli exec "return Task.Run(() => ImportEverything());" --await_timeout 300000
+```
+
+A body using `yield return` runs as a coroutine: `yield return null` waits one editor update, a yielded `Task` is awaited, and any other yielded value is collected and returned as a list. Unity's `YieldInstruction`s (`WaitForSeconds`, `WaitForEndOfFrame`) are rejected rather than silently ignored — use `await Task.Delay(ms)` to wait for time.
+
+```bash
+echo 'for (int i = 0; i < 3; i++) { yield return null; yield return i; }' | unity-cli exec   # -> [0, 1, 2]
+```
+
+Waits are bounded by `--await_timeout <ms>` (default 30000; `0` waits forever). If a wait outlives it, the response is an error carrying `{"timed_out": true, "status": "WaitingForActivation", "steps": N}` — the operation keeps running in the editor and its result is not observable from that response. A domain reload drops a pending result silently, so park long-lived results in a static field or `ScriptableObject` and read them back with a second `exec`.
+
 Because `exec` compiles and runs real C#, it can do anything a custom tool can — inspect ECS entities, modify assets, call internal APIs, run editor utilities. For AI agents, this means **zero-friction access to Unity's entire runtime** without writing a single line of tool code. Piping via stdin avoids shell escaping headaches with complex code.
 
 ### Menu Items

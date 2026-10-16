@@ -216,6 +216,22 @@ echo 'Debug.Log("hello"); return null;' | unity-cli exec
 echo 'var go = new GameObject("Marker"); go.tag = "EditorOnly"; return go.name;' | unity-cli exec
 ```
 
+**Async와 coroutine.** 본문에서 `await`을 사용할 수 있고, 반환한 `Task`는 커넥터가 대신 대기한다 — 응답에는 `Task` 객체가 아니라 그 결과가 담긴다. 대기 중에도 에디터 메인 스레드를 막지 않으므로, 에디터가 계속 동작해야 끝나는 작업(에디터 콜백, 플레이 모드 전환)도 정상적으로 완료된다.
+
+```bash
+unity-cli exec "await Task.Delay(100); return EditorApplication.timeSinceStartup;"
+unity-cli exec "return Task.Run(() => AssetDatabase.Refresh());"
+unity-cli exec "return Task.Run(() => ImportEverything());" --await_timeout 300000
+```
+
+`yield return`을 사용한 본문은 coroutine으로 실행된다: `yield return null`은 에디터 update 1회를 기다리고, yield된 `Task`는 대기되며, 그 외의 yield 값은 수집되어 list로 반환된다. Unity의 `YieldInstruction`(WaitForSeconds, WaitForEndOfFrame)은 조용히 무시되는 대신 거부된다 — 시간을 기다리려면 `await Task.Delay(ms)`를 사용한다.
+
+```bash
+echo 'for (int i = 0; i < 3; i++) { yield return null; yield return i; }' | unity-cli exec   # -> [0, 1, 2]
+```
+
+대기는 `--await_timeout <ms>`로 제한된다 (기본 30000, `0`은 무한 대기). 대기가 이 시간을 넘기면 응답이 `{"timed_out": true, "status": "WaitingForActivation", "steps": N}`를 담은 error로 온다 — 작업은 에디터에서 계속 동작 중이며 그 응답으로는 결과를 알 수 없다. domain reload는 대기 중인 결과를 조용히 사라지게 하므로, 오래 걸리는 결과는 static field나 `ScriptableObject`에 보관하고 두 번째 `exec`로 읽어온다.
+
 `exec`는 실제 C#을 컴파일하고 실행하므로, 커스텀 도구가 할 수 있는 모든 것을 할 수 있습니다 — ECS 엔티티 조사, 에셋 수정, 내부 API 호출, 에디터 유틸리티 실행. AI 에이전트에게 이것은 **도구 코드를 한 줄도 작성하지 않고 Unity 전체 런타임에 즉시 접근**할 수 있다는 의미입니다. stdin 파이프를 사용하면 복잡한 코드에서 shell escaping 문제를 피할 수 있습니다.
 
 ### 메뉴 아이템

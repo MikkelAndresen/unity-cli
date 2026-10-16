@@ -135,6 +135,13 @@ func Execute() error {
 		var params map[string]interface{}
 		params, err = buildParams(subArgs, nil)
 		if err == nil {
+			// The connector waits out --await_timeout before answering. Give it the same
+			// budget plus compile slack so the client is never the one that gives up
+			// first — otherwise a long await reports a Go deadline instead of the
+			// connector's timed_out marker.
+			if t := execRequestTimeout(flagTimeout, params); t > timeout {
+				timeout = t
+			}
 			resp, err = send("exec", params)
 		}
 	default:
@@ -211,6 +218,41 @@ func parseSubFlags(args []string) map[string]string {
 		}
 	}
 	return flags
+}
+
+// execRequestTimeout widens the HTTP request timeout so it outlasts the connector's
+// own await budget (--await_timeout). A budget of 0 or less means the connector waits
+// forever, which no client-side number can cover — leave the flag timeout alone.
+func execRequestTimeout(flagTimeoutMs int, params map[string]interface{}) int {
+	raw, ok := params["await_timeout"]
+	if !ok {
+		raw, ok = params["awaitTimeout"]
+	}
+	if !ok {
+		return flagTimeoutMs
+	}
+
+	ms := 0
+	switch v := raw.(type) {
+	case int:
+		ms = v
+	case float64:
+		ms = int(v)
+	case string:
+		if n, convErr := strconv.Atoi(v); convErr == nil {
+			ms = n
+		}
+	}
+	if ms <= 0 || flagTimeoutMs <= 0 {
+		// 0 or less means "no client-side deadline" on either side.
+		return flagTimeoutMs
+	}
+
+	const compileSlackMs = 30000
+	if want := ms + compileSlackMs; want > flagTimeoutMs {
+		return want
+	}
+	return flagTimeoutMs
 }
 
 // buildParams parses --flag value pairs and positional args from args and merges with base params.
@@ -327,11 +369,13 @@ Execute C#:
   exec "<code>"                 Run C# code in Unity (return required for output)
   echo '<code>' | exec          Pipe code via stdin (avoids shell escaping)
   exec "<code>" --usings x,y    Add extra using directives
+  exec "<code>" --await_timeout 60000   Wait longer for a Task/coroutine to finish
 
   Examples:
     exec "Time.time"
     exec "GameObject.FindObjectsOfType<Camera>().Length"
     exec "var go = new GameObject(\"Test\"); return go.name;"
+    exec "await Task.Delay(100); return EditorApplication.timeSinceStartup;"
 
 Menu:
   menu "<path>"                 Execute Unity menu item by path
@@ -458,11 +502,13 @@ Use 'return' to get output. Add --usings for types outside default namespaces.
 
 Options:
   --usings <ns1,ns2>   Add extra using directives
+  --await_timeout <ms> Max ms to await a returned Task / pump a returned coroutine
+                       (default 30000; 0 or negative waits forever)
   --csc <path>         Path to csc compiler (csc.dll or csc.exe). Auto-detected if omitted.
   --dotnet <path>      Path to dotnet runtime. Auto-detected if omitted.
 
-Default usings: System, System.Collections.Generic, System.IO, System.Linq,
-  System.Reflection, System.Threading.Tasks, UnityEngine,
+Default usings: System, System.Collections, System.Collections.Generic,
+  System.IO, System.Linq, System.Reflection, System.Threading.Tasks, UnityEngine,
   UnityEngine.SceneManagement, UnityEditor, UnityEditor.SceneManagement,
   UnityEditorInternal
 
@@ -472,6 +518,23 @@ Examples:
   echo 'return EditorSceneManager.GetActiveScene().name;' | unity-cli exec
   echo 'Debug.Log("hello"); return null;' | unity-cli exec
   unity-cli exec "return World.All.Count;" --usings Unity.Entities
+  unity-cli exec "await Task.Delay(100); return 1;"
+  unity-cli exec "return Task.Run(() => AssetDatabase.Refresh());" --await_timeout 60000
+
+Async:
+  'await' works in the body, and a Task you return is awaited for you — the response
+  carries its result, not the Task object. Nothing blocks the editor's main thread,
+  so work that needs the editor to keep ticking still completes.
+
+  A body using 'yield return' runs as a coroutine: 'yield return null' waits one
+  editor update, a yielded Task is awaited, and any other yielded value is collected
+  and returned as a list. Unity YieldInstructions (WaitForSeconds, WaitForEndOfFrame)
+  are rejected rather than ignored — use 'await Task.Delay(ms)' to wait for time.
+
+  If the wait outlives --await_timeout the response is an error carrying
+  {"timed_out": true, "status": …}; the operation keeps running in the editor and its
+  result is not observable from that response. A domain reload drops a pending result
+  silently — park it in a static field or ScriptableObject and read it back.
 
 Stdin:
   Pipe code via stdin to avoid shell escaping issues.

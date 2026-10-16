@@ -6,6 +6,7 @@ using System.IO;
 using System.Reflection;
 using System.Text;
 using System.Text.RegularExpressions;
+using System.Threading.Tasks;
 using Newtonsoft.Json.Linq;
 using UnityEditor;
 using UnityEngine;
@@ -18,6 +19,7 @@ namespace UnityCliConnector.Tools
         private static readonly string[] DefaultUsings =
         {
             "System",
+            "System.Collections",
             "System.Collections.Generic",
             "System.IO",
             "System.Linq",
@@ -43,9 +45,14 @@ namespace UnityCliConnector.Tools
 
             [ToolParameter("Path to dotnet runtime. Auto-detected if omitted.")]
             public string Dotnet { get; set; }
+
+            // The 30000 mirrors ExecAwait.DefaultTimeoutMs: Unity's compiler rejects it
+            // there as an attribute argument (CS0182), so it cannot be referenced.
+            [ToolParameter("Max ms to await a returned Task / pump a returned coroutine (default 30000; 0 or negative waits forever)")]
+            public int AwaitTimeout { get; set; }
         }
 
-        public static object HandleCommand(JObject parameters)
+        public static async Task<object> HandleCommand(JObject parameters)
         {
             var p = new ToolParams(parameters);
             var code = p.Get("code")
@@ -65,10 +72,28 @@ namespace UnityCliConnector.Tools
 
             var cscPath = p.Get("csc");
             var dotnetPath = p.Get("dotnet");
-            return CompileAndExecute(BuildSource(code, extraUsings), cscPath, dotnetPath);
+            var awaitTimeout = p.GetInt("await_timeout") ?? p.GetInt("awaitTimeout") ?? ExecAwait.DefaultTimeoutMs;
+            return await CompileAndExecute(BuildSource(code, extraUsings, DetectBodyKind(code)),
+                cscPath, dotnetPath, awaitTimeout);
         }
 
-        private static string BuildSource(string code, List<string> extraUsings)
+        private enum BodyKind { Sync, Async, Iterator }
+
+        /// <summary>
+        /// Picks the signature the body is compiled into. Only the keywords the body
+        /// actually uses decide this: an async signature would break ref-struct locals
+        /// (CS4012) and an iterator signature breaks plain returns, so neither is used
+        /// unless the submitted code asks for it. A body that merely *returns* a Task
+        /// needs no special signature — ExecAwait unwraps it after invocation.
+        /// </summary>
+        private static BodyKind DetectBodyKind(string code)
+        {
+            if (Regex.IsMatch(code, @"\byield\s+(return|break)\b")) return BodyKind.Iterator;
+            if (Regex.IsMatch(code, @"\b(await|async)\b")) return BodyKind.Async;
+            return BodyKind.Sync;
+        }
+
+        private static string BuildSource(string code, List<string> extraUsings, BodyKind kind)
         {
             var sb = new StringBuilder();
             foreach (var u in DefaultUsings)
@@ -78,14 +103,26 @@ namespace UnityCliConnector.Tools
 
             sb.AppendLine();
             sb.AppendLine("public static class __CliDynamic {");
-            sb.AppendLine("  public static object Execute() {");
+            switch (kind)
+            {
+                case BodyKind.Iterator:
+                    sb.AppendLine("  public static System.Collections.IEnumerator Execute() {");
+                    break;
+                case BodyKind.Async:
+                    sb.AppendLine("  public static async System.Threading.Tasks.Task<object> Execute() {");
+                    break;
+                default:
+                    sb.AppendLine("  public static object Execute() {");
+                    break;
+            }
             sb.AppendLine(code);
             sb.AppendLine("  }");
             sb.AppendLine("}");
             return sb.ToString();
         }
 
-        private static object CompileAndExecute(string source, string cscOverride = null, string dotnetOverride = null)
+        private static async Task<object> CompileAndExecute(string source, string cscOverride = null,
+            string dotnetOverride = null, int awaitTimeoutMs = ExecAwait.DefaultTimeoutMs)
         {
             var utf8 = new UTF8Encoding(false);
             var tmpDir = Path.Combine(Path.GetTempPath(), "unity-cli-exec");
@@ -191,7 +228,38 @@ namespace UnityCliConnector.Tools
                     var inner = tie.InnerException ?? tie;
                     return new ErrorResponse($"Runtime error: {inner.GetType().Name}: {inner.Message}");
                 }
-                return new SuccessResponse("OK", Serialize(result, 0));
+
+                // An async body reports its exceptions on the returned Task, not as a
+                // TargetInvocationException, so both paths have to be handled.
+                var outcome = await ExecAwait.ResolveAsync(result, awaitTimeoutMs);
+
+                if (outcome.Error != null)
+                    return new ErrorResponse($"Runtime error: {outcome.Error.GetType().Name}: {outcome.Error.Message}");
+
+                if (outcome.TimedOut)
+                {
+                    var budget = awaitTimeoutMs <= 0
+                        ? "no timeout is set"
+                        : $"await_timeout of {awaitTimeoutMs}ms is set";
+                    return new ErrorResponse(
+                        $"exec timed out with the returned operation still unfinished (status: {outcome.Status}, " +
+                        $"steps: {outcome.Steps}, {budget}). The operation is still running in the editor and its " +
+                        "result is not observable from this response; a domain reload would also drop it silently. " +
+                        "Raise --await_timeout, or park the result somewhere durable (static field, ScriptableObject) " +
+                        "and read it back with a second exec.",
+                        new
+                        {
+                            timed_out = true,
+                            status = outcome.Status,
+                            steps = outcome.Steps,
+                            await_timeout_ms = awaitTimeoutMs,
+                        });
+                }
+
+                var message = outcome.Steps > 0
+                    ? $"OK (routine completed in {outcome.Steps} steps)"
+                    : "OK";
+                return new SuccessResponse(message, Serialize(outcome.Value, 0));
             }
             finally
             {
@@ -281,6 +349,18 @@ namespace UnityCliConnector.Tools
             if (type.IsPrimitive || type == typeof(string) || type == typeof(decimal)) return obj;
             if (type.IsEnum) return obj.ToString();
             if (type.Name.StartsWith("FixedString")) return obj.ToString();
+            // A Task still reachable here was never awaited (nested inside a collection
+            // or a field). Reflecting over it yields AsyncState/Status noise, so name
+            // the state instead.
+            if (obj is Task task)
+            {
+                if (task.IsCompleted && !task.IsFaulted && !task.IsCanceled)
+                {
+                    var inner = TaskResultOf(task);
+                    return inner == null ? "<completed>" : Serialize(inner, depth + 1);
+                }
+                return $"<task {task.Status}>";
+            }
             if (obj is IDictionary dict)
             {
                 var r = new Dictionary<string, object>();
@@ -314,6 +394,12 @@ namespace UnityCliConnector.Tools
                 }
             }
             return obj.ToString();
+        }
+
+        private static object TaskResultOf(Task task)
+        {
+            // Non-generic Task has no Result property.
+            return task.GetType().GetProperty("Result")?.GetValue(task);
         }
     }
 }
