@@ -27,6 +27,7 @@ namespace UnityCliConnector
         static readonly object s_WriteLock = new();
         static string s_ProjectPath;
         static string s_UnityVersion;
+        static string s_EditorPath;
         static int s_Pid;
         static string s_LastState = "ready";
         static bool s_LastCompileErrors;
@@ -106,6 +107,7 @@ namespace UnityCliConnector
             {
                 s_ProjectPath = Application.dataPath.Replace("/Assets", "");
                 s_UnityVersion = Application.unityVersion;
+                s_EditorPath = EditorApplication.applicationPath;
                 s_Pid = System.Diagnostics.Process.GetCurrentProcess().Id;
                 GetFilePath();
             }
@@ -136,6 +138,8 @@ namespace UnityCliConnector
                 port = HttpServer.Port,
                 pid = s_Pid,
                 unityVersion = s_UnityVersion,
+                // Read by "unity-cli restart" to relaunch the same editor after this process exits.
+                editorPath = s_EditorPath,
                 connectorVersion = GetConnectorVersion(),
                 timestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
                 compileErrors = s_LastCompileErrors,

@@ -19,6 +19,7 @@ type Instance struct {
 	Port             int    `json:"port"`
 	PID              int    `json:"pid"`
 	UnityVersion     string `json:"unityVersion,omitempty"`
+	EditorPath       string `json:"editorPath,omitempty"`
 	ConnectorVersion string `json:"connectorVersion,omitempty"`
 	Timestamp        int64  `json:"timestamp,omitempty"`
 	CompileErrors    bool   `json:"compileErrors,omitempty"`
@@ -64,6 +65,11 @@ type CommandResponse struct {
 // so the instance file is preserved.
 // Defaults to the OS-specific implementation; overridden in tests.
 var isProcessDead = checkProcessDead
+
+// ProcessDead reports whether pid is confirmed not to be running.
+func ProcessDead(pid int) bool {
+	return isProcessDead(pid)
+}
 
 func instancesDir() string {
 	home, _ := os.UserHomeDir()
@@ -218,7 +224,13 @@ func Send(inst *Instance, command string, params interface{}, timeoutMs int) (*C
 	}
 
 	url := fmt.Sprintf("http://127.0.0.1:%d/command", inst.Port)
-	httpClient := &http.Client{Timeout: time.Duration(timeoutMs) * time.Millisecond}
+	httpClient := &http.Client{
+		Timeout: time.Duration(timeoutMs) * time.Millisecond,
+		// The connector's listener can write a stray empty response while it shuts
+		// down (e.g. after "manage_editor quit"); on a pooled idle connection net/http
+		// logs that as "Unsolicited response received on idle HTTP channel".
+		Transport: &http.Transport{DisableKeepAlives: true},
+	}
 
 	resp, err := httpClient.Post(url, "application/json", bytes.NewReader(body))
 	if err != nil {

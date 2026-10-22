@@ -154,6 +154,7 @@ Before compiling or reloading, the Connector records the state (`compiling`, `re
 | `modal` | Inspect and answer a modal dialog blocking the editor (macOS) |
 | `list` | Show all available tools with parameter schemas |
 | `status` | Show Unity Editor connection state |
+| `restart` | Quit and relaunch Unity, optionally wiping `Library/` and `Temp/` |
 | `update` | Self-update the CLI binary |
 
 ### Editor Control
@@ -369,6 +370,30 @@ unity-cli status
 ```
 
 The CLI also checks Unity's state automatically before sending any command. If Unity is busy (compiling, reloading), it waits for Unity to become responsive. If a modal dialog is open (state `modal`), it fails immediately and shows the dialog; see [Modal Dialogs](#modal-dialogs-macos).
+
+### Restart / Rebuild Library
+
+```bash
+# Quit Unity, relaunch the same editor on the same project, wait until ready
+unity-cli restart
+
+# Also delete Library/ and Temp/ (full reimport) — fixes a corrupted Library
+unity-cli restart --clean
+
+# Kill Unity if it is wedged or a dialog blocks it (unsaved changes are lost)
+unity-cli restart --clean --force
+
+# Save (or discard) dirty open scenes instead of refusing to quit
+unity-cli restart --auto-save-scenes
+unity-cli restart --allow-dirty-scenes
+
+# Start a project whose editor is not running
+unity-cli --project ~/Work/MyGame restart
+```
+
+`restart` reads the PID, project path and editor location from the last heartbeat, so it works even when Unity no longer answers. It asks the connector to quit first; Unity refuses while open scenes have unsaved changes, and that refusal is never overridden. An editor that is unresponsive, blocked by a modal dialog, or ignores the quit request is killed only with `--force`. If Unity has already finished quitting but its process lingers, it is killed without `--force`, since nothing unsaved is left.
+
+After relaunching, the CLI waits (default 30 minutes, `--wait-timeout <ms>`) until the connector reports `ready`. If a dialog opens during startup, `restart` exits with its text and buttons so it can be answered with `unity-cli modal answer`. Dialogs shown before scripts load (e.g. Safe Mode) are not visible to the connector. `--no-wait` returns right after launch; `--editor <path>` overrides which editor is launched (by default, the running editor, or the Unity Hub install matching `ProjectSettings/ProjectVersion.txt`).
 
 ## Global Options
 

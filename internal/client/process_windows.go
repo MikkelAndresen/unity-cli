@@ -46,3 +46,12 @@ func checkProcessDead(pid int) bool {
 	}
 	return exitCode != stillActive
 }
+
+const (
+	detachedProcess       = 0x00000008
+	createNewProcessGroup = 0x00000200
+)
+
+func detachedProcAttr() *syscall.SysProcAttr {
+	return &syscall.SysProcAttr{CreationFlags: detachedProcess | createNewProcessGroup}
+}

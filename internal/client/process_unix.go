@@ -32,3 +32,7 @@ func checkProcessDead(pid int) bool {
 	// Unknown error — be conservative, assume alive
 	return false
 }
+
+func detachedProcAttr() *syscall.SysProcAttr {
+	return &syscall.SysProcAttr{Setsid: true}
+}

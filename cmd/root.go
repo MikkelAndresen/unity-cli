@@ -65,6 +65,8 @@ func Execute() error {
 		return nil
 	case "update":
 		return updateCmd(subArgs)
+	case "restart":
+		return restartFromFlags(subArgs)
 	case "status":
 		inst, err := discoverStatusInstance(flagProject, flagPort)
 		if err != nil {
@@ -429,6 +431,11 @@ Custom Tools:
 Status:
   status                        Show Unity Editor state (ready, compiling, etc.)
 
+Restart:
+  restart                       Quit Unity, relaunch it, and wait until ready
+  restart --clean               Also delete Library/ and Temp/ (full reimport)
+  restart --force               Kill Unity if it is unresponsive or blocked
+
 Update:
   update                        Update to the latest version
   update --check                Check for updates without installing
@@ -681,6 +688,43 @@ printed (see "unity-cli modal --help").
 
 Example:
   unity-cli status
+`)
+	case "restart":
+		fmt.Print(`Usage: unity-cli restart [options]
+
+Quit the Unity Editor, optionally delete Library/ and Temp/, relaunch the
+same editor on the same project, and wait until the connector reports ready.
+Works when Unity is wedged: the PID, project and editor location come from
+the last heartbeat, not from a live request.
+
+Options:
+  --clean               Delete Library/ and Temp/ before relaunching. Unity
+                        reimports the whole project, which can take minutes.
+  --force               Kill Unity when it cannot be asked to quit (stale
+                        heartbeat, modal dialog) or ignores the request.
+                        Unsaved changes are lost.
+  --auto-save-scenes    Save dirty open scenes before quitting
+  --allow-dirty-scenes  Quit even when open scenes have unsaved changes
+  --no-wait             Return right after launching
+  --wait-timeout <ms>   How long to wait for ready (default: 1800000)
+  --editor <path>       Unity.app / Unity executable to launch. Defaults to
+                        the running editor, or the Unity Hub install matching
+                        ProjectSettings/ProjectVersion.txt.
+
+With no running editor, --project <dir> naming a Unity project starts it.
+
+By default Unity refuses to quit while open scenes have unsaved changes,
+and the CLI never kills an editor without --force. A dialog that opens
+during startup is reported once the connector loads; answer it with
+"unity-cli modal answer". Dialogs raised before scripts load (e.g. Safe
+Mode) are not visible to the connector.
+
+Examples:
+  unity-cli restart
+  unity-cli restart --clean
+  unity-cli restart --clean --force --auto-save-scenes
+  unity-cli --project ~/Work/MyGame restart
+  unity-cli restart --editor /Applications/Unity/Hub/Editor/6000.4.4f1/Unity.app
 `)
 	case "update":
 		fmt.Print(`Usage: unity-cli update [options]

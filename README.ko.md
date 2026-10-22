@@ -154,6 +154,7 @@ Unity 커넥터의 동작:
 | `modal` | 에디터를 막고 있는 모달 다이얼로그 확인 및 응답 (macOS) |
 | `list` | 사용 가능한 모든 도구와 파라미터 스키마 표시 |
 | `status` | Unity Editor 연결 상태 확인 |
+| `restart` | Unity 종료 후 재실행, 선택적으로 `Library/`와 `Temp/` 삭제 |
 | `update` | CLI 바이너리 자동 업데이트 |
 
 ### Editor 제어
@@ -369,6 +370,30 @@ unity-cli status
 ```
 
 명령 전송 전에 CLI가 자동으로 Unity 상태를 확인합니다. Unity가 바쁜 상태(컴파일, 리로드)이면 응답 가능해질 때까지 대기합니다. 모달 다이얼로그가 열려 있으면(상태 `modal`) 즉시 실패하고 다이얼로그 내용을 보여줍니다. [모달 다이얼로그](#모달-다이얼로그-macos)를 참고하세요.
+
+### 재시작 / Library 재빌드
+
+```bash
+# Unity를 종료하고 같은 에디터로 같은 프로젝트를 다시 열어 ready까지 대기
+unity-cli restart
+
+# Library/와 Temp/도 삭제 (전체 재임포트) — 손상된 Library 복구
+unity-cli restart --clean
+
+# Unity가 멈췄거나 다이얼로그에 막혀 있으면 강제 종료 (저장하지 않은 변경 사항은 사라짐)
+unity-cli restart --clean --force
+
+# 종료를 거부하는 대신 dirty 씬을 저장(또는 버림)
+unity-cli restart --auto-save-scenes
+unity-cli restart --allow-dirty-scenes
+
+# 에디터가 실행 중이지 않은 프로젝트 시작
+unity-cli --project ~/Work/MyGame restart
+```
+
+`restart`는 마지막 heartbeat에서 PID, 프로젝트 경로, 에디터 위치를 읽으므로 Unity가 더 이상 응답하지 않아도 동작합니다. 먼저 Connector에 종료를 요청하며, 열린 씬에 저장하지 않은 변경 사항이 있으면 Unity가 종료를 거부하고 이 거부는 절대 무시되지 않습니다. 응답하지 않거나, 모달 다이얼로그에 막혀 있거나, 종료 요청을 무시하는 에디터는 `--force`일 때만 강제 종료합니다. Unity가 이미 종료 처리를 마쳤는데 프로세스만 남아 있으면 저장할 것이 없으므로 `--force` 없이도 강제 종료합니다.
+
+재실행 후 Connector가 `ready`를 보고할 때까지 대기합니다 (기본 30분, `--wait-timeout <ms>`). 시작 중 다이얼로그가 뜨면 텍스트와 버튼을 출력하고 종료하므로 `unity-cli modal answer`로 응답할 수 있습니다. 스크립트가 로드되기 전의 다이얼로그(예: Safe Mode)는 Connector가 볼 수 없습니다. `--no-wait`은 실행 직후 반환하고, `--editor <path>`는 실행할 에디터를 지정합니다 (기본값: 실행 중이던 에디터, 또는 `ProjectSettings/ProjectVersion.txt`에 맞는 Unity Hub 설치 경로).
 
 ## 글로벌 옵션
 

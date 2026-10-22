@@ -7,7 +7,7 @@ using UnityEditorInternal;
 
 namespace UnityCliConnector.Tools
 {
-    [UnityCliTool(Description = "Controls Unity editor state. Actions: play, stop, pause, refresh, set_active_tool, add_tag, remove_tag, add_layer, remove_layer.")]
+    [UnityCliTool(Description = "Controls Unity editor state. Actions: play, stop, pause, quit, refresh, set_active_tool, add_tag, remove_tag, add_layer, remove_layer.")]
     public static class ManageEditor
     {
         private const int FirstUserLayerIndex = 8;
@@ -16,7 +16,7 @@ namespace UnityCliConnector.Tools
 
         public class Parameters
         {
-            [ToolParameter("Action to perform: play, stop, pause, refresh, set_active_tool, add_tag, remove_tag, add_layer, remove_layer", Required = true)]
+            [ToolParameter("Action to perform: play, stop, pause, quit, refresh, set_active_tool, add_tag, remove_tag, add_layer, remove_layer", Required = true)]
             public string Action { get; set; }
 
             [ToolParameter("Wait for action to complete before responding")]
@@ -30,6 +30,12 @@ namespace UnityCliConnector.Tools
 
             [ToolParameter("Layer name (required for add_layer/remove_layer actions)")]
             public string LayerName { get; set; }
+
+            [ToolParameter("quit: exit even when open scenes have unsaved changes (they are discarded)")]
+            public bool AllowDirtyScenes { get; set; }
+
+            [ToolParameter("quit: save dirty open scenes before exiting")]
+            public bool AutoSaveScenes { get; set; }
         }
 
         public static async Task<object> HandleCommand(JObject @params)
@@ -81,6 +87,9 @@ namespace UnityCliConnector.Tools
                     }
                     return new SuccessResponse("Already stopped (not in play mode).");
 
+                case "quit":
+                    return Quit(p);
+
                 case "set_active_tool":
                     var toolNameResult = p.GetRequired("tool_name", "'tool_name' parameter required.");
                     if (!toolNameResult.IsSuccess) return new ErrorResponse(toolNameResult.ErrorMessage);
@@ -116,6 +125,29 @@ namespace UnityCliConnector.Tools
                 default:
                     return new ErrorResponse($"Unknown action: '{action}'.");
             }
+        }
+
+        private static object Quit(ToolParams p)
+        {
+            var blocked = DirtyScenes.Prepare(
+                p.GetBool("allow_dirty_scenes"),
+                p.GetBool("auto_save_scenes"),
+                "Open scenes have unsaved changes. Save or discard them before quitting.");
+            if (blocked != null)
+                return blocked;
+
+            AssetDatabase.SaveAssets();
+            // Deferred so the HTTP response is flushed before the process goes away.
+            // Not delayCall: it waits for an inspector update, which never comes while
+            // the editor is in the background. EditorApplication.Exit skips the
+            // "save changes?" prompt, which is what the dirty-scene guard stands in for.
+            void ExitOnNextUpdate()
+            {
+                EditorApplication.update -= ExitOnNextUpdate;
+                EditorApplication.Exit(0);
+            }
+            EditorApplication.update += ExitOnNextUpdate;
+            return new SuccessResponse("Quitting Unity.", new { pid = System.Diagnostics.Process.GetCurrentProcess().Id });
         }
 
         private static object ManageLayer(string action, ToolParams p)

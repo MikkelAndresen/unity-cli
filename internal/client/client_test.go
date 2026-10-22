@@ -373,3 +373,16 @@ func TestDiscoverInstance_PortFlagRequiresActiveInstance(t *testing.T) {
 		t.Fatal("expected error for port without an active instance file")
 	}
 }
+
+func TestEditorExecutable(t *testing.T) {
+	cases := map[string]string{
+		"/Applications/Unity/Hub/Editor/6000.4.4f1/Unity.app":  "/Applications/Unity/Hub/Editor/6000.4.4f1/Unity.app/Contents/MacOS/Unity",
+		"/Applications/Unity/Hub/Editor/6000.4.4f1/Unity.app/": "/Applications/Unity/Hub/Editor/6000.4.4f1/Unity.app/Contents/MacOS/Unity",
+		"/opt/unity/Editor/Unity":                              "/opt/unity/Editor/Unity",
+	}
+	for in, want := range cases {
+		if got := EditorExecutable(in); got != want {
+			t.Errorf("EditorExecutable(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
