@@ -24,8 +24,9 @@ func checkProcessDead(pid int) bool {
 	if errors.Is(err, syscall.EPERM) {
 		return false
 	}
-	// ESRCH means the process does not exist
-	if errors.Is(err, syscall.ESRCH) {
+	// ESRCH means the process does not exist. os.Process.Signal reports it as
+	// os.ErrProcessDone rather than the raw errno.
+	if errors.Is(err, os.ErrProcessDone) || errors.Is(err, syscall.ESRCH) {
 		return true
 	}
 	// Unknown error — be conservative, assume alive
