@@ -36,6 +36,13 @@ func Execute() error {
 		os.Exit(1)
 	}
 
+	timeoutSet := false
+	flag.CommandLine.Visit(func(f *flag.Flag) {
+		if f.Name == "timeout" {
+			timeoutSet = true
+		}
+	})
+
 	if len(cmdArgs) == 0 {
 		printHelp()
 		return nil
@@ -71,6 +78,21 @@ func Execute() error {
 			return err
 		}
 		return statusCmd(inst)
+	case "editor":
+		// restart must run before discovery: it has to work with no live editor
+		// and it stops the one discovery would otherwise require. The other
+		// editor subcommands fall through to the normal send path below.
+		if len(subArgs) > 0 && subArgs[0] == "restart" {
+			resp, err := restartCmd(subArgs[1:], newRestartDeps(timeoutSet))
+			if err != nil {
+				return err
+			}
+			printResponse(resp)
+			if !resp.Success {
+				os.Exit(1)
+			}
+			return nil
+		}
 	}
 
 	inst, err := client.DiscoverInstance(flagProject, flagPort)
@@ -357,6 +379,8 @@ Editor Control:
   editor pause                  Toggle pause/resume (play mode only)
   editor refresh [--force]      Refresh asset database (blocked in play mode unless forced)
   editor refresh --compile      Recompile scripts and wait until done
+  editor restart [--clean] [--save] [--editor-path <exe>]
+                                Quit, optionally clean Library/Temp, relaunch, wait until ready
 
 Console:
   console                       Read error & warning logs (default)
@@ -453,7 +477,7 @@ Notes:
 func printTopicHelp(topic string) {
 	switch topic {
 	case "editor":
-		fmt.Print(`Usage: unity-cli editor <play|stop|pause|refresh> [options]
+		fmt.Print(`Usage: unity-cli editor <play|stop|pause|refresh|restart> [options]
 
 Subcommands:
   play [--wait]       Enter play mode
@@ -465,12 +489,21 @@ Subcommands:
                       Blocked in play mode unless --force is set.
     --compile         Recompile scripts and wait until compilation finishes.
     --force           Allow refresh during play mode and force asset update.
+  restart             Quit Unity, relaunch the same project, and wait until ready.
+                      Also works when no editor is running (plain launch).
+    --save            Save open scenes and assets before quitting.
+    --clean           Delete Library/ and Temp/ before relaunching (full reimport).
+    --editor-path <exe>  Unity executable to launch (default: $UNITY_EDITOR or Unity Hub).
+                      --timeout <ms> overrides the quit and startup budgets
+                      (default: 60s to quit; 5m to start, 15m with --clean).
 
 Examples:
   unity-cli editor play --wait
   unity-cli editor stop
   unity-cli editor refresh --compile
   unity-cli editor refresh --force
+  unity-cli editor restart
+  unity-cli editor restart --clean
 `)
 	case "console":
 		fmt.Print(`Usage: unity-cli console [options]

@@ -143,7 +143,7 @@ Unity 커넥터의 동작:
 
 | 명령어 | 설명 |
 |--------|------|
-| `editor` | Unity Editor play/stop/pause/refresh 제어 |
+| `editor` | Unity Editor play/stop/pause/refresh/restart 제어 |
 | `console` | 콘솔 로그 읽기, 필터링, 지우기 |
 | `exec` | Unity 안에서 임의 C# 코드 실행 |
 | `test` | EditMode/PlayMode 테스트 실행 |
@@ -180,6 +180,34 @@ unity-cli editor refresh --compile
 # 플레이모드 중 강제 새로고침
 unity-cli editor refresh --force
 ```
+
+### 재시작
+
+```bash
+# Unity를 종료하고 다시 실행한 뒤 준비될 때까지 대기
+unity-cli editor restart
+
+# 종료 전에 열린 씬과 에셋 저장
+unity-cli editor restart --save
+
+# 재실행 전에 Library/와 Temp/ 삭제 (전체 재임포트)
+unity-cli editor restart --clean
+
+# 특정 Unity 에디터 바이너리로 실행
+unity-cli editor restart --editor-path /Applications/Unity/Hub/Editor/6000.1.0f1/Unity.app/Contents/MacOS/Unity
+```
+
+`editor restart`는 에디터를 멈추기 전에 프로젝트를 먼저 확인하고(실행 중인
+인스턴스, `--project`, 또는 현재 디렉터리), 종료한 뒤 선택적으로 `Library/`와
+`Temp/`를 삭제하고 다시 실행하여 새 에디터가 `ready` 상태가 될 때까지 기다립니다.
+진행 상황과 삭제된 경로는 stderr로 출력되고, 최종 JSON에는 프로젝트 경로, 이전/새
+PID, 삭제된 경로, 경과 시간이 담깁니다.
+
+기본 대기 시간은 5분이며 `--clean` 사용 시 15분입니다. `--timeout`은 이 대기
+시간과 60초 종료 대기를 함께 덮어씁니다. 재시작은 Unity를 강제 종료하지 않습니다.
+모달 다이얼로그가 종료를 막고 있으면 먼저 응답해야 합니다. 시작이 멈춘 것 같으면
+에디터 창에 다이얼로그(안전 모드, 백업 복원, 버전 업그레이드)가 떠 있는지
+확인하세요.
 
 ### 콘솔 로그
 
@@ -376,7 +404,7 @@ unity-cli status
 |--------|------|--------|
 | `--port <N>` | 활성 heartbeat 포트로 Unity 인스턴스 선택 | auto |
 | `--project <path>` | 프로젝트 경로로 Unity 인스턴스 선택 | latest |
-| `--timeout <ms>` | HTTP 요청 타임아웃 | 120000 |
+| `--timeout <ms>` | HTTP 요청 타임아웃, `editor restart` 대기 시간에도 적용 | 120000 |
 | `--ignore-version-mismatch` | CLI와 connector 버전이 달라도 실행 | false |
 
 ```bash

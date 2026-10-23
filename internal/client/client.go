@@ -65,6 +65,16 @@ type CommandResponse struct {
 // Defaults to the OS-specific implementation; overridden in tests.
 var isProcessDead = checkProcessDead
 
+// IsProcessAlive reports whether pid is running. It is conservative: true is
+// also returned when liveness cannot be determined (permission denied, or a PID
+// from a different namespace), so callers must not treat true as proof of life.
+func IsProcessAlive(pid int) bool {
+	if pid <= 0 {
+		return false
+	}
+	return !isProcessDead(pid)
+}
+
 func instancesDir() string {
 	home, _ := os.UserHomeDir()
 	return filepath.Join(home, ".unity-cli", "instances")
