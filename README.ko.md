@@ -143,7 +143,7 @@ Unity 커넥터의 동작:
 
 | 명령어 | 설명 |
 |--------|------|
-| `editor` | Unity Editor play/stop/pause/refresh/restart 제어 |
+| `editor` | Unity Editor play/stop/pause/refresh/quit/restart 제어 |
 | `console` | 콘솔 로그 읽기, 필터링, 지우기 |
 | `exec` | Unity 안에서 임의 C# 코드 실행 |
 | `test` | EditMode/PlayMode 테스트 실행 |
@@ -181,6 +181,32 @@ unity-cli editor refresh --compile
 unity-cli editor refresh --force
 ```
 
+### 종료
+
+```bash
+# 종료하고 Unity가 실제로 끝날 때까지 대기 (저장하지 않은 씬 변경은 버려짐)
+unity-cli editor quit
+
+# 열린 씬과 에셋을 먼저 저장
+unity-cli editor quit --save
+
+# 종료 요청이 무시되거나 모달 다이얼로그가 막으면 프로세스를 강제 종료
+unity-cli editor quit --force
+```
+
+`exec "EditorApplication.Exit(0)"` 대신 `editor quit`을 사용하세요. 커맨드 핸들러
+안에서 `Exit`을 호출하면 응답과 경쟁하게 되어, 커맨드 잠금을 쥔 채 에디터가 계속
+실행될 수 있습니다. `editor quit`은 응답을 보낸 뒤에 종료하고, heartbeat가
+`stopped`가 되거나 프로세스가 사라질 때까지 기다립니다. 60초 안에 둘 다 일어나지
+않으면 실패합니다(`--timeout`으로 변경 가능).
+
+`--force`를 주면 제때 종료되지 않거나 모달 다이얼로그에 멈춘 에디터를 강제
+종료합니다(macOS/Linux는 SIGTERM, Windows는 `TerminateProcess`). 저장하지 않은
+변경은 사라집니다. CLI는 프로세스 이름에 `Unity`가 들어간 PID에만 시그널을
+보냅니다. 호스트 에디터의 PID가 보이지 않는 컨테이너에서는 `--force`가 실패하므로
+호스트에서 Unity를 종료해야 합니다. 최종 JSON의 `method`는 `graceful` 또는
+`terminate`입니다.
+
 ### 재시작
 
 ```bash
@@ -204,8 +230,9 @@ unity-cli editor restart --editor-path /Applications/Unity/Hub/Editor/6000.1.0f1
 PID, 삭제된 경로, 경과 시간이 담깁니다.
 
 기본 대기 시간은 5분이며 `--clean` 사용 시 15분입니다. `--timeout`은 이 대기
-시간과 60초 종료 대기를 함께 덮어씁니다. 재시작은 Unity를 강제 종료하지 않습니다.
-모달 다이얼로그가 종료를 막고 있으면 먼저 응답해야 합니다. 시작이 멈춘 것 같으면
+시간과 60초 종료 대기를 함께 덮어씁니다. 재시작은 `editor quit`과 같은 방식으로
+Unity를 종료하며, `--force` 없이는 강제 종료하지 않습니다. 모달 다이얼로그가
+종료를 막고 있으면 먼저 응답해야 합니다. 시작이 멈춘 것 같으면
 에디터 창에 다이얼로그(안전 모드, 백업 복원, 버전 업그레이드)가 떠 있는지
 확인하세요.
 
@@ -404,7 +431,7 @@ unity-cli status
 |--------|------|--------|
 | `--port <N>` | 활성 heartbeat 포트로 Unity 인스턴스 선택 | auto |
 | `--project <path>` | 프로젝트 경로로 Unity 인스턴스 선택 | latest |
-| `--timeout <ms>` | HTTP 요청 타임아웃, `editor restart` 대기 시간에도 적용 | 120000 |
+| `--timeout <ms>` | HTTP 요청 타임아웃, `editor quit`/`restart` 대기 시간에도 적용 | 120000 |
 | `--ignore-version-mismatch` | CLI와 connector 버전이 달라도 실행 | false |
 
 ```bash

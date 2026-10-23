@@ -143,7 +143,7 @@ Before compiling or reloading, the Connector records the state (`compiling`, `re
 
 | Command | Description |
 |---------|-------------|
-| `editor` | Play/stop/pause/refresh/restart the Unity Editor |
+| `editor` | Play/stop/pause/refresh/quit/restart the Unity Editor |
 | `console` | Read, filter, and clear console logs |
 | `exec` | Run arbitrary C# code inside Unity |
 | `test` | Run EditMode/PlayMode tests |
@@ -181,6 +181,32 @@ unity-cli editor refresh --compile
 unity-cli editor refresh --force
 ```
 
+### Quit
+
+```bash
+# Quit and wait until Unity has actually exited (unsaved scene changes are discarded)
+unity-cli editor quit
+
+# Save open scenes and assets first
+unity-cli editor quit --save
+
+# Terminate Unity if it ignores the quit or a modal dialog blocks it
+unity-cli editor quit --force
+```
+
+Use `editor quit` rather than `exec "EditorApplication.Exit(0)"`. Calling `Exit`
+from inside a command handler races the reply and can leave the editor running
+with the command lock held. `editor quit` defers the exit until the reply is
+sent, then waits until the heartbeat reports `stopped` or the process is gone,
+and fails if neither happens within 60 seconds (`--timeout` overrides it).
+
+With `--force`, an editor that does not exit in time, or that is parked on a
+modal dialog, is terminated (SIGTERM on macOS/Linux, `TerminateProcess` on
+Windows). Unsaved changes are lost. The CLI only signals a PID whose process
+name contains `Unity`. When the CLI runs in a container that cannot see the host
+editor's PID, `--force` fails and Unity has to be stopped from the host. The final
+JSON reports `method`: `graceful` or `terminate`.
+
 ### Restart
 
 ```bash
@@ -204,8 +230,9 @@ instance, `--project`, or the current directory), quits it, optionally removes
 project path, old and new PIDs, cleaned paths, and elapsed time.
 
 The default wait budget is 5 minutes, or 15 minutes with `--clean`; `--timeout`
-overrides both that and the 60-second quit wait. Restart never force-kills Unity:
-if a modal dialog blocks quitting, answer it first. If startup stalls, a dialog
+overrides both that and the 60-second quit wait. Restart stops Unity the same way
+as `editor quit`. Without `--force` it never kills the process, so if a modal
+dialog blocks quitting, answer it first. If startup stalls, a dialog
 may be waiting in the editor window (safe mode, restore backup, or version upgrade).
 
 ### Console Logs
@@ -403,7 +430,7 @@ The CLI also checks Unity's state automatically before sending any command. If U
 |------|-------------|---------|
 | `--port <N>` | Select Unity instance by active heartbeat port | auto |
 | `--project <path>` | Select Unity instance by project path | latest |
-| `--timeout <ms>` | HTTP request timeout; also bounds `editor restart` waits | 120000 |
+| `--timeout <ms>` | HTTP request timeout; also bounds `editor quit`/`restart` waits | 120000 |
 | `--ignore-version-mismatch` | Run even when CLI and connector versions differ | false |
 
 ```bash

@@ -31,6 +31,7 @@ type restartDeps struct {
 	discover        func(project string, port int) (*client.Instance, error)
 	send            func(inst *client.Instance, command string, params interface{}, timeoutMs int) (*client.CommandResponse, error)
 	waitForExit     func(editor.WaitForExitOptions) error
+	terminate       func(pid int) error
 	cleanProject    func(string) ([]string, error)
 	validateProject func(string) error
 	readVersion     func(string) (string, error)
@@ -51,6 +52,7 @@ func newRestartDeps(timeoutSet bool) restartDeps {
 		discover:        client.DiscoverInstance,
 		send:            client.Send,
 		waitForExit:     editor.WaitForExit,
+		terminate:       editor.Terminate,
 		cleanProject:    editor.CleanProject,
 		validateProject: editor.ValidateProject,
 		readVersion:     editor.ReadProjectVersion,
@@ -105,29 +107,8 @@ func restartCmd(args []string, deps restartDeps) (*client.CommandResponse, error
 	cleaned := []string{}
 
 	if target.pid > 0 {
-		if isModal(target.inst) {
-			return nil, modalBlockedError(target.inst, "editor restart", false)
-		}
-
-		restartLog(deps.stderr, "Stopping Unity (pid %d) for %s...\n", target.pid, target.projectPath)
-		resp, sendErr := deps.send(target.inst, "quit_editor", map[string]interface{}{"save": save}, quitRequestTimeoutMs)
-		if sendErr != nil {
-			// The editor can tear down its HTTP server before the reply reaches us.
-			restartLog(deps.stderr, "Warning: quit request failed (%v); waiting for Unity to exit anyway.\n", sendErr)
-		} else if resp != nil && !resp.Success {
-			return nil, fmt.Errorf("unity refused to quit: %s", resp.Message)
-		}
-
-		restartLog(deps.stderr, "Waiting for Unity to exit...\n")
-		if err := deps.waitForExit(editor.WaitForExitOptions{
-			PID:         target.pid,
-			ProjectPath: target.projectPath,
-			Timeout:     quitTimeout,
-		}); err != nil {
-			if errors.Is(err, editor.ErrEditorModal) {
-				return nil, restartModalError(deps, target.projectPath)
-			}
-			return nil, fmt.Errorf("%w\nIf a modal dialog is open, answer it with: unity-cli modal answer --button \"<title>\"", err)
+		if _, err := stopEditor(deps, target, save, subFlagEnabled(flags, "force"), quitTimeout, "editor restart"); err != nil {
+			return nil, err
 		}
 	}
 

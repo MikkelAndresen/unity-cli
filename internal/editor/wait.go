@@ -32,6 +32,10 @@ type WaitForExitOptions struct {
 	PollInterval time.Duration
 	// StaleAfter defaults to 3s when <= 0.
 	StaleAfter time.Duration
+	// IgnoreModal keeps waiting through a "modal" heartbeat instead of returning
+	// ErrEditorModal. Set it after terminating the editor: the dead process
+	// leaves its last modal heartbeat behind until it goes stale.
+	IgnoreModal bool
 }
 
 // WaitForExit blocks until the editor is gone. It returns nil when any of the
@@ -81,7 +85,7 @@ func WaitForExit(opts WaitForExitOptions) error {
 			// Parse failures during a heartbeat rewrite are expected; they carry
 			// no exit signal and must not restart the stale timer.
 			if inst, err := readHeartbeat(opts.ProjectPath); err == nil && heartbeatMatchesPID(inst, opts.PID) {
-				if inst.State == "modal" {
+				if inst.State == "modal" && !opts.IgnoreModal {
 					return ErrEditorModal
 				}
 				if inst.State == "stopped" {

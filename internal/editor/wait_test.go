@@ -271,3 +271,26 @@ func TestWaitForExit_ModalBlocksExit(t *testing.T) {
 		t.Fatalf("expected ErrEditorModal, got %v", err)
 	}
 }
+
+func TestWaitForExit_IgnoreModalWaitsForStaleHeartbeat(t *testing.T) {
+	setTestHome(t)
+	project := "/work/FoW"
+	writeHeartbeat(t, project, client.Instance{
+		State:     "modal",
+		PID:       4242,
+		Timestamp: 1000,
+	})
+	stubProcessAlive(t, true)
+
+	err := WaitForExit(WaitForExitOptions{
+		PID:          4242,
+		ProjectPath:  project,
+		Timeout:      2 * time.Second,
+		PollInterval: 10 * time.Millisecond,
+		StaleAfter:   50 * time.Millisecond,
+		IgnoreModal:  true,
+	})
+	if err != nil {
+		t.Fatalf("a frozen modal heartbeat should count as exited once stale, got %v", err)
+	}
+}
