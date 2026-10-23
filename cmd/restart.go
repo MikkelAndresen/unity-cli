@@ -2,7 +2,6 @@ package cmd
 
 import (
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -272,12 +271,12 @@ func waitForRestartReady(deps restartDeps, projectPath string, oldPID int, timeo
 	}
 }
 
-func restartModalError(deps restartDeps, projectPath string) error {
+func stopModalError(deps restartDeps, projectPath, command string) error {
 	if inst, err := deps.readHeartbeat(projectPath); err == nil && isModal(inst) {
-		return fmt.Errorf("%s", "unity is still running because a modal dialog blocks it; the editor was not restarted.\n"+
-			describeModal(inst.Modal)+"answer it with: unity-cli modal answer --button \"<title>\"")
+		return fmt.Errorf("unity is still running because a modal dialog blocks it; %q did not complete.\n%sanswer it with: unity-cli modal answer --button \"<title>\", or pass --force to terminate the process",
+			command, describeModal(inst.Modal))
 	}
-	return errors.New("unity is still running because a modal dialog blocks it; the editor was not restarted, so answer the dialog in the Unity window and retry")
+	return fmt.Errorf("unity is still running because a modal dialog blocks it; %q did not complete, so answer the dialog in the Unity window and retry, or pass --force", command)
 }
 
 func restartLog(w io.Writer, format string, args ...interface{}) {

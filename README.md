@@ -199,6 +199,8 @@ from inside a command handler races the reply and can leave the editor running
 with the command lock held. `editor quit` defers the exit until the reply is
 sent, then waits until the heartbeat reports `stopped` or the process is gone,
 and fails if neither happens within 60 seconds (`--timeout` overrides it).
+`--save` refuses to quit while an untitled scene has unsaved changes, because
+saving it would open a file dialog that the CLI cannot answer.
 
 With `--force`, an editor that does not exit in time, or that is parked on a
 modal dialog, is terminated (SIGTERM on macOS/Linux, `TerminateProcess` on

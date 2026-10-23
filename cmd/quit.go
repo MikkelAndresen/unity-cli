@@ -89,7 +89,7 @@ func stopEditor(deps restartDeps, target *restartTarget, save, force bool, timeo
 		}
 		if !force {
 			if errors.Is(gracefulErr, editor.ErrEditorModal) {
-				return "", restartModalError(deps, target.projectPath)
+				return "", stopModalError(deps, target.projectPath, command)
 			}
 			return "", fmt.Errorf("%w\nIf a modal dialog is open, answer it with: unity-cli modal answer --button \"<title>\"\nor pass --force to terminate the process", gracefulErr)
 		}

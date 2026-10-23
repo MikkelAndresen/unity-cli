@@ -199,6 +199,8 @@ unity-cli editor quit --force
 실행될 수 있습니다. `editor quit`은 응답을 보낸 뒤에 종료하고, heartbeat가
 `stopped`가 되거나 프로세스가 사라질 때까지 기다립니다. 60초 안에 둘 다 일어나지
 않으면 실패합니다(`--timeout`으로 변경 가능).
+`--save`는 저장하지 않은 변경이 있는 제목 없는 씬이 있으면 종료를 거부합니다. 저장하려면
+CLI가 응답할 수 없는 파일 다이얼로그가 열리기 때문입니다.
 
 `--force`를 주면 제때 종료되지 않거나 모달 다이얼로그에 멈춘 에디터를 강제
 종료합니다(macOS/Linux는 SIGTERM, Windows는 `TerminateProcess`). 저장하지 않은
