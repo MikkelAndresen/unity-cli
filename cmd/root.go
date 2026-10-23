@@ -36,6 +36,13 @@ func Execute() error {
 		os.Exit(1)
 	}
 
+	timeoutSet := false
+	flag.CommandLine.Visit(func(f *flag.Flag) {
+		if f.Name == "timeout" {
+			timeoutSet = true
+		}
+	})
+
 	if len(cmdArgs) == 0 {
 		printHelp()
 		return nil
@@ -71,6 +78,26 @@ func Execute() error {
 			return err
 		}
 		return statusCmd(inst)
+	case "editor":
+		// restart and quit must run before the normal pipeline: restart has to
+		// work with no live editor, both stop the editor that pipeline would wait
+		// on, and quit --force must reach an editor parked on a modal dialog. The
+		// other editor subcommands fall through to the normal send path below.
+		if len(subArgs) > 0 && (subArgs[0] == "restart" || subArgs[0] == "quit") {
+			lifecycle := restartCmd
+			if subArgs[0] == "quit" {
+				lifecycle = quitCmd
+			}
+			resp, err := lifecycle(subArgs[1:], newRestartDeps(timeoutSet))
+			if err != nil {
+				return err
+			}
+			printResponse(resp)
+			if !resp.Success {
+				os.Exit(1)
+			}
+			return nil
+		}
 	}
 
 	inst, err := client.DiscoverInstance(flagProject, flagPort)
@@ -357,6 +384,9 @@ Editor Control:
   editor pause                  Toggle pause/resume (play mode only)
   editor refresh [--force]      Refresh asset database (blocked in play mode unless forced)
   editor refresh --compile      Recompile scripts and wait until done
+  editor quit [--save] [--force]  Quit Unity and wait until the process has exited
+  editor restart [--clean] [--save] [--force] [--editor-path <exe>]
+                                Quit, optionally clean Library/Temp, relaunch, wait until ready
 
 Console:
   console                       Read error & warning logs (default)
@@ -453,7 +483,7 @@ Notes:
 func printTopicHelp(topic string) {
 	switch topic {
 	case "editor":
-		fmt.Print(`Usage: unity-cli editor <play|stop|pause|refresh> [options]
+		fmt.Print(`Usage: unity-cli editor <play|stop|pause|refresh|quit|restart> [options]
 
 Subcommands:
   play [--wait]       Enter play mode
@@ -465,12 +495,29 @@ Subcommands:
                       Blocked in play mode unless --force is set.
     --compile         Recompile scripts and wait until compilation finishes.
     --force           Allow refresh during play mode and force asset update.
+  quit                Quit Unity and wait until the heartbeat or process confirms
+                      the exit. Unsaved scene changes are discarded unless --save.
+    --save            Save open scenes and assets before quitting.
+    --force           If Unity ignores the quit or a modal dialog blocks it,
+                      terminate the process (SIGTERM on unix).
+  restart             Quit Unity, relaunch the same project, and wait until ready.
+                      Also works when no editor is running (plain launch).
+    --save            Save open scenes and assets before quitting.
+    --force           Terminate Unity if it does not quit gracefully.
+    --clean           Delete Library/ and Temp/ before relaunching (full reimport).
+    --editor-path <exe>  Unity executable to launch (default: $UNITY_EDITOR or Unity Hub).
+                      --timeout <ms> overrides the quit and startup budgets
+                      (default: 60s to quit; 5m to start, 15m with --clean).
 
 Examples:
   unity-cli editor play --wait
   unity-cli editor stop
   unity-cli editor refresh --compile
   unity-cli editor refresh --force
+  unity-cli editor quit --save
+  unity-cli editor quit --force
+  unity-cli editor restart
+  unity-cli editor restart --clean
 `)
 	case "console":
 		fmt.Print(`Usage: unity-cli console [options]

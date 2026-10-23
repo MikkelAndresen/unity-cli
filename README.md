@@ -143,7 +143,7 @@ Before compiling or reloading, the Connector records the state (`compiling`, `re
 
 | Command | Description |
 |---------|-------------|
-| `editor` | Play/stop/pause/refresh the Unity Editor |
+| `editor` | Play/stop/pause/refresh/quit/restart the Unity Editor |
 | `console` | Read, filter, and clear console logs |
 | `exec` | Run arbitrary C# code inside Unity |
 | `test` | Run EditMode/PlayMode tests |
@@ -180,6 +180,62 @@ unity-cli editor refresh --compile
 # Force refresh while in play mode
 unity-cli editor refresh --force
 ```
+
+### Quit
+
+```bash
+# Quit and wait until Unity has actually exited (unsaved scene changes are discarded)
+unity-cli editor quit
+
+# Save open scenes and assets first
+unity-cli editor quit --save
+
+# Terminate Unity if it ignores the quit or a modal dialog blocks it
+unity-cli editor quit --force
+```
+
+Use `editor quit` rather than `exec "EditorApplication.Exit(0)"`. Calling `Exit`
+from inside a command handler races the reply and can leave the editor running
+with the command lock held. `editor quit` defers the exit until the reply is
+sent, then waits until the heartbeat reports `stopped` or the process is gone,
+and fails if neither happens within 60 seconds (`--timeout` overrides it).
+`--save` refuses to quit while an untitled scene has unsaved changes, because
+saving it would open a file dialog that the CLI cannot answer.
+
+With `--force`, an editor that does not exit in time, or that is parked on a
+modal dialog, is terminated (SIGTERM on macOS/Linux, `TerminateProcess` on
+Windows). Unsaved changes are lost. The CLI only signals a PID whose process
+name contains `Unity`. When the CLI runs in a container that cannot see the host
+editor's PID, `--force` fails and Unity has to be stopped from the host. The final
+JSON reports `method`: `graceful` or `terminate`.
+
+### Restart
+
+```bash
+# Quit, relaunch, and wait until Unity is ready
+unity-cli editor restart
+
+# Save open scenes and assets before quitting
+unity-cli editor restart --save
+
+# Delete Library/ and Temp/ before relaunching (forces a full reimport)
+unity-cli editor restart --clean
+
+# Launch a specific Unity editor binary
+unity-cli editor restart --editor-path /Applications/Unity/Hub/Editor/6000.1.0f1/Unity.app/Contents/MacOS/Unity
+```
+
+`editor restart` resolves the project before stopping the editor (from the running
+instance, `--project`, or the current directory), quits it, optionally removes
+`Library/` and `Temp/`, relaunches it, and waits until the new editor reports
+`ready`. Progress and removed paths go to stderr; the final JSON contains the
+project path, old and new PIDs, cleaned paths, and elapsed time.
+
+The default wait budget is 5 minutes, or 15 minutes with `--clean`; `--timeout`
+overrides both that and the 60-second quit wait. Restart stops Unity the same way
+as `editor quit`. Without `--force` it never kills the process, so if a modal
+dialog blocks quitting, answer it first. If startup stalls, a dialog
+may be waiting in the editor window (safe mode, restore backup, or version upgrade).
 
 ### Console Logs
 
@@ -376,7 +432,7 @@ The CLI also checks Unity's state automatically before sending any command. If U
 |------|-------------|---------|
 | `--port <N>` | Select Unity instance by active heartbeat port | auto |
 | `--project <path>` | Select Unity instance by project path | latest |
-| `--timeout <ms>` | HTTP request timeout | 120000 |
+| `--timeout <ms>` | HTTP request timeout; also bounds `editor quit`/`restart` waits | 120000 |
 | `--ignore-version-mismatch` | Run even when CLI and connector versions differ | false |
 
 ```bash
