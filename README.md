@@ -143,7 +143,7 @@ Before compiling or reloading, the Connector records the state (`compiling`, `re
 
 | Command | Description |
 |---------|-------------|
-| `editor` | Play/stop/pause/refresh the Unity Editor |
+| `editor` | Play/stop/pause/refresh/restart the Unity Editor |
 | `console` | Read, filter, and clear console logs |
 | `exec` | Run arbitrary C# code inside Unity |
 | `test` | Run EditMode/PlayMode tests |
@@ -180,6 +180,33 @@ unity-cli editor refresh --compile
 # Force refresh while in play mode
 unity-cli editor refresh --force
 ```
+
+### Restart
+
+```bash
+# Quit, relaunch, and wait until Unity is ready
+unity-cli editor restart
+
+# Save open scenes and assets before quitting
+unity-cli editor restart --save
+
+# Delete Library/ and Temp/ before relaunching (forces a full reimport)
+unity-cli editor restart --clean
+
+# Launch a specific Unity editor binary
+unity-cli editor restart --editor-path /Applications/Unity/Hub/Editor/6000.1.0f1/Unity.app/Contents/MacOS/Unity
+```
+
+`editor restart` resolves the project before stopping the editor (from the running
+instance, `--project`, or the current directory), quits it, optionally removes
+`Library/` and `Temp/`, relaunches it, and waits until the new editor reports
+`ready`. Progress and removed paths go to stderr; the final JSON contains the
+project path, old and new PIDs, cleaned paths, and elapsed time.
+
+The default wait budget is 5 minutes, or 15 minutes with `--clean`; `--timeout`
+overrides both that and the 60-second quit wait. Restart never force-kills Unity:
+if a modal dialog blocks quitting, answer it first. If startup stalls, a dialog
+may be waiting in the editor window (safe mode, restore backup, or version upgrade).
 
 ### Console Logs
 
@@ -376,7 +403,7 @@ The CLI also checks Unity's state automatically before sending any command. If U
 |------|-------------|---------|
 | `--port <N>` | Select Unity instance by active heartbeat port | auto |
 | `--project <path>` | Select Unity instance by project path | latest |
-| `--timeout <ms>` | HTTP request timeout | 120000 |
+| `--timeout <ms>` | HTTP request timeout; also bounds `editor restart` waits | 120000 |
 | `--ignore-version-mismatch` | Run even when CLI and connector versions differ | false |
 
 ```bash
