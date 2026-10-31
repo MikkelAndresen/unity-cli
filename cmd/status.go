@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"strings"
 	"time"
@@ -117,7 +118,14 @@ func waitForAlive(resolve instanceResolver, timeoutMs int) (*client.Instance, er
 // waitForReady polls indefinitely until the heartbeat state becomes "ready".
 // Returns true if compilation had errors, or an error if a modal dialog blocks the editor.
 func waitForReady(resolve instanceResolver) (bool, error) {
-	fmt.Fprintf(os.Stderr, "Waiting for compilation...\n")
+	hasErrors, timedOut, err := waitForReadyTo(resolve, os.Stderr, "editor refresh --compile")
+	return hasErrors || timedOut, err
+}
+
+// waitForReadyTo polls until the editor is ready after a compile, writing progress to logw.
+// command names the waiting command if a modal dialog blocks the editor.
+func waitForReadyTo(resolve instanceResolver, logw io.Writer, command string) (hasErrors, timedOut bool, err error) {
+	_, _ = fmt.Fprintf(logw, "Waiting for compilation...\n")
 
 	deadline := time.Now().Add(5 * time.Minute)
 	for time.Now().Before(deadline) {
@@ -127,18 +135,18 @@ func waitForReady(resolve instanceResolver) (bool, error) {
 			continue
 		}
 		if isModal(status) {
-			return false, modalBlockedError(status, "editor refresh --compile", true)
+			return false, false, modalBlockedError(status, command, true)
 		}
 		if status.State == "ready" {
 			if status.CompileErrors {
-				fmt.Fprintf(os.Stderr, "Compilation finished with errors.\n")
+				_, _ = fmt.Fprintf(logw, "Compilation finished with errors.\n")
 			} else {
-				fmt.Fprintf(os.Stderr, "Compilation complete.\n")
+				_, _ = fmt.Fprintf(logw, "Compilation complete.\n")
 			}
-			return status.CompileErrors, nil
+			return status.CompileErrors, false, nil
 		}
 	}
 
-	fmt.Fprintf(os.Stderr, "Timed out waiting for compilation (5m).\n")
-	return true, nil
+	_, _ = fmt.Fprintf(logw, "Timed out waiting for compilation (5m).\n")
+	return false, true, nil
 }

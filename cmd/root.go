@@ -73,9 +73,17 @@ func Execute() error {
 		return statusCmd(inst)
 	}
 
+	// verify reports an editor that can't answer as exit code 2, not as a CLI error.
+	noEditor := func(err error) error {
+		if category == "verify" {
+			os.Exit(verifyExit(os.Stdout, err))
+		}
+		return err
+	}
+
 	inst, err := client.DiscoverInstance(flagProject, flagPort)
 	if err != nil {
-		return err
+		return noEditor(err)
 	}
 
 	targetProject := flagProject
@@ -92,13 +100,13 @@ func Execute() error {
 
 	alive, err := waitForAlive(resolve, flagTimeout)
 	if err != nil {
-		return err
+		return noEditor(err)
 	}
 	if err := checkConnectorVersion(alive, Version, flagIgnoreVersionMismatch); err != nil {
-		return err
+		return noEditor(err)
 	}
 	if category != modalCommand && isModal(alive) {
-		return modalBlockedError(alive, category, false)
+		return noEditor(modalBlockedError(alive, category, false))
 	}
 
 	timeout := flagTimeout
@@ -130,6 +138,15 @@ func Execute() error {
 			return client.Send(currentInst, command, params, 0)
 		}, resolve)
 		resp, err = testCmd(subArgs, testSend, currentInst.Port)
+	case "verify":
+		currentInst, resolveErr := resolve()
+		if resolveErr != nil {
+			return noEditor(resolveErr)
+		}
+		testSend := sendWatchingModal(func(command string, params interface{}) (*client.CommandResponse, error) {
+			return client.Send(currentInst, command, params, 0)
+		}, resolve)
+		os.Exit(verifyCmd(subArgs, send, testSend, resolve, currentInst.Port, os.Stdout))
 	case "exec":
 		subArgs = readStdinIfPiped(subArgs)
 		var params map[string]interface{}
@@ -403,6 +420,12 @@ Tests:
   test --filter <name>            Filter by namespace, class, or full test name
   test --allow-dirty-scenes       Run even when open scenes have unsaved changes
   test --auto-save-scenes         Save dirty open scenes before running tests
+  test --assembly <a,b>           Only tests in these assemblies
+
+Verify (compile + tests, brief output for agents):
+  verify                          Compile, list errors in your code, run EditMode tests
+  verify --no-tests               Stop after the compile
+  verify --assembly <a,b>         Only these test assemblies (also --filter, --mode)
 
 Profiler:
   profiler hierarchy              Top-level profiler samples (last frame)
@@ -621,6 +644,7 @@ Options:
   --mode <EditMode|PlayMode>    Test mode (default: EditMode)
   --filter <name>               Filter by namespace, class, or full test name
                                 Must be the full path (e.g. MyNamespace.MyClass)
+  --assembly <a,b>              Only tests in these assemblies (comma-separated)
   --allow-dirty-scenes          Run even when open scenes have unsaved changes
   --auto-save-scenes            Save dirty open scenes before running tests
 
@@ -635,7 +659,46 @@ Examples:
   unity-cli test --mode PlayMode
   unity-cli test --auto-save-scenes
   unity-cli test --filter MyNamespace.MyTests
+  unity-cli test --assembly MyGame.Tests.Editor
   unity-cli test --mode EditMode --filter MyNamespace.MyTests.SpecificTest
+`)
+	case "verify":
+		fmt.Print(`Usage: unity-cli verify [options]
+
+Check that the project compiles and its tests pass, in one call, with output
+brief enough for an agent's context:
+
+  1. Clears the console (a Burst error stays there after its code changes;
+     Burst logs a live one again on the next compile). --keep-console skips it.
+  2. Refreshes assets, compiles, and waits for it to finish.
+  3. Lists this compile's errors in your code as file:line:col CODE message.
+     Errors in Library/ or PackageCache/ are listed only when nothing else is.
+  4. Unless --no-tests: saves dirty open scenes and runs the tests, then
+     prints passed/total and the first line of each failure.
+
+Options:
+  --no-tests                    Stop after the compile
+  --assembly <a,b>              Only tests in these assemblies (comma-separated)
+  --filter <name>               Filter by namespace, class, or full test name
+  --mode <EditMode|PlayMode>    Test mode (default: EditMode)
+  --max <n>                     List at most n errors and n failures (default 20)
+  --keep-console                Don't clear the console first
+  --json                        One JSON object instead of text
+
+Exit codes:
+  0  compiles and every test passes
+  1  compile errors, failing tests, or no test ran
+  2  the editor could not answer: not running, timed out, or blocked by a
+     modal dialog (named, with the command that answers it)
+
+Needs connector 0.7.0 for live compile errors; older connectors fall back to
+console errors.
+
+Examples:
+  unity-cli verify
+  unity-cli verify --no-tests
+  unity-cli verify --assembly MyGame.Tests.Editor
+  unity-cli verify --json
 `)
 	case "modal":
 		fmt.Print(`Usage: unity-cli modal [list|answer] [options]

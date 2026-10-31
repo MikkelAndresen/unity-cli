@@ -44,6 +44,9 @@ func testCmd(args []string, send sendFn, port int) (*client.CommandResponse, err
 	if filter, ok := flags["filter"]; ok {
 		params["filter"] = filter
 	}
+	if assembly, ok := flags["assembly"]; ok {
+		params["assembly"] = assembly
+	}
 	if _, ok := flags["allow-dirty-scenes"]; ok {
 		params["allowDirtyScenes"] = true
 	}

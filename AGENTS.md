@@ -9,6 +9,7 @@ cmd/                  # Go CLI — thin passthrough layer
   root.go             # Entry point, flag/arg parsing, default passthrough
   editor.go           # editor command (waitForReady polling)
   test.go             # test command (PlayMode result polling)
+  verify.go           # verify command (compile + compile_diagnostics + tests, brief output)
   status.go           # status, waitForAlive, heartbeat reading
   update.go           # self-update from GitHub releases
   version_check.go    # periodic update notice (12h interval)

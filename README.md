@@ -147,6 +147,7 @@ Before compiling or reloading, the Connector records the state (`compiling`, `re
 | `console` | Read, filter, and clear console logs |
 | `exec` | Run arbitrary C# code inside Unity |
 | `test` | Run EditMode/PlayMode tests |
+| `verify` | Compile, list errors in your code, run tests: one call, brief output |
 | `menu` | Execute any Unity menu item by path |
 | `reserialize` | Re-serialize assets through Unity's serializer |
 | `screenshot` | Capture scene/game view as PNG |
@@ -318,9 +319,37 @@ unity-cli test --auto-save-scenes
 
 # Filter by test name (substring match)
 unity-cli test --filter MyTestClass
+
+# Only tests in these assemblies (comma-separated)
+unity-cli test --assembly MyGame.Tests.Editor
 ```
 
 Requires the Unity Test Framework package. Tests are blocked by default when any open scene has unsaved changes. Use `--auto-save-scenes` to save them first, or `--allow-dirty-scenes` to run anyway. PlayMode tests trigger a domain reload — the CLI polls for results automatically.
+
+### Verify
+
+Check that the project compiles and its tests pass in one call, with output brief enough for an agent's context.
+
+```bash
+# Compile, list errors in your code, then run EditMode tests
+unity-cli verify
+
+# Stop after the compile
+unity-cli verify --no-tests
+
+# Only some tests (also --filter, --mode PlayMode)
+unity-cli verify --assembly MyGame.Tests.Editor
+
+# One JSON object instead of text
+unity-cli verify --json
+```
+
+```
+compile: 1 error(s)
+  Assets/Scripts/Player.cs:42:13 CS0103 The name 'speed' does not exist in the current context
+```
+
+`verify` clears the console first (a Burst error stays there after its code changes; Burst logs a live one again on the next compile; `--keep-console` skips the clear), refreshes and compiles, and lists this compile's errors from the connector's `compile_diagnostics` tool, leaving out `Library/` and `PackageCache/` unless nothing else failed. It then saves dirty open scenes and runs the tests, printing `passed/total` and the first line of each failure (`--max` caps both lists, default 20). Exit code 0 means it compiles and every test passed; 1 means compile errors, failing tests or no test ran; 2 means the editor couldn't answer: not running, timed out, or blocked by a modal dialog, which is named along with the command that answers it. Connectors before 0.7.0 have no `compile_diagnostics` and ignore `--assembly`; `verify` then lists console errors and says so.
 
 ### Modal Dialogs (macOS)
 

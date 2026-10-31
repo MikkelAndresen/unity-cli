@@ -147,6 +147,7 @@ Unity 커넥터의 동작:
 | `console` | 콘솔 로그 읽기, 필터링, 지우기 |
 | `exec` | Unity 안에서 임의 C# 코드 실행 |
 | `test` | EditMode/PlayMode 테스트 실행 |
+| `verify` | 컴파일, 내 코드의 에러 출력, 테스트 실행을 한 번에 짧은 출력으로 |
 | `menu` | Unity 메뉴 아이템을 경로로 실행 |
 | `reserialize` | Unity 시리얼라이저를 통해 에셋 재직렬화 |
 | `screenshot` | Scene/Game 뷰를 PNG로 캡처 |
@@ -318,9 +319,37 @@ unity-cli test --auto-save-scenes
 
 # 테스트 이름으로 필터링 (부분 문자열 매치)
 unity-cli test --filter MyTestClass
+
+# 지정한 어셈블리의 테스트만 실행 (쉼표로 구분)
+unity-cli test --assembly MyGame.Tests.Editor
 ```
 
 Unity Test Framework 패키지가 필요합니다. 열린 씬에 저장되지 않은 변경이 있으면 기본적으로 테스트를 막습니다. `--auto-save-scenes`로 먼저 저장하거나, `--allow-dirty-scenes`로 그대로 실행할 수 있습니다. PlayMode 테스트는 도메인 리로드를 트리거하며, CLI가 자동으로 결과를 폴링합니다.
+
+### 검증 (verify)
+
+프로젝트가 컴파일되고 테스트가 통과하는지 한 번의 호출로 확인합니다. 에이전트 컨텍스트에 맞게 출력이 짧습니다.
+
+```bash
+# 컴파일, 내 코드의 에러 출력, 그 다음 EditMode 테스트 실행
+unity-cli verify
+
+# 컴파일까지만
+unity-cli verify --no-tests
+
+# 일부 테스트만 (--filter, --mode PlayMode도 가능)
+unity-cli verify --assembly MyGame.Tests.Editor
+
+# 텍스트 대신 JSON 객체 하나
+unity-cli verify --json
+```
+
+```
+compile: 1 error(s)
+  Assets/Scripts/Player.cs:42:13 CS0103 The name 'speed' does not exist in the current context
+```
+
+`verify`는 먼저 콘솔을 비웁니다 (Burst 에러는 코드가 바뀐 뒤에도 콘솔에 남고, 다음 컴파일에서 Burst가 살아 있는 에러를 다시 기록합니다. `--keep-console`로 생략 가능). 그다음 리프레시와 컴파일을 하고, 커넥터의 `compile_diagnostics` 도구로 이번 컴파일의 에러를 출력합니다. `Library/`와 `PackageCache/`의 에러는 다른 실패가 없을 때만 보여 줍니다. 이어서 저장되지 않은 열린 씬을 저장하고 테스트를 실행해 `passed/total`과 실패마다 첫 줄을 출력합니다 (`--max`로 두 목록의 길이를 제한, 기본값 20). 종료 코드 0은 컴파일 성공과 모든 테스트 통과, 1은 컴파일 에러, 실패한 테스트, 또는 실행된 테스트 없음, 2는 에디터가 응답하지 못함(실행 중이 아님, 시간 초과, 모달 다이얼로그에 막힘)을 뜻하며, 다이얼로그는 응답 명령과 함께 표시됩니다. 0.7.0 이전 커넥터에는 `compile_diagnostics`가 없고 `--assembly`를 무시합니다. 이때 `verify`는 콘솔 에러를 보여 주고 그 사실을 알립니다.
 
 ### 모달 다이얼로그 (macOS)
 
