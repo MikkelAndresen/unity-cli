@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 using System.Threading.Tasks;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
@@ -25,6 +26,9 @@ namespace UnityCliConnector.TestRunner
 
             [ToolParameter("Filter by namespace, class, or full test name")]
             public string Filter { get; set; }
+
+            [ToolParameter("Only tests in these assemblies (comma-separated assembly names)")]
+            public string Assembly { get; set; }
 
             [ToolParameter("Run tests even when open scenes have unsaved changes")]
             public bool AllowDirtyScenes { get; set; }
@@ -54,6 +58,7 @@ namespace UnityCliConnector.TestRunner
                 return Task.FromResult<object>(new ErrorResponse($"Unknown mode '{modeStr}'. Use EditMode or PlayMode."));
 
             var filter = p.Get("filter", null);
+            var assemblies = ParseAssemblies(p.Get("assembly", null));
             var dirtySceneResult = PrepareDirtyScenes(
                 p.GetBool("allowDirtyScenes") || p.GetBool("allow_dirty_scenes"),
                 p.GetBool("autoSaveScenes") || p.GetBool("auto_save_scenes"));
@@ -61,13 +66,13 @@ namespace UnityCliConnector.TestRunner
                 return Task.FromResult<object>(dirtySceneResult);
 
             if (testMode == TestMode.EditMode)
-                return ExecuteInProcess(testMode, filter);
+                return ExecuteInProcess(testMode, filter, assemblies);
 
-            StartPlayModeRun(filter);
+            StartPlayModeRun(filter, assemblies);
             return Task.FromResult<object>(new SuccessResponse("running", new { port = HttpServer.Port }));
         }
 
-        private static Task<object> ExecuteInProcess(TestMode mode, string filter)
+        private static Task<object> ExecuteInProcess(TestMode mode, string filter, string[] assemblies)
         {
             var tcs = new TaskCompletionSource<object>(TaskCreationOptions.RunContinuationsAsynchronously);
             var passed  = new List<string>();
@@ -86,11 +91,11 @@ namespace UnityCliConnector.TestRunner
             );
 
             api.RegisterCallbacks(callbacks);
-            api.Execute(new ExecutionSettings(BuildFilter(mode, filter)));
+            api.Execute(new ExecutionSettings(BuildFilter(mode, filter, assemblies)));
             return tcs.Task;
         }
 
-        private static void StartPlayModeRun(string filter)
+        private static void StartPlayModeRun(string filter, string[] assemblies)
         {
             var port = HttpServer.Port;
 
@@ -113,7 +118,7 @@ namespace UnityCliConnector.TestRunner
             );
 
             api.RegisterCallbacks(callbacks);
-            api.Execute(new ExecutionSettings(BuildFilter(TestMode.PlayMode, filter)));
+            api.Execute(new ExecutionSettings(BuildFilter(TestMode.PlayMode, filter, assemblies)));
         }
 
         private static object PrepareDirtyScenes(bool allowDirtyScenes, bool autoSaveScenes)
@@ -231,7 +236,7 @@ namespace UnityCliConnector.TestRunner
                 : new SuccessResponse($"All {passed.Count} test(s) passed.", summary);
         }
 
-        internal static Filter BuildFilter(TestMode mode, string filterStr)
+        internal static Filter BuildFilter(TestMode mode, string filterStr, string[] assemblies = null)
         {
             var f = new Filter { testMode = mode };
             if (!string.IsNullOrEmpty(filterStr))
@@ -239,7 +244,16 @@ namespace UnityCliConnector.TestRunner
                 f.testNames  = new[] { filterStr };
                 f.groupNames = new[] { filterStr };
             }
+            if (assemblies != null && assemblies.Length > 0)
+                f.assemblyNames = assemblies;
             return f;
+        }
+
+        internal static string[] ParseAssemblies(string value)
+        {
+            if (string.IsNullOrWhiteSpace(value)) return null;
+            var names = value.Split(',').Select(s => s.Trim()).Where(s => s.Length > 0).ToArray();
+            return names.Length > 0 ? names : null;
         }
 
         internal class TestCallbacks : ICallbacks
