@@ -150,6 +150,7 @@ Unity 커넥터의 동작:
 | `verify` | 컴파일, 내 코드의 에러 출력, 테스트 실행을 한 번에 짧은 출력으로 |
 | `menu` | Unity 메뉴 아이템을 경로로 실행 |
 | `reserialize` | Unity 시리얼라이저를 통해 에셋 재직렬화 |
+| `clear_burst_cache` | `Library/BurstCache`를 삭제해 Burst가 처음부터 다시 컴파일하게 함 |
 | `screenshot` | Scene/Game 뷰를 PNG로 캡처 |
 | `profiler` | 프로파일러 하이어라키 읽기, 녹화 제어 |
 | `modal` | 에디터를 막고 있는 모달 다이얼로그 확인 및 응답 (macOS) |
@@ -267,6 +268,25 @@ unity-cli reserialize Assets/Materials/Character.mat
 ```
 
 이것이 텍스트 기반 에셋 수정을 안전하게 만드는 핵심입니다. 이게 없으면 YAML 필드 하나 잘못 놓은 것이 런타임에서야 드러나는 프리팹 파손으로 이어집니다. 이게 있으면 **AI 에이전트가 어떤 Unity 에셋이든 텍스트로 자신 있게 수정**할 수 있습니다 — 프리팹에 컴포넌트 추가, 씬 계층 구조 변경, 머티리얼 속성 조정 — 결과가 정상적으로 로드된다는 것을 보장하면서.
+
+### Burst 캐시
+
+Burst는 컴파일된 JIT 라이브러리를 `<프로젝트>/Library/BurstCache`에 보관합니다. 이 캐시가 오래되면 — Burst 패키지 업그레이드, Burst 옵션 변경, 혹은 job이 예전 코드처럼 동작할 때 — 캐시를 지우고 Burst가 다시 컴파일하게 하는 것이 해결책입니다.
+
+`clear_burst_cache`가 셸 없이 에디터 안에서 그 일을 합니다. `Library/BurstCache` 하위 경로만 건드리고(경로 인자는 아예 받지 않습니다), 삭제한 파일 수와 용량을 보고하며, dry run으로 같은 정보를 미리 볼 수 있습니다.
+
+```bash
+# 캐시 전체 삭제 — Burst가 다음 컴파일 때 다시 만듭니다
+unity-cli clear_burst_cache
+
+# 무엇이 지워질지 용량과 함께 먼저 확인
+unity-cli clear_burst_cache --dry_run
+
+# JIT 라이브러리 캐시만, AOT 설정 해시는 유지
+unity-cli clear_burst_cache --scope jit
+```
+
+Burst가 아직 매핑 중인 파일은 삭제 전체를 중단시키는 대신 경로별로 보고되므로, 부분 삭제 결과도 항상 근거가 남습니다.
 
 ### 프로파일러
 

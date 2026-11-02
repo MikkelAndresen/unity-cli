@@ -414,6 +414,16 @@ Reserialize:
     reserialize Assets/Scenes/Main.unity
     reserialize Assets/Prefabs/A.prefab Assets/Prefabs/B.prefab
 
+Burst Cache:
+  clear_burst_cache              Delete Library/BurstCache (Burst recompiles on next use)
+  clear_burst_cache --scope jit  Only the JIT library cache, keep AOT settings hashes
+  clear_burst_cache --dry_run    List files and size without deleting
+
+  Examples:
+    clear_burst_cache
+    clear_burst_cache --dry_run
+    clear_burst_cache --scope jit
+
 Tests:
   test                            Run EditMode tests (default)
   test --mode PlayMode            Run PlayMode tests
@@ -607,6 +617,29 @@ Examples:
   unity-cli reserialize
   unity-cli reserialize Assets/Prefabs/Player.prefab
   unity-cli reserialize Assets/Scenes/Main.unity Assets/Scenes/Lobby.unity
+`)
+	case "clear_burst_cache":
+		fmt.Print(`Usage: unity-cli clear_burst_cache [options]
+
+Delete the project's Burst compilation cache (<project>/Library/BurstCache) and
+report how many files and bytes were removed.
+
+Burst rebuilds the cache on its next compile, so this is safe to run whenever
+JIT-compiled jobs look stale. Only paths inside Library/BurstCache are touched —
+no path argument is accepted.
+
+Options:
+  --scope <all|jit>   all (default): the whole Library/BurstCache
+                      jit: only Library/BurstCache/JIT, keeping AotSettings*.hash
+  --dry_run           List what would be deleted without deleting anything
+
+Locked files are reported per path instead of aborting the whole clear; on
+Windows the JIT cache can stay mapped until the editor quits.
+
+Examples:
+  unity-cli clear_burst_cache
+  unity-cli clear_burst_cache --dry_run
+  unity-cli clear_burst_cache --scope jit
 `)
 	case "profiler":
 		fmt.Print(`Usage: unity-cli profiler <subcommand> [options]

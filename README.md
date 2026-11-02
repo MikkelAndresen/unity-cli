@@ -150,6 +150,7 @@ Before compiling or reloading, the Connector records the state (`compiling`, `re
 | `verify` | Compile, list errors in your code, run tests: one call, brief output |
 | `menu` | Execute any Unity menu item by path |
 | `reserialize` | Re-serialize assets through Unity's serializer |
+| `clear_burst_cache` | Delete `Library/BurstCache` so Burst recompiles from scratch |
 | `screenshot` | Capture scene/game view as PNG |
 | `profiler` | Read profiler hierarchy, control recording |
 | `modal` | Inspect and answer a modal dialog blocking the editor (macOS) |
@@ -267,6 +268,25 @@ unity-cli reserialize Assets/Materials/Character.mat
 ```
 
 This is what makes text-based asset editing safe. Without it, a single misplaced YAML field can break a prefab with no visible error until runtime. With it, **AI agents can confidently modify any Unity asset through plain text** — add components to prefabs, adjust scene hierarchies, change material properties — and know the result will load correctly.
+
+### Burst Cache
+
+Burst keeps its compiled JIT libraries in `<project>/Library/BurstCache`. When that cache goes stale — a Burst package upgrade, a switch of Burst options, or jobs behaving like old code — the fix is to delete it and let Burst recompile.
+
+`clear_burst_cache` does that from inside the editor, without a shell: it only ever touches paths under `Library/BurstCache` (no path argument exists), reports every file and byte it removed, and can list the same for a dry run.
+
+```bash
+# Delete the whole cache; Burst rebuilds it on the next compile
+unity-cli clear_burst_cache
+
+# See what would go first, sizes included
+unity-cli clear_burst_cache --dry_run
+
+# Only the JIT library cache, keep the AOT settings hashes
+unity-cli clear_burst_cache --scope jit
+```
+
+Files Burst still has mapped are reported per path instead of aborting the clear, so a partial result is always accounted for.
 
 ### Profiler
 
