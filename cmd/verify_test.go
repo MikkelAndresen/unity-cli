@@ -24,6 +24,7 @@ type fakeEditor struct {
 	diagnostics   map[bool][]interface{} // compile_diagnostics by source_tree_only; nil: tool unknown (old connector)
 	console       []string               // console error entries (old-connector fallback)
 	consoleCapped bool                   // console reply wraps the entries in the capped object
+	provenance    map[string]interface{} // compile_diagnostics' provenance object; nil: connector predates it
 	tests         map[string]interface{} // run_tests summary; nil: tests not expected
 	testsSuccess  bool
 	testsMessage  string
@@ -79,9 +80,13 @@ func (f *fakeEditor) send(command string, params interface{}) (*client.CommandRe
 			return &client.CommandResponse{Success: false, Message: "Unknown command: compile_diagnostics"}, nil
 		}
 		list := f.diagnostics[p["source_tree_only"] == true]
-		return &client.CommandResponse{Success: true, Data: data(map[string]interface{}{
+		reply := map[string]interface{}{
 			"compiling": false, "total": len(list), "diagnostics": list,
-		})}, nil
+		}
+		if f.provenance != nil {
+			reply["provenance"] = f.provenance
+		}
+		return &client.CommandResponse{Success: true, Data: data(reply)}, nil
 	case "run_tests":
 		if f.tests == nil {
 			f.t.Fatalf("run_tests called but not expected")
@@ -213,6 +218,74 @@ func TestVerify_NoTestsStopsAfterCompile(t *testing.T) {
 	code, out := f.run("--no-tests")
 	if code != verifyOK || out != "compile: ok\n" || f.called("run_tests") {
 		t.Errorf("exit = %d, output = %q, calls = %v", code, out, f.calls)
+	}
+}
+
+// The point of provenance is that the agent stops rebuilding "did the editor pick up my change?"
+// by hand, so verify's own output has to carry the line.
+func TestVerify_PrintsTheProvenanceLineAfterTheCompileVerdict(t *testing.T) {
+	f := &fakeEditor{t: t, diagnostics: clean(), tests: passing(3), testsSuccess: true,
+		provenance: map[string]interface{}{"provenance_line": provLine, "compiled_at_ms": 1_793_782_952_102}}
+	code, out := f.run()
+	if code != verifyOK {
+		t.Fatalf("exit = %d, want 0; output:\n%s", code, out)
+	}
+	want := "compile: ok\n" + provLine + "\ntests: 3/3 passed\n"
+	if out != want {
+		t.Errorf("output = %q, want %q", out, want)
+	}
+}
+
+func TestVerify_ASourceWrittenAfterTheCompileIsSaidOutLoud(t *testing.T) {
+	f := &fakeEditor{t: t, diagnostics: clean(),
+		provenance: map[string]interface{}{
+			"provenance_line": provLine,
+			"stale_count":     1,
+			"stale_files":     []string{"Assets/Foo.cs"},
+			"stale_line":      "stale: Assets/Foo.cs modified after this compile — run verify again",
+		}}
+	code, out := f.run("--no-tests")
+	if code != verifyOK {
+		t.Fatalf("exit = %d, want 0; output:\n%s", code, out)
+	}
+	if !strings.Contains(out, "stale: Assets/Foo.cs modified after this compile") {
+		t.Errorf("output = %q, want the stale line", out)
+	}
+}
+
+func TestVerify_JsonCarriesProvenanceFields(t *testing.T) {
+	f := &fakeEditor{t: t, diagnostics: clean(),
+		provenance: map[string]interface{}{
+			"provenance_line": provLine, "compiled_at_ms": 1_793_782_952_102,
+			"compiled_at": "2026-11-04T04:02:32.102-05:00", "scan_ms": 4, "scan_complete": true,
+			"changed_since_previous_compile": 1, "rebuilt_assemblies": []string{"Game"},
+		}}
+	code, out := f.run("--no-tests", "--json")
+	if code != verifyOK {
+		t.Fatalf("exit = %d, want 0; output:\n%s", code, out)
+	}
+	var r verifyResult
+	if err := json.Unmarshal([]byte(out), &r); err != nil {
+		t.Fatalf("output is not the JSON object: %v (%s)", err, out)
+	}
+	if len(r.Compile.Provenance) == 0 {
+		t.Fatalf("compile.provenance is missing: %s", out)
+	}
+	var p compileProvenance
+	if err := json.Unmarshal(r.Compile.Provenance, &p); err != nil {
+		t.Fatalf("compile.provenance is not the connector's object: %v (%s)", err, r.Compile.Provenance)
+	}
+	if p.ProvenanceLine != provLine || p.CompiledAtMs != 1_793_782_952_102 ||
+		p.ChangedSincePrevious == nil || *p.ChangedSincePrevious != 1 || !p.ScanComplete || p.ScanMs != 4 {
+		t.Errorf("compile.provenance = %+v, want the connector's fields", p)
+	}
+}
+
+func TestVerify_OlderConnectorWithoutProvenanceStillVerifies(t *testing.T) {
+	f := &fakeEditor{t: t, diagnostics: clean()}
+	code, out := f.run("--no-tests")
+	if code != verifyOK || out != "compile: ok\n" {
+		t.Errorf("exit = %d, output = %q; want a clean verify with no provenance line", code, out)
 	}
 }
 

@@ -67,6 +67,10 @@ func TestSplitArgs(t *testing.T) {
 		{"timeout flag", []string{"exec", "--timeout", "5000", "Time.time"}, []string{"--timeout", "5000"}, []string{"exec", "Time.time"}},
 		{"ignore version mismatch flag", []string{"exec", "--ignore-version-mismatch", "Time.time"}, []string{"--ignore-version-mismatch"}, []string{"exec", "Time.time"}},
 		{"multiple global flags", []string{"--port", "8080", "--timeout", "3000", "exec", "code"}, []string{"--port", "8080", "--timeout", "3000"}, []string{"exec", "code"}},
+		// wait's own --timeout is seconds of waiting, not the global request timeout in ms.
+		{"wait timeout belongs to the command", []string{"wait", "--compile", "--timeout", "120"}, nil, []string{"wait", "--compile", "--timeout", "120"}},
+		{"timeout before the command stays global", []string{"--timeout", "5000", "wait"}, []string{"--timeout", "5000"}, []string{"wait"}},
+		{"wait timeout with no value", []string{"wait", "--timeout"}, nil, []string{"wait", "--timeout"}},
 	}
 
 	for _, tt := range tests {

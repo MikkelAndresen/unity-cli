@@ -107,14 +107,15 @@ func editorRefreshCompile(send sendFn, resolve instanceResolver, params map[stri
 		return nil, err
 	}
 
-	diags, total, source, err := compileReportDiagnostics(send, outcome.HasErrors)
+	findings, err := compileReportDiagnostics(send, outcome.HasErrors)
 	if err != nil {
 		return nil, fmt.Errorf("compile: %w", err)
 	}
+	total := findings.Total
 
 	succeeded := !outcome.TimedOut && !outcome.HasErrors && total == 0
-	notes := compileReportNotes(outcome, source)
-	if err := attachCompileReport(resp, outcome, succeeded, total, diags, notes); err != nil {
+	notes := compileReportNotes(outcome, findings.Source, findings.Provenance)
+	if err := attachCompileReport(resp, outcome, succeeded, findings, notes); err != nil {
 		return nil, err
 	}
 
@@ -140,12 +141,12 @@ func editorRefreshCompile(send sendFn, resolve instanceResolver, params map[stri
 // compileReportDiagnostics reads this compile's errors, retrying while the editor is still back
 // from the domain reload the compile triggered: its HTTP connection drops across the reload, so a
 // single failed call proves nothing.
-func compileReportDiagnostics(send sendFn, hasErrors bool) ([]verifyDiag, int, string, error) {
+func compileReportDiagnostics(send sendFn, hasErrors bool) (compileFindings, error) {
 	deadline := time.Now().Add(30 * time.Second)
 	for {
-		diags, total, source, err := verifyDiagnostics(send, compileReportMaxDiags, hasErrors)
+		findings, err := verifyDiagnostics(send, compileReportMaxDiags, hasErrors)
 		if err == nil || !isConnectionFailure(err) || time.Now().After(deadline) {
-			return diags, total, source, err
+			return findings, err
 		}
 		time.Sleep(statusPollInterval)
 	}
@@ -164,7 +165,7 @@ func isConnectionFailure(err error) bool {
 
 // compileReportNotes explains any part of the result the numbers alone cannot: a compile that was
 // never seen to run, a timed-out wait, a restarted editor, or an old connector's console fallback.
-func compileReportNotes(outcome compileOutcome, diagSource string) []string {
+func compileReportNotes(outcome compileOutcome, diagSource string, prov *compileProvenance) []string {
 	var notes []string
 	switch {
 	case outcome.TimedOut:
@@ -180,6 +181,10 @@ func compileReportNotes(outcome compileOutcome, diagSource string) []string {
 	if diagSource == "console" {
 		notes = append(notes, "connector has no compile_diagnostics; errors were read from the console")
 	}
+	if prov != nil && prov.StaleCount > 0 {
+		notes = append(notes, fmt.Sprintf("%d source file(s) were written after this compile and are not in this result (listed: %s)",
+			prov.StaleCount, strings.Join(prov.StaleFiles, ", ")))
+	}
 	return notes
 }
 
@@ -194,7 +199,11 @@ func compileFailureLine(total int) string {
 
 // attachCompileReport merges the compile outcome into the connector's refresh payload so the
 // command answers with a single self-describing object.
-func attachCompileReport(resp *client.CommandResponse, outcome compileOutcome, succeeded bool, total int, diags []verifyDiag, notes []string) error {
+func attachCompileReport(resp *client.CommandResponse, outcome compileOutcome, succeeded bool,
+	findings compileFindings, notes []string) error {
+	if len(findings.Diags) == 0 {
+		findings.Diags = []verifyDiag{}
+	}
 	data := map[string]interface{}{}
 	if len(resp.Data) > 0 && string(resp.Data) != "null" {
 		if err := json.Unmarshal(resp.Data, &data); err != nil {
@@ -205,13 +214,19 @@ func attachCompileReport(resp *client.CommandResponse, outcome compileOutcome, s
 	data["compile_requested"] = true
 	data["compile_succeeded"] = succeeded
 	data["nothing_to_compile"] = outcome.NothingToCompile
-	data["error_count"] = total
-	if diags == nil {
-		diags = []verifyDiag{}
-	}
-	data["errors"] = diags
+	data["error_count"] = findings.Total
+	data["errors"] = findings.Diags
 	data["timed_out"] = outcome.TimedOut
 	data["elapsed_ms"] = outcome.Elapsed.Milliseconds()
+	if len(findings.ProvenanceJSON) > 0 {
+		data["provenance"] = findings.ProvenanceJSON
+		if findings.Provenance != nil {
+			data["provenance_line"] = findings.Provenance.ProvenanceLine
+			if findings.Provenance.StaleLine != "" {
+				data["stale_line"] = findings.Provenance.StaleLine
+			}
+		}
+	}
 	if len(notes) > 0 {
 		data["notes"] = notes
 	}

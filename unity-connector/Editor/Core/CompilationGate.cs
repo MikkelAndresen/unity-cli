@@ -27,15 +27,22 @@ namespace UnityCliConnector
 
 		static CompilationGate()
 		{
-			CompilationPipeline.compilationStarted += _ => ByAssembly.Clear();
-			CompilationPipeline.assemblyCompilationFinished += (path, messages) => ByAssembly[path] = messages;
-			CompilationPipeline.compilationFinished += _ => NoteCompileFinished();
-			AssemblyReloadEvents.afterAssemblyReload += NoteCompileFinished;
+			// CompileProvenance rides the same events: it needs the compile's start, the assemblies
+			// that were rebuilt, and the finish, and two subscriptions could drift apart.
+			CompilationPipeline.compilationStarted += _ => { ByAssembly.Clear(); CompileProvenance.NoteCompileStarted(); };
+			CompilationPipeline.assemblyCompilationFinished += (path, messages) =>
+			{
+				ByAssembly[path] = messages;
+				CompileProvenance.NoteAssemblyCompiled(path);
+			};
+			CompilationPipeline.compilationFinished += _ => NoteCompileFinished(false);
+			AssemblyReloadEvents.afterAssemblyReload += () => NoteCompileFinished(true);
 		}
 
-		private static void NoteCompileFinished()
+		private static void NoteCompileFinished(bool afterReload)
 		{
 			s_CompileFinishedAt = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+			CompileProvenance.NoteCompileFinished(afterReload);
 		}
 
 		/// Returns an ErrorResponse with compile diagnostics if the editor is mid-compile or has
@@ -188,6 +195,6 @@ namespace UnityCliConnector
 			ByAssembly.Clear();
 		}
 
-		internal static void NoteCompileFinishedForTests() => NoteCompileFinished();
+		internal static void NoteCompileFinishedForTests() => NoteCompileFinished(false);
 	}
 }

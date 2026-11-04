@@ -28,10 +28,11 @@ type verifyDiag struct {
 
 type verifyResult struct {
 	Compile struct {
-		OK     bool         `json:"ok"`
-		Total  int          `json:"total"`
-		Errors []verifyDiag `json:"errors,omitempty"`
-		Source string       `json:"source,omitempty"` // "console" when the connector predates compile_diagnostics
+		OK         bool            `json:"ok"`
+		Total      int             `json:"total"`
+		Errors     []verifyDiag    `json:"errors,omitempty"`
+		Source     string          `json:"source,omitempty"` // "console" when the connector predates compile_diagnostics
+		Provenance json.RawMessage `json:"provenance,omitempty"`
 	} `json:"compile"`
 	Burst *verifyBurst `json:"burst,omitempty"`
 	Tests *struct {
@@ -143,14 +144,16 @@ func verifyCmd(args []string, send, testSend sendFn, resolve instanceResolver, p
 		return noReply("compile: still compiling after 5 minutes")
 	}
 
-	diags, total, source, err := verifyDiagnostics(send, max, hasErrors)
+	findings, err := verifyDiagnostics(send, max, hasErrors)
 	if err != nil {
 		return noReply("compile: %v", err)
 	}
-	r.Compile.Total, r.Compile.Errors, r.Compile.Source = total, diags, source
-	r.Compile.OK = total == 0 && !hasErrors
+	r.Compile.Total, r.Compile.Errors, r.Compile.Source, r.Compile.Provenance =
+		findings.Total, findings.Diags, findings.Source, findings.ProvenanceJSON
+	r.Compile.OK = findings.Total == 0 && !hasErrors
 	if !asJSON {
-		printCompile(out, r.Compile.OK, total, diags, source, hasErrors)
+		printCompile(out, r.Compile.OK, findings.Total, findings.Diags, findings.Source, hasErrors)
+		printProvenance(out, findings.Provenance)
 	}
 	if !r.Compile.OK {
 		return finish(verifyFailed)
@@ -231,23 +234,24 @@ func verifyCmd(args []string, send, testSend sendFn, resolve instanceResolver, p
 	return finish(verifyOK)
 }
 
-// verifyDiagnostics returns this compile's errors in the project's own code. When the heartbeat
-// reports errors but none are in the source tree, it returns the third-party ones instead, so a
-// failed compile is never reported as clean. Connectors before 0.7.0 have no compile_diagnostics;
-// their console errors stand in, marked with source "console".
-func verifyDiagnostics(send sendFn, max int, hasErrors bool) ([]verifyDiag, int, string, error) {
-	query := func(sourceTreeOnly bool) ([]verifyDiag, int, bool, error) {
+// verifyDiagnostics returns this compile's findings: the errors in the project's own code and the
+// provenance object that came with them. When the heartbeat reports errors but none are in the
+// source tree, it returns the third-party ones instead, so a failed compile is never reported as
+// clean. Connectors before 0.7.0 have no compile_diagnostics; their console errors stand in, marked
+// with source "console", and they predate provenance too.
+func verifyDiagnostics(send sendFn, max int, hasErrors bool) (compileFindings, error) {
+	query := func(sourceTreeOnly bool) (compileFindings, bool, error) {
 		deadline := time.Now().Add(time.Minute)
 		for {
 			resp, err := send("compile_diagnostics", map[string]interface{}{"source_tree_only": sourceTreeOnly, "limit": max})
 			if err != nil {
-				return nil, 0, false, err
+				return compileFindings{}, false, err
 			}
 			if !resp.Success {
 				if strings.Contains(resp.Message, "Unknown command") {
-					return nil, 0, false, nil
+					return compileFindings{}, false, nil
 				}
-				return nil, 0, true, fmt.Errorf("%s", resp.Message)
+				return compileFindings{}, true, fmt.Errorf("%s", resp.Message)
 			}
 			var d struct {
 				Compiling   bool         `json:"compiling"`
@@ -255,29 +259,36 @@ func verifyDiagnostics(send sendFn, max int, hasErrors bool) ([]verifyDiag, int,
 				Diagnostics []verifyDiag `json:"diagnostics"`
 			}
 			if err := json.Unmarshal(resp.Data, &d); err != nil {
-				return nil, 0, true, fmt.Errorf("unreadable compile_diagnostics reply: %w", err)
+				return compileFindings{}, true, fmt.Errorf("unreadable compile_diagnostics reply: %w", err)
 			}
-			if !d.Compiling {
-				return d.Diagnostics, d.Total, true, nil
+			if d.Compiling {
+				if time.Now().After(deadline) {
+					return compileFindings{}, true, fmt.Errorf("editor still compiling")
+				}
+				time.Sleep(statusPollInterval)
+				continue
 			}
-			if time.Now().After(deadline) {
-				return nil, 0, true, fmt.Errorf("editor still compiling")
-			}
-			time.Sleep(statusPollInterval)
+			p, pjson := provenanceIn(resp.Data)
+			return compileFindings{Diags: d.Diagnostics, Total: d.Total, Provenance: p, ProvenanceJSON: pjson}, true, nil
 		}
 	}
 
-	diags, total, supported, err := query(true)
+	found, supported, err := query(true)
 	if err != nil {
-		return nil, 0, "", err
+		return compileFindings{}, err
 	}
 	if !supported {
-		return consoleErrors(send, max)
+		consoleDiags, consoleTotal, source, consoleErr := consoleErrors(send, max)
+		return compileFindings{Diags: consoleDiags, Total: consoleTotal, Source: source}, consoleErr
 	}
-	if total == 0 && hasErrors {
-		diags, total, _, err = query(false)
+	if found.Total == 0 && hasErrors {
+		if second, _, err2 := query(false); err2 == nil {
+			found = second
+		} else {
+			err = err2
+		}
 	}
-	return diags, total, "", err
+	return found, err
 }
 
 func consoleErrors(send sendFn, max int) ([]verifyDiag, int, string, error) {
@@ -457,7 +468,7 @@ func versionBefore(version string, major, minor int) bool {
 	return ma < major || (ma == major && mi < minor)
 }
 
-// verifyExit maps an error that stopped verify before it could ask the editor anything
+// verifyExit maps an error that stopped verify (or wait) before it could ask the editor anything
 // (no instance, editor not alive, version mismatch, a dialog) to exit code 2.
 func verifyExit(out io.Writer, err error) int {
 	_, _ = fmt.Fprintln(out, err.Error())
