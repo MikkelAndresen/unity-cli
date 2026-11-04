@@ -376,6 +376,15 @@ echo 'for (int i = 0; i < 3; i++) { yield return null; yield return i; }' | unit
 
 Waits are bounded by `--await_timeout <ms>` (default 30000; `0` waits forever). If a wait outlives it, the response is an error carrying `{"timed_out": true, "status": "WaitingForActivation", "steps": N}` — the operation keeps running in the editor and its result is not observable from that response. A domain reload drops a pending result silently, so park long-lived results in a static field or `ScriptableObject` and read them back with a second `exec`.
 
+**Compiled-snippet cache.** `exec` compiles the snippet with `csc` in a subprocess and waits for it **without** blocking the editor's main thread, then loads and invokes it back on that thread. The same call again — same body, same `--usings`, same reference set — reuses the already-loaded assembly instead of compiling, which is the difference between a repeated probe costing one frame or three seconds. The response reports that as `meta: {"compile":"compiled|cached","compile_ms":N,"reference_assemblies":N}`, kept out of `data` so parsing a result is unchanged; `--meta` prints it to stderr:
+
+```bash
+unity-cli exec --meta "return Application.dataPath;"   # meta: {"compile":"compiled","compile_ms":403,…}
+unity-cli exec --meta "return Application.dataPath;"   # meta: {"compile":"cached","compile_ms":0,…}
+```
+
+It is off by default: `exec … 2>&1 | tail -1` would otherwise pick the note up instead of the result. Cached lookups are bounded at 256 entries; an evicted snippet's assembly stays in the domain until the next domain reload either way, because Mono cannot unload one. If the editor reloads while a snippet is being compiled, the call answers an error instead of running the stale compile.
+
 Because `exec` compiles and runs real C#, it can do anything a custom tool can — inspect ECS entities, modify assets, call internal APIs, run editor utilities. For AI agents, this means **zero-friction access to Unity's entire runtime** without writing a single line of tool code. Piping via stdin avoids shell escaping headaches with complex code.
 
 ### API Lookup
@@ -874,6 +883,7 @@ can decide there; the verdict always prints which evidence it used.
 | `--project <path>` | Select Unity instance by project path | latest |
 | `--timeout <ms>` | HTTP request timeout | 120000 |
 | `--ignore-version-mismatch` | Run even when CLI and connector versions differ | false |
+| `--meta` | Print the response's `meta` (how the call was served, e.g. `exec`'s compile cache state) to stderr | false |
 
 ```bash
 # Select an active Unity instance by heartbeat port
@@ -972,6 +982,9 @@ unity-cli spawn --params '{"x":1,"y":0,"z":5,"prefab":"Goblin"}'
 - Class must be `static`
 - Must have `public static object HandleCommand(JObject parameters)` or `async Task<object>` variant
 - Return `SuccessResponse(message, data)` or `ErrorResponse(message)`
+- A response's optional third argument, `meta`, reports *how* the call was served (e.g. `exec`'s
+  `compile`/`compile_ms`). It stays out of `data`, so callers parsing a tool's result see the same shape
+  either way; the CLI prints it to stderr only with `--meta`
 - Add a `Parameters` nested class with `[ToolParameter]` attributes for discoverability
 - Class name is auto-converted to snake_case for the command name
 - Override with `[UnityCliTool(Name = "my_name")]` if needed
