@@ -93,7 +93,7 @@ CLI(Go)와 Connector(C#)는 같은 릴리스 버전으로 맞춘다.
 - **Connector heartbeat**: `unity-connector/Editor/Heartbeat.cs`의 `CONNECTOR_VERSION`도 같은 `X.Y.Z`로 갱신한다.
 - 개발 빌드의 CLI `Version=dev`는 비교 예외지만, 배포 빌드는 항상 Connector 버전과 같아야 한다.
 - Go 코드나 C# 커넥터 코드 중 하나만 바뀌어도, 배포 시에는 tag와 `package.json` 버전을 같은 번호로 갱신한다.
-- CLI는 실행 전 Connector heartbeat의 `connectorVersion`을 읽어 버전이 다르거나 없으면 에러를 낸다. 버전 갱신 누락을 정상 동작으로 넘기지 않는다.
+- CLI는 실행 전 Connector heartbeat의 `connectorVersion`을 읽어 호환성을 판정한다. patch 차이는 조용히 허용하고, minor/major 차이는 stderr 경고 한 줄만 낸다. 진단용 명령은 게이트하지 않으며, `minConnectorVersion`(0.7.0)보다 오래된 connector만 거부한다. 버전 갱신 누락은 경고로 드러내되 세션을 막지 않는다.
 
 ### 작업 마무리 시
 
