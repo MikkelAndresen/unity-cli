@@ -24,7 +24,10 @@ type ghAsset struct {
 }
 
 func updateCmd(args []string) error {
-	flags := parseSubFlags(args)
+	flags, err := parseSubFlags(args)
+	if err != nil {
+		return err
+	}
 	_, checkOnly := flags["check"]
 
 	fmt.Println("Checking for updates...")

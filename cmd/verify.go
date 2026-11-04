@@ -84,7 +84,11 @@ const defaultBurstWaitSeconds = 60
 // enough for an agent's context. testSend carries no request timeout (test runs can be long); port
 // is where PlayMode results are polled.
 func verifyCmd(args []string, send, testSend sendFn, resolve instanceResolver, port int, out io.Writer) int {
-	flags := parseSubFlags(args)
+	flags, err := parseSubFlags(args)
+	if err != nil {
+		_, _ = fmt.Fprintln(out, err)
+		return verifyFailed
+	}
 	_, noTests := flags["no-tests"]
 	_, noBurst := flags["no-burst"]
 	_, keepConsole := flags["keep-console"]
