@@ -475,8 +475,10 @@ Menu:
     menu "Assets/Refresh"
 
 Screenshot:
-  screenshot                          Capture scene view (default)
-  screenshot --view game              Capture game view
+  screenshot                          Game view in Play mode, Scene view in Edit mode
+  screenshot --mode gameview          The running game's frame, OnGUI/IMGUI included (Play mode)
+  screenshot --mode camera            Camera.main rendered offscreen (no OnGUI, no overlays)
+  screenshot --mode scene             Scene view camera rendered offscreen
   screenshot --output_path <path>     Custom output path
 
 Reserialize:
@@ -812,20 +814,37 @@ Note: File/Quit is blocked for safety.
 	case "screenshot":
 		fmt.Print(`Usage: unity-cli screenshot [options]
 
-Capture a screenshot of the Unity editor.
+Capture a PNG of what Unity is rendering. No mode reads screen pixels of an
+editor window, so a window moved off every display cannot break a capture.
 
 Options:
-  --view <mode>      scene (default), game
-  --width <N>        Image width in pixels (default: 1920)
-  --height <N>       Image height in pixels (default: 1080)
+  --mode <mode>       gameview (default in Play mode), scene (default in Edit
+                      mode), camera
+                      gameview - the frame the running game produces, captured by
+                                 ScreenCapture at the Game view's own resolution.
+                                 Includes the game's OnGUI/IMGUI HUDs; excludes
+                                 the Game view tab's own editor chrome. Needs Play
+                                 mode: in Edit mode there is no game frame, and
+                                 Unity never writes the file.
+                      camera   - Camera.main rendered offscreen into a render
+                                 texture: no OnGUI/IMGUI, no editor overlays.
+                      scene    - the Scene view camera rendered offscreen: no
+                                 gizmos, no Handles, no Scene-view UI.
+  --width <N>        Image width for mode camera/scene (default: 1920)
+  --height <N>       Image height for mode camera/scene (default: 1080)
+                     (mode gameview keeps the Game view's resolution)
   --output_path <path>  Output path, absolute or relative to project root
                         (default: Screenshots/screenshot.png)
 
 Examples:
   unity-cli screenshot
-  unity-cli screenshot --view game
-  unity-cli screenshot --view scene --width 3840 --height 2160
+  unity-cli editor play --wait
+  unity-cli screenshot --mode gameview --output_path Temp/shots/hud.png
+  unity-cli screenshot --mode camera --width 3840 --height 2160
   unity-cli screenshot --output_path captures/my_scene.png
+
+Note: --view is the older spelling of --mode: --view scene is --mode scene, but
+--view game is --mode camera (the offscreen render), not the Game view.
 `)
 	case "reserialize":
 		fmt.Print(`Usage: unity-cli reserialize [path...]

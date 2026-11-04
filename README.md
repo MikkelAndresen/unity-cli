@@ -157,7 +157,7 @@ Before compiling or reloading, the Connector records the state (`compiling`, `re
 | `reserialize` | Re-serialize assets through Unity's serializer |
 | `clear_burst_cache` | Delete `Library/BurstCache` so Burst recompiles from scratch |
 | `burst_status` | Is Burst done compiling, which `[BurstCompile]` targets compiled, which failed (BCxxxx) |
-| `screenshot` | Capture scene/game view as PNG |
+| `screenshot` | Capture the running Game view (OnGUI included), a camera, or the Scene view as PNG |
 | `profiler` | Read profiler hierarchy, control recording |
 | `modal` | Inspect and answer a modal dialog blocking the editor (macOS) |
 | `dialogs` | List or click Unity's windows from outside the editor — startup dialogs, no connector (macOS host) |
@@ -434,6 +434,34 @@ unity-cli menu "Window/General/Console"
 ```
 
 Note: `File/Quit` is blocked for safety.
+
+### Screenshots
+
+```bash
+# What the running game shows — OnGUI/IMGUI HUDs included (needs Play mode)
+unity-cli editor play --wait
+unity-cli screenshot --mode gameview --output_path Temp/shots/hud.png
+
+# One camera rendered offscreen at a chosen size: no OnGUI, no editor overlays
+unity-cli screenshot --mode camera --width 3840 --height 2160
+
+# The Scene view camera — what a bare `screenshot` means while not in Play mode
+unity-cli screenshot
+```
+
+| mode | what it captures | includes | not in it |
+|---|---|---|---|
+| `gameview` | the frame the running game produces (`ScreenCapture.CaptureScreenshot`), at the Game view's own resolution | the game's OnGUI/IMGUI HUDs, measured: a `GUI.Box` drawn at `Rect(40,40,400,240)` landed at exactly that pixel rect | the Game view tab's own editor chrome (toolbar, resolution dropdown) |
+| `camera` | `Camera.main` rendered offscreen into a render texture at `--width`/`--height` | that camera's render only | the game's GUI (OnGUI/IMGUI) — measured: all 2,073,600 pixels of a 1920x1080 frame were the flat background color while the Game view was showing a HUD — plus Scene-view gizmos, Handles and editor overlays |
+| `scene` | the Scene view camera rendered offscreen at `--width`/`--height` | the scene as the current scene camera sees it | gizmos and Handles (toggling `SceneView.drawGizmos` leaves the file byte-identical), the Scene view's overlay UI, any game GUI |
+
+`gameview` is the default in Play mode, `scene` in Edit mode (what a bare `screenshot` has always done). `gameview` needs Play mode: in Edit mode no game frame is produced and Unity never writes the file, which the tool reports instead of hanging. Its file write is asynchronous, so the tool pumps editor updates and answers as soon as the file stops growing (bounded at 5 s), reporting path, byte count and dimensions — without blocking the editor's main thread.
+
+Compare pixels inside one capture, not across modes: the `gameview` frame is what the game's own pipeline wrote to its backbuffer, while `camera`/`scene` read a plain render texture, and the same background color comes out at different values.
+
+No mode reads screen pixels out of an editor window. An editor window moved off every display makes such a read abort the editor natively, so `screenshot` sticks to camera renders and the game's own `ScreenCapture`.
+
+`--view` is the older spelling of `--mode`: `--view scene` is `--mode scene`, but `--view game` is `--mode camera` — the offscreen render, not the Game view.
 
 ### Asset Reserialize
 
