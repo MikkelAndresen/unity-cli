@@ -80,7 +80,11 @@ namespace UnityCliConnector
                 return new Formatted(string.Empty, 0, 0, 0, 0);
 
             if (mode == StacktraceMode.None)
-                return new Formatted(FirstLine(message), 0, 0, 0, 0);
+            {
+                int noneCharsOmitted = 0;
+                var noneText = ApplyCharCap(FirstLine(message), maxEntryChars, out noneCharsOmitted);
+                return new Formatted(noneText, 0, 0, 0, noneCharsOmitted);
+            }
 
             if (maxFrames < 0) maxFrames = int.MaxValue;
 
@@ -128,21 +132,25 @@ namespace UnityCliConnector
             if (sb.Length == 0 && maxFrames > 0 && frames.Count > 0)
                 AppendLine(sb, lines[frames[0]].Text);
 
-            var text = sb.ToString();
-            int charsOmitted = 0;
-            if (maxEntryChars > 0 && text.Length > maxEntryChars)
-            {
-                // The "... (+N characters omitted)" marker is part of the entry, so it comes out of
-                // the cap: 33 covers its longest form. The kept part is then cut at the last line
-                // end inside its budget, so a cut entry still reads as whole lines when it can.
-                int keep = Math.Max(maxEntryChars / 2, maxEntryChars - 33);
-                int newline = text.LastIndexOf('\n', Math.Min(keep, text.Length - 1));
-                if (newline > 0) keep = newline;
-                charsOmitted = text.Length - keep;
-                text = text.Substring(0, keep).TrimEnd() + $"\n... (+{charsOmitted} characters omitted)";
-            }
+            int charsOmitted;
+            var text = ApplyCharCap(sb.ToString(), maxEntryChars, out charsOmitted);
 
             return new Formatted(text, kept, omitted, overCap, charsOmitted);
+        }
+
+        private static string ApplyCharCap(string text, int maxEntryChars, out int charsOmitted)
+        {
+            charsOmitted = 0;
+            if (maxEntryChars <= 0 || text.Length <= maxEntryChars) return text;
+
+            // The "... (+N characters omitted)" marker is part of the entry, so it comes out of
+            // the cap: 33 covers its longest form. The kept part is then cut at the last line
+            // end inside its budget, so a cut entry still reads as whole lines when it can.
+            int keep = Math.Max(maxEntryChars / 2, maxEntryChars - 33);
+            int newline = text.LastIndexOf('\n', Math.Min(keep, text.Length - 1));
+            if (newline > 0) keep = newline;
+            charsOmitted = text.Length - keep;
+            return text.Substring(0, keep).TrimEnd() + $"\n... (+{charsOmitted} characters omitted)";
         }
 
         private static string FirstLine(string message)

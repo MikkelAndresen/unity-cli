@@ -331,32 +331,44 @@ func consoleErrors(send sendFn, max int) ([]verifyDiag, int, string, error) {
 	if err != nil {
 		return nil, 0, "", err
 	}
-	messages := consoleEntryMessages(resp.Data)
+	messages, total := consoleEntryInfo(resp.Data)
 	diags := make([]verifyDiag, 0, len(messages))
 	for _, m := range messages {
 		diags = append(diags, verifyDiag{Severity: "error", Message: firstLine(m)})
 	}
-	return diags, len(diags), "console", nil
+	return diags, total, "console", nil
 }
 
 // consoleEntryMessages reads the entry list out of a console reply. A bare array is what a
 // connector without caps returns; the capped connector wraps the entries in an object that also
 // carries the truncation counts.
 func consoleEntryMessages(data []byte) []string {
+	messages, _ := consoleEntryInfo(data)
+	return messages
+}
+
+// consoleEntryInfo also returns the pre-cap total, so verify does not report a byte- or
+// line-truncated list as the whole error count.
+func consoleEntryInfo(data []byte) ([]string, int) {
 	if len(data) == 0 {
-		return nil
+		return nil, 0
 	}
 	var list []string
 	if err := json.Unmarshal(data, &list); err == nil {
-		return list
+		return list, len(list)
 	}
 	var capped struct {
-		Entries []string `json:"entries"`
+		Entries      []string `json:"entries"`
+		EntriesTotal int      `json:"entries_total"`
 	}
 	if err := json.Unmarshal(data, &capped); err != nil {
-		return nil
+		return nil, 0
 	}
-	return capped.Entries
+	total := capped.EntriesTotal
+	if total < len(capped.Entries) {
+		total = len(capped.Entries)
+	}
+	return capped.Entries, total
 }
 
 func printCompile(out io.Writer, ok bool, total int, diags []verifyDiag, source string, hasErrors bool) {

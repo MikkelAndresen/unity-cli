@@ -63,10 +63,12 @@ namespace UnityCliConnector.Tests
         private int _savedConsoleFlags;
         private string _savedFilteringText;
         private bool _savedConsoleFilter;
+        private bool _savedIgnoreFailingMessages;
 
         [SetUp]
         public void SaveConsoleWindowFilter()
         {
+            _savedIgnoreFailingMessages = LogAssert.ignoreFailingMessages;
             if (ConsoleFlagsProperty == null || GetFilteringTextMethod == null || SetFilteringTextMethod == null)
                 return;
             _savedConsoleFlags = (int)ConsoleFlagsProperty.GetValue(null);
@@ -77,6 +79,7 @@ namespace UnityCliConnector.Tests
         [TearDown]
         public void RestoreConsoleWindowFilter()
         {
+            LogAssert.ignoreFailingMessages = _savedIgnoreFailingMessages;
             if (!_savedConsoleFilter) return;
             ConsoleFlagsProperty.SetValue(null, _savedConsoleFlags);
             SetFilteringTextMethod.Invoke(null, new object[] { _savedFilteringText });
@@ -84,7 +87,7 @@ namespace UnityCliConnector.Tests
 
         // The test runner gives SetUp/TearDown their own LogScope, so a flag set in SetUp does not
         // reach the scope that records the test body's logs; each test sets it itself.
-        private static void IgnoreFailingLogs() => LogAssert.ignoreFailingMessages = true;
+        private void IgnoreFailingLogs() => LogAssert.ignoreFailingMessages = true;
 
         [Test]
         public void Lines_LimitsToTheNewestEntriesAndCountsTheRest()
@@ -294,6 +297,93 @@ namespace UnityCliConnector.Tests
 
             Assert.IsNull(data["console_window_filter"]);
             Assert.AreEqual(visibleFlags, (int)ConsoleFlagsProperty.GetValue(null));
+        }
+
+        [Test]
+        public void StacktraceNone_StillCapsALongFirstLine()
+        {
+            IgnoreFailingLogs();
+            const string marker = Marker + "_none_long";
+            string entry = marker + new string('x', 4000);
+            Debug.LogError(entry);
+
+            string text = FindEntry(marker, new JObject
+            {
+                ["type"] = "error",
+                ["stacktrace"] = "none",
+                ["entry_chars"] = 120,
+            });
+
+            Assert.LessOrEqual(text.Length, 120);
+            StringAssert.Contains("characters omitted", text);
+        }
+
+        [Test]
+        public void MaxBytes_CountsUtf8BytesNotCharacters()
+        {
+            IgnoreFailingLogs();
+            string older = new string('가', 300);
+            string newer = new string('나', 300);
+            Debug.LogError(older);
+            Debug.LogError(newer);
+
+            var data = Run(new JObject
+            {
+                ["type"] = "error",
+                ["stacktrace"] = "none",
+                ["lines"] = 2,
+                ["entry_chars"] = 0,
+                ["max_bytes"] = 1000,
+            });
+
+            // 300 Hangul characters are 900 UTF-8 bytes; both entries would fit a 1000-char count.
+            Assert.AreEqual(1, data["entries_returned"].Value<int>());
+            Assert.AreEqual(newer, data["entries"][0].Value<string>());
+            Assert.That(data["truncated_by"].Values<string>(), Does.Contain("bytes"));
+        }
+
+        [Test]
+        public void MaxBytes_DoesNotExemptTheNewestEntry()
+        {
+            IgnoreFailingLogs();
+            const string marker = Marker + "_one_too_big";
+            Debug.LogError(marker + new string('x', 4000));
+
+            var data = Run(new JObject
+            {
+                ["type"] = "error",
+                ["stacktrace"] = "none",
+                ["lines"] = 1,
+                ["entry_chars"] = 0,
+                ["max_bytes"] = 500,
+            });
+
+            Assert.AreEqual(0, data["entries_returned"].Value<int>());
+            Assert.IsTrue(data["truncated"].Value<bool>());
+            Assert.That(data["truncated_by"].Values<string>(), Does.Contain("bytes"));
+        }
+
+        [Test]
+        public void UnavailableConsoleFilter_IsReported()
+        {
+            IgnoreFailingLogs();
+            var field = typeof(ReadConsole).GetField("_consoleFlagsProperty", StaticAny);
+            Assert.IsNotNull(field, "ReadConsole.consoleFlags binding field is missing");
+            var saved = field.GetValue(null);
+            try
+            {
+                field.SetValue(null, null);
+                var data = Run(new JObject { ["type"] = "error", ["lines"] = 1, ["stacktrace"] = "none" });
+
+                var reported = data["console_window_filter"];
+                Assert.IsNotNull(reported, "the reply should say the window filter could not be checked");
+                Assert.IsFalse(reported["available"].Value<bool>());
+                StringAssert.Contains("unavailable", reported["note"].Value<string>());
+            }
+            finally
+            {
+                field.SetValue(null, saved);
+            }
         }
 
         private static void RequireConsoleFilterBindings()

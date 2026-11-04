@@ -107,3 +107,15 @@ Updated the `console` section of `README.md` to describe the override and the ne
 - The read briefly changes the Console window's visible state on the main thread and restores it
   in the same call; no repaint is expected between those points, but this is observable to any
   code re-entering the console during the read.
+
+## Review follow-up
+
+- When `LogEntries.consoleFlags` is missing, cannot be read, or the widened flags cannot be
+  written, the console reply now carries `console_window_filter: {"available": false, ...}` with a
+  note instead of staying silent. That still cannot name the hidden filter on such a Unity version,
+  but an empty result is no longer presented as if the window filter had been checked.
+- The filter override also runs from the compile gate's console fallback, on every gated tool
+  (`exec`, menu item, reserialize, `editor`, build). That is intentional: a hidden error toggle
+  must not hide compile errors from the gate. Ungated tools (`api`, `screenshot`, `editor stop`)
+  do not run the gate and are unaffected. A failed restore remains best-effort exactly like the
+  existing `EndGettingEntries` cleanup; it is not a new failure mode.

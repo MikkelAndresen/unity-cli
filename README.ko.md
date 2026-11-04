@@ -186,22 +186,35 @@ unity-cli editor refresh --force
 
 ### 콘솔 로그
 
+`console`은 기본적으로 출력을 작게 유지합니다: 최신 50개 항목, 항목당 최대 6개 스택 프레임,
+항목당 1000자, 전체 15 KB. `--stacktrace user`(기본값)는 유저 코드 프레임만 남기고 엔진
+프레임은 `... (+N engine frames)`로 접습니다. `--full`은 모든 크기 제한을 해제합니다.
+
 ```bash
-# 에러 및 경고 로그 읽기 (기본값)
+# 최근 50개 항목, 스택 트레이스 캡 적용 (기본값)
 unity-cli console
 
 # 모든 타입의 최근 20개 로그 읽기
-unity-cli console --lines 20 --filter error,warning,log
+unity-cli console --lines 20 --type error,warning,log
 
-# 에러만 읽기
-unity-cli console --type error
+# 에러만, 한 줄씩 읽기
+unity-cli console --type error --stacktrace none
 
-# 스택 트레이스 포함 (user: 유저 코드만, full: 원본 그대로)
-unity-cli console --stacktrace user
+# 에러의 모든 프레임 (항목 크기 제한은 유지)
+unity-cli console --type error --stacktrace full --frames -1
+
+# 크기 제한 없이 전부 (stacktrace 필터는 그대로 적용)
+unity-cli console --full
 
 # 콘솔 지우기
 unity-cli console --clear
 ```
+
+응답이 잘리면 `truncated`, `truncated_by`, `entries_total` 등으로 무엇이 얼마나 빠졌는지
+알려줍니다. `console`은 읽는 동안 Console 창의 Log/Warning/Error 토글을 켜고 검색어를 지우고
+Collapse를 끈 뒤 원래대로 복원하므로, `--type`은 창에 보이는 항목이 아니라 전체 항목을
+대상으로 합니다. 필터를 바꿔야 했다면 `console_window_filter`에 그 내용이 담깁니다. Unity
+버전이 창 필터를 노출하지 않으면 `"available":false`와 안내 문구를 대신 보냅니다.
 
 ### C# 코드 실행
 

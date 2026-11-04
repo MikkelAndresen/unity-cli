@@ -405,7 +405,7 @@ unity-cli console --type error --stacktrace none
 # Every frame of every error, still per-entry capped
 unity-cli console --type error --stacktrace full --frames -1
 
-# No caps at all
+# No size caps (--stacktrace full for every frame)
 unity-cli console --full
 
 # Clear console
@@ -437,8 +437,10 @@ entries matching `--type`, before any cap. The tool temporarily turns on the Con
 Log/Warning/Error toggles, clears its search text and disables collapse for the read, then restores
 the window exactly as it was. `--type` therefore narrows every entry, not just the ones the window
 currently shows. When anything had to be overridden the reply says so in `console_window_filter`
-(e.g. `{"note":"ignored Console window filter: log/warning hidden, search 'foo'","log_hidden":true,
-"warning_hidden":true,"error_hidden":false,"search":"foo","collapsed":false}`).
+(e.g. `{"available":true,"note":"ignored Console window filter: log/warning hidden, search 'foo'",
+"log_hidden":true,"warning_hidden":true,"error_hidden":false,"search":"foo","collapsed":false}`).
+If the Unity version does not expose the window filter, the reply carries `"available":false` and a
+note instead, so an empty result is not mistaken for a clean one.
 
 Before the caps release `console` returned a bare array of
 all matching entries and `stacktrace=user` filtered with a hardcoded list of names that Burst and

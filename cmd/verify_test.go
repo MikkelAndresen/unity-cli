@@ -25,6 +25,7 @@ type fakeEditor struct {
 	diagnostics    map[bool][]interface{}   // compile_diagnostics by source_tree_only; nil: tool unknown (old connector)
 	console        []string                 // console error entries (old-connector fallback)
 	consoleCapped  bool                     // console reply wraps the entries in the capped object
+	consoleTotal   int                      // capped console entries_total; 0: len(console)
 	provenance     map[string]interface{}   // compile_diagnostics' provenance object; nil: connector predates it
 	provenanceSeq  []map[string]interface{} // per-call provenance; overrides provenance while non-empty
 	refreshReplies []map[string]interface{} // per-call refresh_unity extras; overrides reply while non-empty
@@ -61,11 +62,15 @@ func (f *fakeEditor) send(command string, params interface{}) (*client.CommandRe
 			return &client.CommandResponse{Success: true, Message: "Console cleared."}, nil
 		}
 		if f.consoleCapped {
+			total := f.consoleTotal
+			if total == 0 {
+				total = len(f.console)
+			}
 			return &client.CommandResponse{Success: true, Data: data(map[string]interface{}{
 				"entries":          f.console,
-				"entries_total":    len(f.console),
+				"entries_total":    total,
 				"entries_returned": len(f.console),
-				"truncated":        false,
+				"truncated":        total > len(f.console),
 			})}, nil
 		}
 		return &client.CommandResponse{Success: true, Data: data(f.console)}, nil
@@ -455,6 +460,21 @@ func TestVerify_CappedConnectorConsoleErrorsAreReadFromEntries(t *testing.T) {
 		t.Fatalf("exit = %d, want 1", code)
 	}
 	want := "compile: 1 error(s) (connector < 0.7.0: console errors shown)\n  Assets/Foo.cs(1,1): error CS0103: x\n"
+	if out != want {
+		t.Errorf("output = %q, want %q", out, want)
+	}
+}
+
+func TestVerify_CappedConnectorConsoleErrorsUseThePreCapTotal(t *testing.T) {
+	f := &fakeEditor{t: t, compileErrors: true, consoleCapped: true, consoleTotal: 7,
+		console: []string{"Assets/Foo.cs(1,1): error CS0103: x", "Assets/Bar.cs(2,2): error CS0103: y"}}
+	code, out := f.run()
+	if code != verifyFailed {
+		t.Fatalf("exit = %d, want 1", code)
+	}
+	want := "compile: 7 error(s) (connector < 0.7.0: console errors shown)\n" +
+		"  Assets/Foo.cs(1,1): error CS0103: x\n" +
+		"  Assets/Bar.cs(2,2): error CS0103: y\n"
 	if out != want {
 		t.Errorf("output = %q, want %q", out, want)
 	}

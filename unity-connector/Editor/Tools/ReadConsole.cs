@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Reflection;
+using System.Text;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
 using UnityEditor;
@@ -206,8 +207,8 @@ namespace UnityCliConnector.Tools
                     framesOverCap += formatted.FramesOverCap;
                     charsOmitted += formatted.CharsOmitted;
 
-                    int cost = JsonConvert.ToString(formatted.Text).Length;
-                    if (limits.MaxBytes > 0 && texts.Count > 0 && bytes + cost > limits.MaxBytes)
+                    int cost = Encoding.UTF8.GetByteCount(JsonConvert.ToString(formatted.Text));
+                    if (limits.MaxBytes > 0 && bytes + cost > limits.MaxBytes)
                     {
                         cutByBytes = true;
                         break;
@@ -254,7 +255,8 @@ namespace UnityCliConnector.Tools
                     stacktrace = StackTraceFilter.ModeName(mode),
                 },
             };
-            if (filterScope.Changed) data["console_window_filter"] = filterScope.Details;
+            if (filterScope.Changed || filterScope.FilterUnavailable)
+                data["console_window_filter"] = filterScope.Details;
             return new SuccessResponse(summary, data);
         }
 
@@ -271,11 +273,16 @@ namespace UnityCliConnector.Tools
         /// drift apart. No-op when the filter API is unavailable.
         private static ConsoleFilterScope EnterConsoleFilterOverride()
         {
-            if (_consoleFlagsProperty == null) return ConsoleFilterScope.None;
+            if (_consoleFlagsProperty == null) return ConsoleFilterScope.Unavailable;
 
             int savedFlags;
-            try { savedFlags = (int)_consoleFlagsProperty.GetValue(null); }
-            catch { return ConsoleFilterScope.None; }
+            try
+            {
+                var raw = _consoleFlagsProperty.GetValue(null);
+                if (raw == null) return ConsoleFilterScope.Unavailable;
+                savedFlags = Convert.ToInt32(raw);
+            }
+            catch { return ConsoleFilterScope.Unavailable; }
 
             bool haveFilter = _getFilteringTextMethod != null && _setFilteringTextMethod != null;
             string savedFilter = "";
@@ -296,24 +303,34 @@ namespace UnityCliConnector.Tools
             bool changeFilter = haveFilter && !string.IsNullOrEmpty(savedFilter);
 
             bool flagsSet = false, filterSet = false;
-            if (changeFlags)
-            {
-                try { _consoleFlagsProperty.SetValue(null, desiredFlags); flagsSet = true; }
-                catch { }
-            }
+            if (changeFlags) flagsSet = TrySetConsoleFlags(desiredFlags);
             if (changeFilter)
             {
                 try { _setFilteringTextMethod.Invoke(null, new object[] { "" }); filterSet = true; }
                 catch { }
             }
 
-            if (!flagsSet && !filterSet) return ConsoleFilterScope.None;
+            if (!flagsSet && !filterSet)
+                return changeFlags || changeFilter ? ConsoleFilterScope.Unavailable : ConsoleFilterScope.None;
             return new ConsoleFilterScope(savedFlags, savedFilter, flagsSet, filterSet, hidden, collapsed);
+        }
+
+        private static bool TrySetConsoleFlags(int flags)
+        {
+            try
+            {
+                var type = _consoleFlagsProperty.PropertyType;
+                object value = type.IsEnum ? Enum.ToObject(type, flags) : Convert.ChangeType(flags, type);
+                _consoleFlagsProperty.SetValue(null, value);
+                return true;
+            }
+            catch { return false; }
         }
 
         private sealed class ConsoleFilterScope : IDisposable
         {
             public static readonly ConsoleFilterScope None = new ConsoleFilterScope();
+            public static readonly ConsoleFilterScope Unavailable = new ConsoleFilterScope(true);
 
             private readonly int _savedFlags;
             private readonly string _savedFilter;
@@ -321,10 +338,12 @@ namespace UnityCliConnector.Tools
             private readonly bool _restoreFilter;
             private readonly List<string> _hidden;
             private readonly bool _collapsed;
+            private readonly bool _unavailable;
 
-            private ConsoleFilterScope()
+            private ConsoleFilterScope(bool unavailable = false)
             {
                 _hidden = new List<string>();
+                _unavailable = unavailable;
             }
 
             public ConsoleFilterScope(int savedFlags, string savedFilter, bool restoreFlags, bool restoreFilter,
@@ -340,10 +359,14 @@ namespace UnityCliConnector.Tools
 
             public bool Changed => _restoreFlags || _restoreFilter;
 
+            public bool FilterUnavailable => _unavailable;
+
             public string Note
             {
                 get
                 {
+                    if (_unavailable)
+                        return "Console window filter unavailable on this Unity version; an empty result may be filtered";
                     var parts = new List<string>();
                     if (_restoreFlags && _hidden.Count > 0) parts.Add(string.Join("/", _hidden) + " hidden");
                     if (_restoreFilter && !string.IsNullOrEmpty(_savedFilter)) parts.Add($"search '{_savedFilter}'");
@@ -354,6 +377,7 @@ namespace UnityCliConnector.Tools
 
             public object Details => new
             {
+                available = !_unavailable,
                 note = Note,
                 log_hidden = _restoreFlags && _hidden.Contains("log"),
                 warning_hidden = _restoreFlags && _hidden.Contains("warning"),
@@ -365,9 +389,7 @@ namespace UnityCliConnector.Tools
             public void Dispose()
             {
                 if (_restoreFlags)
-                {
-                    try { _consoleFlagsProperty.SetValue(null, _savedFlags); } catch { }
-                }
+                    TrySetConsoleFlags(_savedFlags);
                 if (_restoreFilter)
                 {
                     try { _setFilteringTextMethod.Invoke(null, new object[] { _savedFilter }); } catch { }

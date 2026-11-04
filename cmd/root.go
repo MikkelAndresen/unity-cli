@@ -791,7 +791,7 @@ Console:
   console --lines 20            Newest N entries
   console --type error,warning,log   Filter by log types (comma-separated)
   console --stacktrace full     Stack trace: none, user (default), full
-  console --full                No caps: every entry, frame and character
+  console --full                No size caps (the stacktrace mode still filters frames)
   console --clear               Clear console
 
 Execute C#:
@@ -1124,7 +1124,7 @@ Options:
   --frames <N>         Stack frames kept per entry (default 6; 0 = none, -1 = all)
   --entry_chars <N>    Max characters per entry (default 1000; 0 = no limit)
   --max_bytes <N>      Max total bytes of entry text (default 15360; 0 = no limit)
-  --full               Remove every cap
+  --full               Remove every size cap (stacktrace mode still filters frames)
   --clear              Clear console
 
 Examples:
