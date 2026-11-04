@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Threading.Tasks;
 using Newtonsoft.Json.Linq;
 using UnityEditor;
 using UnityEditor.Compilation;
@@ -51,7 +52,7 @@ namespace UnityCliConnector.Tools
         private const int DefaultLimit = 20;
         private const float PollIntervalMs = 100f;
 
-        public static object HandleCommand(JObject parameters)
+        public static async Task<object> HandleCommand(JObject parameters)
         {
             var p = new ToolParams(parameters ?? new JObject());
             var force = p.GetBool("compile");
@@ -77,15 +78,23 @@ namespace UnityCliConnector.Tools
                     notes.Add("this Burst build does not expose TriggerRecompilation; reporting the last compile instead of a forced one");
             }
 
-            var (idleKnown, idle, waitedMs, timedOut) = WaitForIdle(burst, waitSeconds);
+            var (idleKnown, idle, waitedMs, timedOut) = await WaitForIdle(burst, waitSeconds);
 
             var targets = burst.Targets();
-            var projectAssemblies = ProjectAssemblies();
-            foreach (var target in targets)
-                ResolveAssembly(target, projectAssemblies);
+            if (burst.TargetEnumerationFailed)
+                notes.Add("Burst's target list could not be read; target counts and statuses are unknown, not zero.");
 
-            var projectTargets = targets.Where(t => !string.IsNullOrEmpty(t.Assembly)).ToList();
+            var projectAssemblies = ProjectAssemblies();
+            var projectAssemblyNames = new HashSet<string>(projectAssemblies.Keys, StringComparer.OrdinalIgnoreCase);
+            var resolutionOrder = ResolutionOrder(projectAssemblies);
+            foreach (var target in targets)
+                ResolveAssembly(target, resolutionOrder);
+
+            // A target belongs to the project by its resolved assembly name, not by having one:
+            // Burst 1.8 sets Assembly from the job's own type, package targets included.
+            var projectTargets = targets.Where(t => BurstTargets.IsProjectTarget(t, projectAssemblyNames)).ToList();
             var packageTargets = targets.Count - projectTargets.Count;
+            var candidates = p.GetBool("include_packages") ? targets : projectTargets;
 
             var errors = BurstErrors.Collect(CompilationGate.GetLiveDiagnostics(false), CompileErrors());
 
@@ -97,10 +106,10 @@ namespace UnityCliConnector.Tools
             // Filtered: the answer is the list of matches. Unfiltered: counts over every target in
             // the project's own assemblies, and the list stays out of the reply.
             var reported = listing
-                ? projectTargets
+                ? candidates
                     .Where(t => BurstTargets.Matches(t, p.Get("type"), p.Get("namespace"), SplitAssemblies(p.Get("assembly"))))
                     .ToList()
-                : projectTargets;
+                : candidates;
 
             foreach (var target in reported)
                 target.Status = BurstTargets.StatusOf(target, errors, idleKnown, idle);
@@ -121,7 +130,7 @@ namespace UnityCliConnector.Tools
                 notes.Add("this Burst build does not answer IsCurrentCompilationDone, so targets are reported as unknown rather than compiled");
             else if (burst.Eager() == BurstIntrospection.EagerState.NotScheduled && !forced)
                 notes.Add("Burst has not scheduled an eager compile in this editor session; the statuses come from its idle queue after the last script compile");
-            var unattributed = errors.Count(e => projectTargets.All(t => !BurstErrors.PointsAt(e, t)));
+            var unattributed = errors.Count(e => reported.All(t => !BurstErrors.PointsAt(e, t)));
             if (unattributed > 0)
                 notes.Add($"{unattributed} Burst error(s) could not be attributed to a target");
             // Measured on Unity 6000.6.5f1 / Burst 2.0.0: Burst logs a method's error once and then
@@ -133,7 +142,8 @@ namespace UnityCliConnector.Tools
                 notes.Add("no Burst errors in the console; Burst logs a method's error once per editor session, " +
                           "so an assembly that was not recompiled may not re-log one it already reported");
 
-            var message = $"Burst {(idle ? "idle" : "compiling")}: {compiled}/{reported.Count} targets compiled, " +
+            var state = !idleKnown ? "unknown" : idle ? "idle" : "compiling";
+            var message = $"Burst {state}: {compiled}/{reported.Count} targets compiled, " +
                           $"{errors.Count} Burst error(s).";
 
             return new SuccessResponse(message, new
@@ -186,9 +196,10 @@ namespace UnityCliConnector.Tools
             return entries;
         }
 
-        /// Bounded wait on Burst's own queue, not on Unity's script compilation. Sleeps rather than
-        /// pumping: Burst compiles on its own thread, so the main thread has nothing to pump for it.
-        private static (bool IdleKnown, bool Idle, int WaitedMs, bool TimedOut) WaitForIdle(BurstIntrospection burst, float waitSeconds)
+        /// Bounded wait on Burst's own queue, not on Unity's script compilation. Yields instead of
+        /// sleeping: the handler runs on the main thread, so blocking it would also stop the script
+        /// compile whose completion IsIdle is waiting for (and freeze the heartbeat and the UI).
+        private static async Task<(bool IdleKnown, bool Idle, int WaitedMs, bool TimedOut)> WaitForIdle(BurstIntrospection burst, float waitSeconds)
         {
             var idleKnown = burst.CanQueryIdle;
             var start = DateTime.UtcNow;
@@ -196,7 +207,7 @@ namespace UnityCliConnector.Tools
             var idle = idleKnown && IsIdle(burst);
             while (idleKnown && !idle && DateTime.UtcNow < deadline)
             {
-                System.Threading.Thread.Sleep(TimeSpan.FromMilliseconds(PollIntervalMs));
+                await Task.Delay(TimeSpan.FromMilliseconds(PollIntervalMs));
                 idle = IsIdle(burst);
             }
             var waited = (int)(DateTime.UtcNow - start).TotalMilliseconds;
@@ -264,21 +275,36 @@ namespace UnityCliConnector.Tools
             return project;
         }
 
-        /// Fills target.Assembly (and normalizes DeclaringType) by finding the owning type among the
-        /// project's assemblies. Burst 2.x describes targets as strings only, so this is the only way
-        /// to say "this target belongs to my code" there. Unresolved targets are treated as
-        /// package/engine targets and left out of the project listing.
-        private static void ResolveAssembly(BurstTargetInfo target, Dictionary<string, System.Reflection.Assembly> projectAssemblies)
+        /// Project assemblies first, then every other loaded assembly. Resolution order decides which
+        /// assembly a type that exists in both is attributed to, and AppDomain order must not.
+        private static List<System.Reflection.Assembly> ResolutionOrder(Dictionary<string, System.Reflection.Assembly> projectAssemblies)
         {
-            if (projectAssemblies.Count == 0) return;
+            var ordered = new List<System.Reflection.Assembly>(projectAssemblies.Values);
+            var seen = new HashSet<string>(projectAssemblies.Keys, StringComparer.OrdinalIgnoreCase);
+            foreach (var assembly in AppDomain.CurrentDomain.GetAssemblies())
+            {
+                var name = assembly.GetName().Name;
+                if (string.IsNullOrEmpty(name) || !seen.Add(name)) continue;
+                ordered.Add(assembly);
+            }
+            return ordered;
+        }
+
+        /// Fills target.Assembly (and normalizes DeclaringType) by finding the owning type among the
+        /// loaded assemblies. Burst 2.x describes targets as strings only, so this is the only way
+        /// to resolve an assembly there. Package targets are resolved too, so --include_packages can
+        /// list them; an unresolved target keeps whatever Burst itself reported (usually nothing).
+        private static void ResolveAssembly(BurstTargetInfo target, IReadOnlyList<System.Reflection.Assembly> assemblies)
+        {
+            if (assemblies.Count == 0) return;
 
             foreach (var candidate in Candidates(target))
             {
-                foreach (var pair in projectAssemblies)
+                foreach (var assembly in assemblies)
                 {
-                    var found = FindType(pair.Value, candidate);
+                    var found = FindType(assembly, candidate);
                     if (found == null) continue;
-                    target.Assembly = pair.Value.GetName().Name;
+                    target.Assembly = assembly.GetName().Name;
                     target.DeclaringType = found.FullName;
                     return;
                 }

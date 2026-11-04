@@ -361,6 +361,15 @@ namespace UnityCliConnector.Tools
             return hay.IndexOf(needle, StringComparison.OrdinalIgnoreCase);
         }
 
+        /// Whether a target's resolved assembly is one of the project's own. Having an assembly name
+        /// is not enough: on Burst 1.8 every target carries the assembly of its job type, including
+        /// package and engine jobs.
+        public static bool IsProjectTarget(BurstTargetInfo target, IReadOnlyCollection<string> projectAssemblies)
+        {
+            if (target == null || string.IsNullOrEmpty(target.Assembly) || projectAssemblies == null) return false;
+            return projectAssemblies.Any(name => string.Equals(name?.Trim(), target.Assembly, StringComparison.OrdinalIgnoreCase));
+        }
+
         public static string NamespaceOf(string declaringType)
         {
             if (string.IsNullOrEmpty(declaringType)) return "";

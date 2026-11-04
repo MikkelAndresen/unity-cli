@@ -30,8 +30,6 @@ namespace UnityCliConnector.Tools
         private static readonly string[] BurstRuntimeAssemblies = { "UnityEngine.BurstModule", "Unity.Burst" };
         private static readonly string[] BurstEditorAssemblies = { "UnityEditor.BurstModule", "Unity.Burst.Editor", "Unity.Burst" };
 
-        private readonly Type _compiler;
-        private readonly Type _reflection;
         private readonly FieldInfo _eagerStatus;
         private readonly MethodInfo _isCompilationDone;
         private readonly MethodInfo _triggerRecompilation;
@@ -43,9 +41,6 @@ namespace UnityCliConnector.Tools
 
         private BurstIntrospection(Type compiler, Type loader, Type reflection)
         {
-            _compiler = compiler;
-            _reflection = reflection;
-
             _isCompilationDone = compiler?.GetMethod("IsCurrentCompilationDone", StaticAny);
             _triggerRecompilation = compiler?.GetMethod("TriggerRecompilation", StaticAny);
             _entryPoints = compiler?.GetMethod("GetInspectorEntryPoints", StaticAny);
@@ -95,21 +90,38 @@ namespace UnityCliConnector.Tools
 
         public bool CanQueryIdle => _isCompilationDone != null;
 
-        public bool CanForceRecompile => _triggerRecompilation != null;
+        /// True when Burst's own enumeration failed (a renamed member or a changed signature). An
+        /// empty <see cref="Targets"/> then means unknown, not "the project has no Burst work".
+        public bool TargetEnumerationFailed { get; private set; }
 
         /// Burst's own answer to "is any compile still queued or running".
         public bool IsCompilationDone()
         {
             if (_isCompilationDone == null) return true;
-            try { return (bool)_isCompilationDone.Invoke(null, null); }
-            catch (TargetInvocationException) { return false; }
+            return TryInvoke(_isCompilationDone, null, null, out var result) && result is bool done && done;
         }
 
         public bool ForceRecompile()
         {
             if (_triggerRecompilation == null) return false;
-            _triggerRecompilation.Invoke(null, null);
-            return true;
+            return TryInvoke(_triggerRecompilation, null, null, out _);
+        }
+
+        /// Reflection into a private API: any failure to invoke a member means it is unusable in this
+        /// Burst build, which is the same outcome as the member being absent.
+        static bool TryInvoke(MethodInfo method, object target, object[] args, out object result)
+        {
+            result = null;
+            if (method == null) return false;
+            try
+            {
+                result = method.Invoke(target, args);
+                return true;
+            }
+            catch (Exception)
+            {
+                return false;
+            }
         }
 
         public enum EagerState
@@ -140,8 +152,7 @@ namespace UnityCliConnector.Tools
         public bool CompilationEnabled()
         {
             if (_optionsIsEnabled == null || _globalOptions == null) return true;
-            try { return (bool)_optionsIsEnabled.Invoke(_globalOptions, null); }
-            catch (TargetInvocationException) { return true; }
+            return !TryInvoke(_optionsIsEnabled, _globalOptions, null, out var result) || result is not bool enabled || enabled;
         }
 
         /// Every target Burst knows how to compile. Assembly is left empty when the target cannot be
@@ -154,8 +165,11 @@ namespace UnityCliConnector.Tools
         List<BurstTargetInfo> TargetsFromInspectorEntries()
         {
             var targets = new List<BurstTargetInfo>();
-            var entries = _entryPoints.Invoke(null, null) as Array;
-            if (entries == null) return targets;
+            if (!TryInvoke(_entryPoints, null, null, out var raw) || raw is not Array entries)
+            {
+                TargetEnumerationFailed = true;
+                return targets;
+            }
 
             var type = entries.GetType().GetElementType();
             var fullName = type.GetField("FullName");
@@ -192,7 +206,11 @@ namespace UnityCliConnector.Tools
         List<BurstTargetInfo> TargetsFromReflectionScan()
         {
             var targets = new List<BurstTargetInfo>();
-            if (_findExecuteMethods == null) return targets;
+            if (_findExecuteMethods == null)
+            {
+                TargetEnumerationFailed = true;
+                return targets;
+            }
 
             object result;
             try
@@ -207,13 +225,23 @@ namespace UnityCliConnector.Tools
                     }),
                 };
             }
-            catch (TargetInvocationException)
+            catch (Exception)
             {
+                TargetEnumerationFailed = true;
                 return targets;
             }
-            if (result == null) return targets;
+            if (result == null)
+            {
+                TargetEnumerationFailed = true;
+                return targets;
+            }
 
-            var list = (System.Collections.IEnumerable)result.GetType().GetField("CompileTargets").GetValue(result);
+            var list = result.GetType().GetField("CompileTargets")?.GetValue(result) as System.Collections.IEnumerable;
+            if (list == null)
+            {
+                TargetEnumerationFailed = true;
+                return targets;
+            }
             foreach (var entry in list)
             {
                 var type = entry.GetType();

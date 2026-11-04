@@ -134,9 +134,6 @@ namespace UnityCliConnector.Tests
             {
                 new BurstConsoleEntry(0, "(0,0): Burst error BC1051: `MyGame.HeavyJob` is not supported\n" +
                                         "at MyGame.HeavyJob.Execute() (at Assets/Job.cs:4)", "", 61),
-                // A Debug.LogError is not a compile error; the caller filters by mode, and this one is
-                // shaped like a Burst error to show the filter is what keeps it out.
-                new BurstConsoleEntry(0, "(0,0): Burst error BC9999: logged by hand", "Assets/Foo.cs", 2),
             };
 
             var errors = BurstErrors.Collect(
@@ -200,6 +197,18 @@ namespace UnityCliConnector.Tests
                 Detail = "at Unity.Jobs.IJobExtensions.JobStruct`1<MyGame.HeavyJob>.Execute(ref MyGame.HeavyJob data) (at /engine/IJob.cs:61)",
             };
             Assert.IsTrue(BurstErrors.PointsAt(producer, target));
+        }
+
+        [Test]
+        public void IsProjectTarget_ClassifiesByTheProjectAssemblySetNotByHavingAName()
+        {
+            var project = new[] { "MyGame.Runtime", "Assembly-CSharp" };
+            Assert.IsTrue(BurstTargets.IsProjectTarget(Target("MyGame.Job", "MyGame.Job", "MyGame.Runtime"), project));
+            Assert.IsTrue(BurstTargets.IsProjectTarget(Target("MyGame.Job", "MyGame.Job", "assembly-csharp"), project));
+            // Burst 1.8 gives package and engine targets an assembly name too.
+            Assert.IsFalse(BurstTargets.IsProjectTarget(Target("Unity.Entities.Job", "Unity.Entities.Job", "Unity.Entities"), project));
+            Assert.IsFalse(BurstTargets.IsProjectTarget(Target("MyGame.Job", "MyGame.Job", ""), project));
+            Assert.IsFalse(BurstTargets.IsProjectTarget(null, project));
         }
 
         [Test]

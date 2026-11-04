@@ -30,6 +30,8 @@ func TestEffectiveInvocationTimeout(t *testing.T) {
 		{"verify is bounded at 30 minutes by default", "verify", nil, false, longCommandTimeoutMs},
 		{"editor refresh --compile waits out a compile", "editor", []string{"refresh", "--compile"}, false, longCommandTimeoutMs},
 		{"plain editor refresh keeps the normal budget", "editor", []string{"refresh"}, false, defaultRequestTimeoutMs},
+		{"burst_status widens the budget past its wait", "burst_status", []string{"--wait", "180"}, false, 210000},
+		{"burst_status without a wait keeps the normal budget", "burst_status", nil, false, defaultRequestTimeoutMs},
 		{"explicit --timeout wins", "test", nil, true, defaultRequestTimeoutMs},
 	}
 	for _, tt := range tests {

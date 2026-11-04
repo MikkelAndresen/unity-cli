@@ -77,8 +77,8 @@ type verifyBurst struct {
 	Notes          []string     `json:"notes,omitempty"`
 }
 
-// burstWaitSeconds is verify's bounded wait for Burst to finish; the connector caps its own wait at
-// the same value, so a bounded wait never turns into an unbounded one.
+// defaultBurstWaitSeconds is verify's bounded wait for Burst to finish. The connector waits exactly
+// this long; verify's invocation budget (30 min by default) is what bounds the request.
 const defaultBurstWaitSeconds = 60
 
 // verifyCmd checks that the project compiles and its tests pass, in one call and with output short

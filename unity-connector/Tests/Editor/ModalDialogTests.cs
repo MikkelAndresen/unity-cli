@@ -122,9 +122,9 @@ namespace UnityCliConnector.Tests
         [Test, Explicit("Opens a real modal dialog")]
         public void DisplayDialog_IsAnsweredOverHttp()
         {
+            if (!RuntimeInformation.IsOSPlatform(OSPlatform.OSX)) Assert.Ignore("Modal handling is macOS-only.");
             if (Environment.GetEnvironmentVariable("UNITY_CLI_DIALOG_TESTS") != "1")
                 Assert.Ignore("Set UNITY_CLI_DIALOG_TESTS=1 in the editor's environment to run the real-dialog test.");
-            if (!RuntimeInformation.IsOSPlatform(OSPlatform.OSX)) Assert.Ignore("Modal handling is macOS-only.");
             Assert.IsTrue(HttpServer.IsRunning, "Connector HTTP server is not running.");
 
             var port = HttpServer.Port;

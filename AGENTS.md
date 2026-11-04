@@ -84,6 +84,11 @@ go test -tags integration ./...
 
 CI skips these since Unity is not available.
 
+The real-dialog modal test (`DisplayDialog_IsAnsweredOverHttp`) is opt-in on top of `[Explicit]`: set
+`UNITY_CLI_DIALOG_TESTS=1` in the editor's environment (a GUI-launched editor does not inherit the
+shell's), and drive it by a path that does not use the CLI's modal watcher, which would otherwise
+abort the run on the dialog it opens.
+
 ## Checklist
 
 ### 변경 시

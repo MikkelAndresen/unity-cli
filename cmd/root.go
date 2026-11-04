@@ -542,10 +542,35 @@ func effectiveInvocationTimeout(category string, subArgs []string, explicit bool
 	if explicit {
 		return flagTimeout
 	}
+	if category == "burst_status" {
+		return burstWaitRequestMs(flagTimeout, subArgs)
+	}
 	if commandRunsLong(category, subArgs) {
 		return longCommandTimeoutMs
 	}
 	return flagTimeout
+}
+
+// burstWaitRequestMs widens a burst_status invocation's budget so the client does not give up while
+// the connector is still inside its own bounded wait (--wait is in seconds).
+func burstWaitRequestMs(flagTimeoutMs int, subArgs []string) int {
+	flags, err := parseSubFlags(subArgs)
+	if err != nil {
+		return flagTimeoutMs
+	}
+	raw, ok := flags["wait"]
+	if !ok || flagTimeoutMs <= 0 {
+		return flagTimeoutMs
+	}
+	seconds, convErr := strconv.ParseFloat(raw, 64)
+	if convErr != nil || seconds <= 0 {
+		return flagTimeoutMs
+	}
+	const waitSlackMs = 30000
+	if want := int(seconds*1000) + waitSlackMs; want > flagTimeoutMs {
+		return want
+	}
+	return flagTimeoutMs
 }
 
 func commandRunsLong(category string, subArgs []string) bool {

@@ -309,7 +309,7 @@ unity-cli burst_status --compile --wait 120 --timeout 130000
 ```
 
 ```
-idle: true, 3/4 targets compiled, 1 Burst error
+Burst idle: 3/4 targets compiled, 1 Burst error(s).
   Assets/Jobs/HeavyJob.cs:39 BC1006 The `catch` construction is not supported
 ```
 
