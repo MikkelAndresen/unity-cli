@@ -197,6 +197,10 @@ unity-cli editor refresh
 # Refresh and recompile scripts (also blocked in play mode unless --force is set)
 unity-cli editor refresh --compile
 
+# Recompile after discarding Unity's compiled-assembly cache (Bee) — the hammer for a build cache you
+# believe is lying; note it can still leave Library/ScriptAssemblies mtimes untouched
+unity-cli editor refresh --compile clean
+
 # Force refresh while in play mode
 unity-cli editor refresh --force
 ```
@@ -213,7 +217,11 @@ change one update tick and the CLI confirms it from the heartbeat (see
 (file/line/col/severity/code/message, plus `hint` for the error codes the connector can answer —
 see [Verify](#verify)), `timed_out`
 and `elapsed_ms`, plus the [compile provenance](#compile-provenance-and-wait) (`provenance`,
-`provenance_line`, and `stale_line` when a source file was written after the compile). `timed_out: true` means the wait gave up after 5 minutes — not that the compile
+`provenance_line`, `stale_line` when a source file was written after the compile, and
+`stale_assembly_line` when a project DLL is older than its sources). If an assembly is still stale
+after the compile, one `CleanBuildCache` rebuild is requested and `stale_after_compile` reports
+whether it fixed the DLL; the top-level `stale_assembly_*` fields always describe the state the
+compile left you in, not the state the request started from. `timed_out: true` means the wait gave up after 5 minutes — not that the compile
 failed. `nothing_to_compile: true` means no compilation was seen to run after the request, in which
 case `compile_succeeded` describes the editor's current compile state rather than a compile this
 command caused. The proof a compile actually ran is the connector's compile-finished clock: the
@@ -703,9 +711,12 @@ unity-cli test --filter MyTestClass
 
 # Only tests in these assemblies (comma-separated)
 unity-cli test --assembly MyGame.Tests.Editor
+
+# Run anyway when an assembly is older than its sources
+unity-cli test --allow-stale
 ```
 
-Requires the Unity Test Framework package. Tests are blocked by default when any open scene has unsaved changes. Use `--auto-save-scenes` to save them first, or `--allow-dirty-scenes` to run anyway. PlayMode tests trigger a domain reload — the CLI polls for results automatically.
+Requires the Unity Test Framework package. Tests are blocked by default when any open scene has unsaved changes. Use `--auto-save-scenes` to save them first, or `--allow-dirty-scenes` to run anyway. They are also blocked when a project assembly under test is older than its sources — a stale DLL runs old code and looks exactly like a real result. Rebuild with `unity-cli editor refresh --compile`, or pass `--allow-stale` deliberately. PlayMode tests trigger a domain reload — the CLI polls for results automatically.
 
 Tests run for minutes, so `test`'s invocation budget defaults to 30 minutes instead of the global 120 s. `--timeout <ms>` overrides it, and `--timeout 0` means no deadline; a run that exceeds the budget is reported as a client deadline, not as a lost editor.
 
@@ -725,6 +736,9 @@ unity-cli verify --no-burst
 
 # Only some tests (also --filter, --mode PlayMode)
 unity-cli verify --assembly MyGame.Tests.Editor
+
+# Run tests even when an assembly is older than its sources
+unity-cli verify --allow-stale
 
 # One JSON object instead of text
 unity-cli verify --json
@@ -758,7 +772,7 @@ The `compiled ...` line is the [compile provenance](#compile-provenance-and-wait
 
 Burst errors print like compile errors and fail verify (exit 1) before the tests run; `--burst-wait <seconds>` bounds how long verify waits for Burst to go idle (default 60, keep `--timeout` above it). A Burst check that cannot run — no `burst_status` tool because Burst is not installed, or the editor wouldn't answer — prints nothing or a note and leaves the verdict alone.
 
-`verify` clears the console first (a Burst error stays there after its code changes; Burst logs a live one again on the next compile; `--keep-console` skips the clear), refreshes and compiles, and lists this compile's errors from the connector's `compile_diagnostics` tool, leaving out `Library/` and `PackageCache/` unless nothing else failed. It then saves dirty open scenes and runs the tests, printing `passed/total` and the first line of each failure (`--max` caps both lists, default 20). Exit code 0 means it compiles, Burst is quiet and every test passed; 1 means compile errors, Burst errors, failing tests or no test ran; 2 means the editor couldn't answer: not running, timed out, or blocked by a modal dialog, which is named along with the command that answers it. Connectors before 0.7.0 have no `compile_diagnostics` and ignore `--assembly`; `verify` then lists console errors and says so.
+`verify` clears the console first (a Burst error stays there after its code changes; Burst logs a live one again on the next compile; `--keep-console` skips the clear), refreshes and compiles, and lists this compile's errors from the connector's `compile_diagnostics` tool, leaving out `Library/` and `PackageCache/` unless nothing else failed. It then refuses to run the tests if any project assembly is older than its sources (the DLL would run old code); `--allow-stale` overrides that. An assembly whose DLL an already-finished compile had time to rewrite is reported as `not stale:` instead of refused over — see [Compile provenance](#compile-provenance-and-wait). Otherwise it saves dirty open scenes and runs the tests, printing `passed/total` and the first line of each failure (`--max` caps both lists, default 20). Exit code 0 means it compiles, Burst is quiet and every test passed; 1 means compile errors, Burst errors, stale assemblies, failing tests or no test ran; 2 means the editor couldn't answer: not running, timed out, or blocked by a modal dialog, which is named along with the command that answers it. Connectors before 0.7.0 have no `compile_diagnostics` and ignore `--assembly`; `verify` then lists console errors and says so.
 
 `verify` runs the tests, so its invocation budget defaults to 30 minutes instead of the global 120 s. `--timeout <ms>` overrides it (`--timeout 0` means no deadline); when you set it explicitly, keep it above `--burst-wait`.
 
@@ -769,7 +783,13 @@ Every compile result says which compile it reflects, so a clean answer is told a
 ```
 compiled 14:02:11 (3 s ago, took 2.2 s) · 1 source file changed since previous compile · rebuilt: Game, Game.Tests.Editor
 stale: Assets/Scripts/Player.cs modified after this compile — run verify again
+stale assembly: Game.Tests.dll (built 14:01:50) is older than Assets/Game/Tests.cs (14:04:02) — run unity-cli editor refresh --compile
+not stale: Game.Tests.dll (built 14:01:50) is older than Assets/Game/Tests.cs (14:04:02), but the compile that started 14:05:10 read that source and kept the DLL; a moved mtime alone does not mean the DLL is out of date
 ```
+
+The third line appears when an assembly's output DLL is missing or older than its newest `.cs`/`.asmdef`/`.asmref` source (project and `file:`/embedded packages only; `Packages/<name>` paths are resolved to the directory the package really lives in, which is what makes `file:` packages count). The compile may have "succeeded" while Unity's assembly cache skipped the rebuild; `verify` and `test` refuse to run tests in that state unless `--allow-stale` is passed, and `editor refresh --compile` asks once for a `CleanBuildCache` rebuild before reporting `stale_after_compile`.
+
+The fourth line is the opposite case, and it is deliberately not a refusal: Unity does not rewrite a DLL whose contents it considers current, so a source whose mtime merely moved (a `touch`, a re-checkout) stays older than its DLL forever even though a compile read it. When the last compile *started* after that source was written, the assembly is counted in `stale_assembly_covered_count` and named in `stale_assembly_covered_line` instead of being reported stale — otherwise every `verify` after a `touch` would refuse, ask for a clean rebuild, and refuse again. Measured on 6000.6.5f1: a touched file produced an 11 s compile with `rebuilt_assemblies: []` and the DLL mtime unchanged, and even `editor refresh --compile clean` (`RequestScriptCompilationOptions.CleanBuildCache`, 65 s) left those mtimes alone because Bee restores its cached node output with the timestamps it recorded. So the compile clock, not the DLL's mtime, is what decides this case; `--compile clean` is still the hammer for a cache you believe is lying.
 
 The first line is the connector's: when the last script compilation finished (the reload it triggered
 included), how long it took, how many source files were written since the compile before it, and
@@ -783,7 +803,7 @@ editor with `sleep 45 && unity-cli compile_errors` loops.
 | `verify` | printed after the compile verdict; `compile.provenance` with `--json` |
 | `editor refresh --compile` | `provenance`, `provenance_line`, `stale_line`, and a note naming uncompiled sources |
 | `compile_diagnostics` | nested under `provenance` (`--include_provenance false` drops it) |
-| `compile_status` | the whole object: `compiled_at_ms`, `compiled_at` (ISO), `duration_ms`, `changed_since_previous_compile`, `rebuilt_assemblies`, `stale_files`, `scan_ms`, `scan_complete`, `provenance_line`, `stale_line` |
+| `compile_status` | the whole object: `compiled_at_ms`, `compiled_at` (ISO), `duration_ms`, `changed_since_previous_compile`, `rebuilt_assemblies`, `stale_files`, `stale_assembly_count`, `stale_assemblies[]`, `stale_assembly_line`, `stale_assembly_covered_count`, `stale_assembly_covered_line`, `scan_ms`, `scan_complete`, `provenance_line`, `stale_line` |
 
 ```bash
 # Block until the editor is idle, then print its state and the provenance line

@@ -57,6 +57,12 @@ func testCmd(ctx context.Context, args []string, send sendFn, port int) (*client
 	if _, ok := flags["auto-save-scenes"]; ok {
 		params["autoSaveScenes"] = true
 	}
+	if _, ok := flags["allow-stale"]; ok {
+		params["allowStale"] = true
+	}
+	if _, ok := flags["allow_stale"]; ok {
+		params["allowStale"] = true
+	}
 
 	resp, err := send("run_tests", params)
 	if err != nil {

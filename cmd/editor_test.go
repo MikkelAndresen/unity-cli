@@ -469,18 +469,24 @@ func compileTestBudgets(t *testing.T) {
 
 // compileReport mirrors the JSON `unity-cli editor refresh --compile` answers with.
 type compileReport struct {
-	RefreshTriggered bool               `json:"refresh_triggered"`
-	CompileRequested bool               `json:"compile_requested"`
-	CompileSucceeded bool               `json:"compile_succeeded"`
-	NothingToCompile bool               `json:"nothing_to_compile"`
-	ErrorCount       int                `json:"error_count"`
-	Errors           []verifyDiag       `json:"errors"`
-	TimedOut         bool               `json:"timed_out"`
-	ElapsedMs        int64              `json:"elapsed_ms"`
-	Notes            []string           `json:"notes"`
-	ProvenanceLine   string             `json:"provenance_line"`
-	StaleLine        string             `json:"stale_line"`
-	Provenance       *compileProvenance `json:"provenance"`
+	RefreshTriggered  bool               `json:"refresh_triggered"`
+	CompileRequested  bool               `json:"compile_requested"`
+	CompileSucceeded  bool               `json:"compile_succeeded"`
+	NothingToCompile  bool               `json:"nothing_to_compile"`
+	ErrorCount        int                `json:"error_count"`
+	Errors            []verifyDiag       `json:"errors"`
+	TimedOut          bool               `json:"timed_out"`
+	ElapsedMs         int64              `json:"elapsed_ms"`
+	Notes             []string           `json:"notes"`
+	ProvenanceLine    string             `json:"provenance_line"`
+	StaleLine         string             `json:"stale_line"`
+	StaleAfterCompile bool               `json:"stale_after_compile"`
+	Provenance        *compileProvenance `json:"provenance"`
+
+	StaleAssemblyCount        int             `json:"stale_assembly_count"`
+	StaleAssemblyCoveredCount int             `json:"stale_assembly_covered_count"`
+	StaleAssemblyCoveredLine  string          `json:"stale_assembly_covered_line"`
+	StaleAssemblies           []staleAssembly `json:"stale_assemblies"`
 }
 
 // The refresh report has to say which compile it answers with, or a clean report from a stale
@@ -523,6 +529,126 @@ func TestEditorCmd_RefreshCompileReportNotesStaleSources(t *testing.T) {
 	}
 	if !hasNoteContaining(report.Notes, "written after this compile") {
 		t.Errorf("notes = %v, want one that names the uncompiled sources", report.Notes)
+	}
+}
+
+func TestEditorCmd_RefreshCompileRetriesStaleAssemblyWithCleanBuild(t *testing.T) {
+	compileTestBudgets(t)
+	const staleLine = "stale assembly: Game.dll (built 12:01:00) is older than Assets/Game.cs (12:04:00) — run unity-cli editor refresh --compile"
+	f := &fakeEditor{t: t, diagnostics: clean(),
+		refreshReplies: []map[string]interface{}{
+			{"clean_compile_supported": true, "compile_finished_at": 1000},
+			{"clean_compile_supported": true, "compile_finished_at": 2000},
+		},
+		provenanceSeq: []map[string]interface{}{
+			{"provenance_line": provLine, "stale_assembly_count": 1, "stale_assembly_line": staleLine},
+			{"provenance_line": provLine, "stale_assembly_count": 0},
+		}}
+
+	resp, err := editorCmd(context.Background(), []string{"refresh", "--compile"}, f.send, f.resolve)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	report := parseCompileReport(t, resp)
+	if report.StaleAfterCompile {
+		t.Errorf("report = %+v, want stale_after_compile=false after the clean rebuild", report)
+	}
+	if !hasNoteContaining(report.Notes, "CleanBuildCache rebuild fixed") {
+		t.Errorf("notes = %v, want the clean retry explained", report.Notes)
+	}
+	if !f.called("refresh_unity") || f.params["refresh_unity"]["compile"] != "clean" {
+		t.Errorf("refresh params = %v, want the retry to request a clean compile", f.params["refresh_unity"])
+	}
+}
+
+func TestEditorCmd_RefreshCompileReportsStaleAfterCleanRetry(t *testing.T) {
+	compileTestBudgets(t)
+	const staleLine = "stale assembly: Game.dll (missing) is older than Assets/Game.cs (12:04:00) — run unity-cli editor refresh --compile"
+	f := &fakeEditor{t: t, diagnostics: clean(),
+		refreshReplies: []map[string]interface{}{
+			{"clean_compile_supported": true, "compile_finished_at": 1000},
+			{"clean_compile_supported": true, "compile_finished_at": 2000},
+		},
+		provenanceSeq: []map[string]interface{}{
+			{"provenance_line": provLine, "stale_assembly_count": 1, "stale_assembly_line": staleLine},
+			{"provenance_line": provLine, "stale_assembly_count": 1, "stale_assembly_line": staleLine},
+		}}
+
+	resp, err := editorCmd(context.Background(), []string{"refresh", "--compile"}, f.send, f.resolve)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	report := parseCompileReport(t, resp)
+	if !report.StaleAfterCompile {
+		t.Errorf("report = %+v, want stale_after_compile=true when the clean rebuild did not fix it", report)
+	}
+	if !hasNoteContaining(report.Notes, "still stale after one CleanBuildCache") {
+		t.Errorf("notes = %v, want the persisted staleness explained", report.Notes)
+	}
+}
+
+// The request-time staleness note tells the caller to run `editor refresh --compile clean`; the CLI
+// has to actually send that mode instead of a plain request.
+func TestEditorCmd_RefreshCompileCleanDiscardsTheBuildCache(t *testing.T) {
+	compileTestBudgets(t)
+	base := int64(1_000)
+	f := &fakeEditor{t: t, diagnostics: clean(), echoFinished: &base, finishedAt: 2_000}
+
+	resp, err := editorCmd(context.Background(), []string{"refresh", "--compile", "clean"}, f.send, f.resolve)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got := f.params["refresh_unity"]; got["compile"] != "clean" {
+		t.Errorf("refresh params = %v, want compile=clean", got)
+	}
+	if report := parseCompileReport(t, resp); !report.CompileSucceeded {
+		t.Errorf("report = %+v, want the clean compile reported like any other", report)
+	}
+}
+
+// An unknown compile mode reaches the connector as "don't compile", which would answer a request to
+// rebuild with a refresh that rebuilt nothing.
+func TestEditorCmd_RefreshCompileRejectsAnUnknownMode(t *testing.T) {
+	compileTestBudgets(t)
+	f := &fakeEditor{t: t, diagnostics: clean()}
+
+	if _, err := editorCmd(context.Background(), []string{"refresh", "--compile", "sometimes"}, f.send, f.resolve); err == nil {
+		t.Fatal("want an error for an unknown --compile value")
+	}
+	if f.called("refresh_unity") {
+		t.Errorf("calls = %v, want nothing sent to the editor", f.calls)
+	}
+}
+
+// The refresh answer used to carry the staleness it measured before asking for the compile next to
+// the post-compile verdict, so a report could say stale_after_compile:false while listing two stale
+// assemblies. The post-compile numbers win.
+func TestEditorCmd_RefreshCompileRestatesStalenessAfterTheCompile(t *testing.T) {
+	compileTestBudgets(t)
+	base := int64(1_000)
+	f := &fakeEditor{t: t, diagnostics: clean(), echoFinished: &base, finishedAt: 2_000,
+		refreshReplies: []map[string]interface{}{{
+			"clean_compile_supported": true,
+			"compile_finished_at":     1000,
+			"stale_assembly_count":    2,
+			"stale_assemblies":        []map[string]interface{}{{"name": "Game.Tests"}, {"name": "Game"}},
+		}},
+		provenance: map[string]interface{}{"provenance_line": provLine, "stale_assembly_count": 0,
+			"stale_assembly_covered_count": 2, "stale_assembly_covered_line": "not stale: Game.dll"}}
+
+	resp, err := editorCmd(context.Background(), []string{"refresh", "--compile"}, f.send, f.resolve)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	report := parseCompileReport(t, resp)
+	if report.StaleAfterCompile {
+		t.Errorf("report = %+v, want stale_after_compile=false", report)
+	}
+	if report.StaleAssemblyCount != 0 || len(report.StaleAssemblies) != 0 {
+		t.Errorf("report = %+v, want the request-time stale list replaced by the post-compile one", report)
+	}
+	if report.StaleAssemblyCoveredCount != 2 || report.StaleAssemblyCoveredLine == "" {
+		t.Errorf("report = %+v, want the covered count and line the compile reported", report)
 	}
 }
 

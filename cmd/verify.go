@@ -93,6 +93,10 @@ func verifyCmd(ctx context.Context, args []string, send, testSend sendFn, resolv
 	_, noTests := flags["no-tests"]
 	_, noBurst := flags["no-burst"]
 	_, keepConsole := flags["keep-console"]
+	_, allowStale := flags["allow-stale"]
+	if !allowStale {
+		_, allowStale = flags["allow_stale"]
+	}
 	_, asJSON := flags["json"]
 	burstWait := defaultBurstWaitSeconds
 	if v, ok := flags["burst-wait"]; ok {
@@ -167,6 +171,26 @@ func verifyCmd(ctx context.Context, args []string, send, testSend sendFn, resolv
 		return finish(verifyFailed)
 	}
 
+	if findings.Provenance != nil && findings.Provenance.StaleAssemblyCount > 0 {
+		line := findings.Provenance.StaleAssemblyLine
+		if line == "" {
+			line = fmt.Sprintf("%d project assembly(ies) are older than their sources", findings.Provenance.StaleAssemblyCount)
+		}
+		if !allowStale {
+			if asJSON {
+				r.Error = line + " — tests were not run; pass --allow-stale to run them anyway"
+			} else {
+				_, _ = fmt.Fprintln(out, line)
+				_, _ = fmt.Fprintf(out, "tests: refused (%d stale assembly(s)) — run unity-cli editor refresh --compile, or pass --allow-stale to run them anyway\n",
+					findings.Provenance.StaleAssemblyCount)
+			}
+			return finish(verifyFailed)
+		}
+		if !asJSON {
+			_, _ = fmt.Fprintf(out, "warning: %s\n", line)
+		}
+	}
+
 	// Burst compiles outside Unity's script compilation, so a clean C# compile says nothing about the
 	// [BurstCompile] jobs; ask Burst itself. A missing tool means no Burst (or an old connector): say
 	// nothing rather than claiming the project has no Burst work.
@@ -198,6 +222,9 @@ func verifyCmd(ctx context.Context, args []string, send, testSend sendFn, resolv
 		if v, ok := flags[k]; ok {
 			testArgs = append(testArgs, "--"+k, v)
 		}
+	}
+	if allowStale {
+		testArgs = append(testArgs, "--allow-stale")
 	}
 	tresp, err := testCmd(ctx, testArgs, testSend, port)
 	if err != nil {

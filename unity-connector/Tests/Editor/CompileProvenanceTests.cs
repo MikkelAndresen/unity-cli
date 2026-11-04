@@ -128,7 +128,9 @@ namespace UnityCliConnector.Tests
                          "compiled_at_ms", "compiled_at", "compile_started_at_ms", "duration_ms",
                          "age_seconds", "rebuilt_assemblies", "rebuilt_truncated",
                          "changed_since_previous_compile", "stale_count", "stale_files",
-                         "stale_truncated", "scanned_roots", "scanned_files", "scan_ms",
+                         "stale_truncated", "stale_assembly_count", "stale_assemblies",
+                         "stale_assemblies_truncated", "stale_assembly_scan_complete",
+                         "stale_assembly_line", "scanned_roots", "scanned_files", "scan_ms",
                          "scan_complete", "scan_note", "provenance_line", "stale_line",
                      })
             {

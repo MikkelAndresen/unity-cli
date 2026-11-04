@@ -15,26 +15,28 @@ import (
 
 // fakeEditor answers the tools verify uses and records every call.
 type fakeEditor struct {
-	t             *testing.T
-	compileErrors bool                   // heartbeat flag after the compile
-	connector     string                 // heartbeat connectorVersion
-	finishedAt    int64                  // heartbeat compileFinishedAt seen while polling
-	echoFinished  *int64                 // refresh_unity echoes compile_finished_at; nil: connector without the clock
-	pid           int                    // heartbeat pid (0: no restart, no restart detection)
-	stuckState    string                 // heartbeat state while polling (default "ready")
-	diagnostics   map[bool][]interface{} // compile_diagnostics by source_tree_only; nil: tool unknown (old connector)
-	console       []string               // console error entries (old-connector fallback)
-	consoleCapped bool                   // console reply wraps the entries in the capped object
-	provenance    map[string]interface{} // compile_diagnostics' provenance object; nil: connector predates it
-	tests         map[string]interface{} // run_tests summary; nil: tests not expected
-	testsSuccess  bool
-	testsMessage  string
-	burst         map[string]interface{} // burst_status reply; nil: connector has no burst_status tool
-	burstSuccess  bool
-	burstMessage  string
-	refreshErr    error
-	calls         []string
-	params        map[string]map[string]interface{}
+	t              *testing.T
+	compileErrors  bool                     // heartbeat flag after the compile
+	connector      string                   // heartbeat connectorVersion
+	finishedAt     int64                    // heartbeat compileFinishedAt seen while polling
+	echoFinished   *int64                   // refresh_unity echoes compile_finished_at; nil: connector without the clock
+	pid            int                      // heartbeat pid (0: no restart, no restart detection)
+	stuckState     string                   // heartbeat state while polling (default "ready")
+	diagnostics    map[bool][]interface{}   // compile_diagnostics by source_tree_only; nil: tool unknown (old connector)
+	console        []string                 // console error entries (old-connector fallback)
+	consoleCapped  bool                     // console reply wraps the entries in the capped object
+	provenance     map[string]interface{}   // compile_diagnostics' provenance object; nil: connector predates it
+	provenanceSeq  []map[string]interface{} // per-call provenance; overrides provenance while non-empty
+	refreshReplies []map[string]interface{} // per-call refresh_unity extras; overrides reply while non-empty
+	tests          map[string]interface{}   // run_tests summary; nil: tests not expected
+	testsSuccess   bool
+	testsMessage   string
+	burst          map[string]interface{} // burst_status reply; nil: connector has no burst_status tool
+	burstSuccess   bool
+	burstMessage   string
+	refreshErr     error
+	calls          []string
+	params         map[string]map[string]interface{}
 }
 
 func (f *fakeEditor) send(command string, params interface{}) (*client.CommandResponse, error) {
@@ -75,6 +77,15 @@ func (f *fakeEditor) send(command string, params interface{}) (*client.CommandRe
 		if f.echoFinished != nil {
 			reply["compile_finished_at"] = *f.echoFinished
 		}
+		if len(f.refreshReplies) > 0 {
+			for k, v := range f.refreshReplies[0] {
+				reply[k] = v
+			}
+			f.refreshReplies = f.refreshReplies[1:]
+			if finished, ok := reply["compile_finished_at"].(int); ok {
+				f.finishedAt = int64(finished) + 1000
+			}
+		}
 		return &client.CommandResponse{Success: true, Data: data(reply)}, nil
 	case "compile_diagnostics":
 		if f.diagnostics == nil {
@@ -84,8 +95,13 @@ func (f *fakeEditor) send(command string, params interface{}) (*client.CommandRe
 		reply := map[string]interface{}{
 			"compiling": false, "total": len(list), "diagnostics": list,
 		}
-		if f.provenance != nil {
-			reply["provenance"] = f.provenance
+		prov := f.provenance
+		if len(f.provenanceSeq) > 0 {
+			prov = f.provenanceSeq[0]
+			f.provenanceSeq = f.provenanceSeq[1:]
+		}
+		if prov != nil {
+			reply["provenance"] = prov
 		}
 		return &client.CommandResponse{Success: true, Data: data(reply)}, nil
 	case "run_tests":
@@ -302,6 +318,68 @@ func TestVerify_ASourceWrittenAfterTheCompileIsSaidOutLoud(t *testing.T) {
 	}
 	if !strings.Contains(out, "stale: Assets/Foo.cs modified after this compile") {
 		t.Errorf("output = %q, want the stale line", out)
+	}
+}
+
+func TestVerify_StaleAssemblyRefusesToRunTests(t *testing.T) {
+	const staleLine = "stale assembly: Foo.Tests.dll (built 12:01:00) is older than Assets/FooTests.cs (12:04:00) — run unity-cli editor refresh --compile"
+	f := &fakeEditor{t: t, diagnostics: clean(),
+		provenance: map[string]interface{}{
+			"provenance_line":      provLine,
+			"stale_assembly_count": 1,
+			"stale_assembly_line":  staleLine,
+			"stale_assemblies": []interface{}{map[string]interface{}{
+				"name": "Foo.Tests", "newest_source": "Assets/FooTests.cs",
+			}},
+		}}
+	code, out := f.run()
+	if code != verifyFailed {
+		t.Fatalf("exit = %d, want 1; output:\n%s", code, out)
+	}
+	if f.called("run_tests") {
+		t.Errorf("tests ran against a stale assembly: %v", f.calls)
+	}
+	if !strings.Contains(out, staleLine) || !strings.Contains(out, "tests: refused (1 stale assembly(s))") {
+		t.Errorf("output = %q, want the stale assembly and the refusal", out)
+	}
+}
+
+func TestVerify_AllowStaleRunsTestsAndSaysWhy(t *testing.T) {
+	const staleLine = "stale assembly: Foo.Tests.dll (built 12:01:00) is older than Assets/FooTests.cs (12:04:00) — run unity-cli editor refresh --compile"
+	f := &fakeEditor{t: t, diagnostics: clean(), tests: passing(1), testsSuccess: true,
+		provenance: map[string]interface{}{
+			"provenance_line":      provLine,
+			"stale_assembly_count": 1,
+			"stale_assembly_line":  staleLine,
+		}}
+	code, out := f.run("--allow-stale")
+	if code != verifyOK {
+		t.Fatalf("exit = %d, want 0; output:\n%s", code, out)
+	}
+	if !strings.Contains(out, "warning: "+staleLine) || !strings.Contains(out, "tests: 1/1 passed") {
+		t.Errorf("output = %q, want the warning and the test result", out)
+	}
+	if f.params["run_tests"]["allowStale"] != true {
+		t.Errorf("run_tests params = %v, want allowStale=true so the connector does not refuse", f.params["run_tests"])
+	}
+}
+
+func TestVerify_StaleAssemblyInJSONIsAnError(t *testing.T) {
+	f := &fakeEditor{t: t, diagnostics: clean(),
+		provenance: map[string]interface{}{
+			"stale_assembly_count": 2,
+			"stale_assembly_line":  "stale assembly: Foo.Tests.dll (missing) is older than Assets/FooTests.cs (12:04:00) — run unity-cli editor refresh --compile",
+		}}
+	code, out := f.run("--json")
+	if code != verifyFailed {
+		t.Fatalf("exit = %d, want 1", code)
+	}
+	var r verifyResult
+	if err := json.Unmarshal([]byte(out), &r); err != nil {
+		t.Fatalf("output is not JSON: %v (%s)", err, out)
+	}
+	if !strings.Contains(r.Error, "stale assembly") || !strings.Contains(r.Error, "--allow-stale") {
+		t.Errorf("error = %q, want the stale assembly and the escape hatch", r.Error)
 	}
 }
 

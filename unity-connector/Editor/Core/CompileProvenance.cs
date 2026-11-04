@@ -115,15 +115,28 @@ namespace UnityCliConnector
         public static object BuildPayload(bool scan, int scanBudgetMs)
         {
             SourceScan s = null;
-            if (scan) s = ScanSourceTree(scanBudgetMs);
-            return BuildPayloadFrom(s_Record, s, NowMs());
+            AssemblyStaleness.ScanResult assemblies = null;
+            if (scan)
+            {
+                s = ScanSourceTree(scanBudgetMs);
+                assemblies = AssemblyStaleness.ScanProject(scanBudgetMs);
+            }
+            return BuildPayloadFrom(s_Record, s, NowMs(), assemblies);
         }
 
         /// The provenance sentence without the source scan, for callers that only need to say
         /// how old the compile behind an answer is (the compile gate's error message).
         public static string DescribeLastCompile() => FormatProvenanceLine(s_Record, null, NowMs());
 
-        internal static object BuildPayloadFrom(Record record, SourceScan scan, long nowMs)
+        /// When the last observed script compilation started, or its finish if this domain never saw
+        /// its start. Sources written before that moment were inputs that compile could read, which is
+        /// what lets AssemblyStaleness tell "the edit was never compiled" from "the compile read the
+        /// edit and kept the old DLL".
+        internal static long LastCompileStartedAtMs() =>
+            s_Record.started_at_ms > 0 ? s_Record.started_at_ms : s_Record.finished_at_ms;
+
+        internal static object BuildPayloadFrom(Record record, SourceScan scan, long nowMs,
+            AssemblyStaleness.ScanResult assemblies = null)
         {
             var ageMs = record.finished_at_ms > 0 ? Math.Max(0, nowMs - record.finished_at_ms) : 0;
             return new
@@ -145,6 +158,13 @@ namespace UnityCliConnector
                 stale_count = scan?.stale_count ?? 0,
                 stale_files = scan?.stale_files ?? new List<string>(),
                 stale_truncated = scan?.stale_truncated ?? false,
+                stale_assembly_count = assemblies?.StaleCount ?? 0,
+                stale_assemblies = AssemblyStaleness.ToPayload(assemblies),
+                stale_assemblies_truncated = assemblies?.Truncated ?? false,
+                stale_assembly_scan_complete = assemblies?.Complete ?? false,
+                stale_assembly_line = AssemblyStaleness.FormatLine(assemblies),
+                stale_assembly_covered_count = assemblies?.CoveredCount ?? 0,
+                stale_assembly_covered_line = AssemblyStaleness.FormatCoveredLine(assemblies),
                 scanned_roots = scan?.roots ?? new List<string>(),
                 scanned_files = scan?.scanned_files ?? 0,
                 scan_ms = scan?.scan_ms ?? 0,
@@ -312,7 +332,7 @@ namespace UnityCliConnector
         /// Sources the user can edit: Assets/, plus embedded and file:/local packages. Registry and
         /// git packages live under Library/PackageCache — third-party code nobody edits, and walking
         /// it would spend the whole budget answering "is your code stale?".
-        static List<string> SourceRoots()
+        internal static List<string> SourceRoots()
         {
             var roots = new List<string>();
             AddRoot(roots, Application.dataPath);
