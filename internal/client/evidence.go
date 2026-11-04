@@ -32,11 +32,48 @@ type EditorEvidence struct {
 	StaleHeartbeat *Instance
 	StaleFile      string
 	StaleBeatAge   time.Duration
+	// SessionHeartbeat is the newest heartbeat for the project whatever its state or freshness,
+	// including a cleanly stopped one. It answers whether the connector ever loaded this session;
+	// StaleHeartbeat is the subset that went silent and drives the unresponsive report.
+	SessionHeartbeat *Instance
 }
 
 // Found reports whether anything on disk suggests an open editor.
 func (e *EditorEvidence) Found() bool {
 	return e != nil && (e.LockfilePath != "" || e.StaleHeartbeat != nil)
+}
+
+func (e *EditorEvidence) heartbeatAfterLockfile(inst *Instance) bool {
+	if e == nil || inst == nil {
+		return false
+	}
+	if e.LockfilePath == "" {
+		return true
+	}
+	return !time.UnixMilli(inst.Timestamp).Before(e.LockfileMTime)
+}
+
+// HeartbeatThisSession reports whether any heartbeat for the project postdates the lockfile.
+// Temp/UnityLockfile is written once when Unity opens the project, so such a heartbeat proves the
+// connector loaded this session — even if it has since stopped, gone silent, or shut down cleanly.
+// Without a lockfile there is nothing to compare, and the heartbeat itself is proof enough.
+func (e *EditorEvidence) HeartbeatThisSession() bool {
+	if e == nil {
+		return false
+	}
+	if e.SessionHeartbeat != nil {
+		return e.heartbeatAfterLockfile(e.SessionHeartbeat)
+	}
+	return e.heartbeatAfterLockfile(e.StaleHeartbeat)
+}
+
+// SilentHeartbeatThisSession narrows the same question to the silent heartbeat the report is about:
+// only then is "stopped answering" the right reading rather than "never started".
+func (e *EditorEvidence) SilentHeartbeatThisSession() bool {
+	if e == nil {
+		return false
+	}
+	return e.heartbeatAfterLockfile(e.StaleHeartbeat)
 }
 
 // Summary is the compact reason an editor looks open, e.g. "Temp/UnityLockfile, age 42s".
@@ -83,6 +120,14 @@ func FindEditorEvidence(project string, port int) *EditorEvidence {
 		ev.LockfileAge = time.Since(info.ModTime())
 		break
 	}
+
+	// Scope the session heartbeat to the project the rest of the evidence is about, so an
+	// unrelated instance cannot suppress this project's lockfile crash hint.
+	scope := ev.ProjectPath
+	if scope == "" {
+		scope = project
+	}
+	ev.SessionHeartbeat = NewestHeartbeat(scope, port)
 
 	if !ev.Found() {
 		return nil

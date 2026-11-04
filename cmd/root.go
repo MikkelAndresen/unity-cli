@@ -736,8 +736,9 @@ Modal Dialogs (macOS):
 Startup Dialogs (macOS host, no connector needed):
   dialogs                       List Unity's windows, their texts and button names (JSON)
   dialogs --click "<title>"    Press a button by title (--window "<title>" to pick the window)
-  Use this when status says editor_starting_or_blocked: the editor is open but its connector
-  has not loaded, so 'modal' cannot see anything. Needs macOS + Accessibility permission.
+  Use this when status says editor_starting_or_blocked or editor_unresponsive: the editor is
+  open but its connector has not loaded or stopped answering, so 'modal' cannot see anything.
+  Needs macOS + Accessibility permission.
 
 Custom Tools:
   list                          List all registered tools with parameter schemas
@@ -747,7 +748,8 @@ Custom Tools:
 Status:
   status                        Show Unity Editor state (ready, compiling, etc.)
                                 editor_starting_or_blocked means Unity is open but the connector
-                                has not loaded; see "unity-cli dialogs --help"
+                                has not loaded; editor_unresponsive means it loaded this session and
+                                stopped answering; see "unity-cli dialogs --help"
                                 crashed means the editor process died instead: the report names the
                                 crash log and its first exception line, and the command exits non-zero
 
@@ -1507,10 +1509,11 @@ State "modal" means a dialog blocks the editor; its text and buttons are
 printed (see "unity-cli modal --help"). State "building" means a player build job holds the main
 thread; the job id, phase and elapsed time are printed with it (see "unity-cli build --help").
 
-When no heartbeat answers but the project's Temp/UnityLockfile (or a heartbeat that
-went silent) says an editor is open, status reports "editor_starting_or_blocked": the
-connector has not loaded yet, or a startup dialog is waiting. That dialog is invisible
-to the connector — read it with "unity-cli dialogs" on the macOS host.
+When no heartbeat answers but the project's Temp/UnityLockfile says an editor is open,
+status reports "editor_starting_or_blocked" if the connector has not loaded this session,
+and "editor_unresponsive" if a heartbeat from this session stopped answering. In the first
+case a startup dialog may be waiting; in the second the main thread is blocked or hung.
+Either way the connector cannot see it — read it with "unity-cli dialogs" on the macOS host.
 
 A silent heartbeat is told apart from a dead editor. The state becomes "crashed", and the command
 exits non-zero, when either:
