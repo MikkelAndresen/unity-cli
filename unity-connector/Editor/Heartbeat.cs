@@ -2,6 +2,7 @@ using System;
 using System.IO;
 using System.Security.Cryptography;
 using System.Text;
+using System.Threading;
 using Newtonsoft.Json;
 using UnityEditor;
 using UnityEngine;
@@ -32,6 +33,11 @@ namespace UnityCliConnector
         static string s_LastState = "ready";
         static bool s_LastCompileErrors;
         static long s_LastCompileFinishedAt;
+
+        /// <summary>The state of the last heartbeat written. Readable from any thread — it is the
+        /// main-thread snapshot, which is what a request thread answers with when the main thread is
+        /// not ticking.</summary>
+        internal static string LastState => Volatile.Read(ref s_LastState);
 
         // Set while a build job holds the main thread. GetState is main-thread only, so the flag is
         // what keeps a heartbeat written from the build's own beater thread saying "building".

@@ -139,6 +139,13 @@ The Unity Connector:
 
 Before compiling or reloading, the Connector records the state (`compiling`, `reloading`) to the instance file. When the main thread freezes, the timestamp stops updating. The CLI detects this and waits for a fresh timestamp before sending commands. A player build holds the main thread for minutes without compiling or reloading anything; the Connector keeps beating as `building` from the build's own writer thread (see [Build a Player](#build-a-player-long-running)), so a building editor is not mistaken for a wedged one.
 
+Every command the Connector accepts gets exactly one answer. It tracks each request, and if the
+editor's main thread has not started it within the request's queue deadline, the Connector itself
+answers with why the editor is busy — the command holding it, the heartbeat state, the queue depth —
+and states that the command did not run. A request still queued when Unity reloads or quits is answered
+`domain reload in progress, retry` before the listener closes, instead of being dropped. See
+[Queued Commands and Server-Side Deadlines](#queued-commands-and-server-side-deadlines).
+
 ## Built-in Commands
 
 | Command | Description |
@@ -930,13 +937,54 @@ Retry loops stop on that verdict instead of polling a dead editor for their whol
 container that cannot see the host's processes, a missing pid proves nothing, so only the artifact route
 can decide there; the verdict always prints which evidence it used.
 
+### Queued Commands and Server-Side Deadlines
+
+A command that runs on Unity's main thread is queued and picked up by `EditorApplication.update`. While
+the editor is compiling, inside a long tool, blocked by a modal dialog, or reloading, that pickup can
+be late or never come. The Connector bounds the wait instead of leaving the connection unanswered:
+
+- Each request carries its client budget (`deadline_ms`, the remaining part of `--timeout`). The
+  Connector uses it as its queue deadline minus a margin, so the editor answers **before** the client
+  gives up. Without a declared deadline the Connector's own 60 s default applies, and a per-call
+  `queue_deadline_ms` parameter overrides both (clamped to 0.5–600 s).
+- The deadline bounds the wait for the main thread to *start* the command, never the command's runtime.
+  A running tool is bounded only by your `--timeout`.
+- On `beforeAssemblyReload` and on quit, every in-flight request is answered first
+  (`domain reload in progress, retry`), and new main-thread requests are refused until a listener is
+  up again. Tools marked `RunOffMainThread` (`modal`, `build_status`, `compile_diagnostics`, …) stay
+  callable throughout.
+- A request that was already answered is skipped when its turn comes, so it cannot apply side effects
+  after the caller was told it did not run.
+
+```bash
+unity-cli --timeout 5000 exec 'return 1;'
+# Error: exec was queued but the main thread did not pick it up within 3.9s (waited 4.1s):
+#        editor busy (blocked by the running command test_run (42s))[heartbeat: playing,
+#        queue depth: 2]. The command did not run; nothing changed.
+# Details: {"code":"main_thread_busy","command":"exec","running_command":"test_run",…}
+#   next:      the command did not run and nothing changed; run 'unity-cli wait' until the
+#              editor is idle, then repeat it
+
+# widen one call's queue deadline
+unity-cli exec --params '{"code":"AssetDatabase.Refresh(); return 1;","queue_deadline_ms":300000}'
+```
+
+| `data.code` | what happened | did the command run? |
+|-------------|---------------|----------------------|
+| `main_thread_busy` | the main thread never picked it up | no — nothing changed |
+| `domain_reload` | Unity reloaded or quit while it was queued (the message says so if it had already started) | no, unless the message says it may have partially run |
+| `serialization_failed` | the tool's result could not be serialized | yes — its effects stand, only the returned value is lost |
+
+A slow but successful pickup says so in `meta`: `--meta` shows `queue_wait_ms` and `queue_depth` once
+the wait exceeded a second.
+
 ## Global Options
 
 | Flag | Description | Default |
 |------|-------------|---------|
 | `--port <N>` | Select Unity instance by active heartbeat port | auto |
 | `--project <path>` | Select Unity instance by project path | latest |
-| `--timeout <ms>` | One budget per invocation, shared by discovery, waiting for a fresh heartbeat, and the request. A client deadline is reported as `timed out ... (the editor may still be running it)`, not as a connection failure. `test`, `verify` and `editor refresh --compile` default to 1800000 (30 min); an explicit `0` means no deadline. `wait --timeout` and build polling keep their own budgets. | 120000 |
+| `--timeout <ms>` | One budget per invocation, shared by discovery, waiting for a fresh heartbeat, and the request. The remaining budget is sent to the Connector as `deadline_ms`, so it answers a queued command before this deadline does — see [Queued Commands and Server-Side Deadlines](#queued-commands-and-server-side-deadlines). A client deadline is reported as `timed out ... (the editor may still be running it)`, not as a connection failure. `test`, `verify` and `editor refresh --compile` default to 1800000 (30 min); an explicit `0` means no deadline (the Connector still answers a queued command after its 60 s default). `wait --timeout` and build polling keep their own budgets. | 120000 |
 | `--ignore-version-mismatch` | Suppress the version-drift warning (and the refusal for a connector older than 0.7.0) | false |
 | `--meta` | Print the response's `meta` (how the call was served, e.g. `exec`'s compile cache state) to stderr | false |
 
