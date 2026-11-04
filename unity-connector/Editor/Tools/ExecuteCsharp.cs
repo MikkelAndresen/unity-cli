@@ -4,6 +4,7 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Reflection;
+using System.Runtime.CompilerServices;
 using System.Text.RegularExpressions;
 using System.Threading.Tasks;
 using Newtonsoft.Json.Linq;
@@ -140,8 +141,19 @@ namespace UnityCliConnector.Tools
 
         // The third constructor argument, not the second: `data` stays the tool's result
         // payload, so a caller parsing it sees the same shape as before the metadata existed.
-        private static object CompileMeta(string state, long compileMs, int referenceCount)
-            => new { compile = state, compile_ms = compileMs, reference_assemblies = referenceCount };
+        private static object CompileMeta(string state, long compileMs, int referenceCount,
+            string serializationError = null)
+        {
+            if (serializationError == null)
+                return new { compile = state, compile_ms = compileMs, reference_assemblies = referenceCount };
+            return new
+            {
+                compile = state,
+                compile_ms = compileMs,
+                reference_assemblies = referenceCount,
+                serialization_error = serializationError,
+            };
+        }
 
         private static async Task<object> CompileAndExecute(string source, string cscOverride = null,
             string dotnetOverride = null, int awaitTimeoutMs = ExecAwait.DefaultTimeoutMs)
@@ -248,8 +260,10 @@ namespace UnityCliConnector.Tools
             var message = outcome.Steps > 0
                 ? $"OK (routine completed in {outcome.Steps} steps)"
                 : "OK";
-            return new SuccessResponse(message, Serialize(outcome.Value, 0),
-                CompileMeta(compileState, compileMs, references.Count));
+            string serializationError;
+            var data = Serialize(outcome.Value, out serializationError);
+            return new SuccessResponse(message, data,
+                CompileMeta(compileState, compileMs, references.Count, serializationError));
         }
 
         /// <summary>
@@ -374,59 +388,256 @@ namespace UnityCliConnector.Tools
             return errors.Count > 0 ? string.Join("\n", errors) : raw;
         }
 
-        private static object Serialize(object obj, int depth)
+        private const int MaxDepth = 6;
+        private const int MaxCollectionItems = 100;
+        private const string TruncatedMarker = "... (truncated at 100)";
+
+        /// <summary>
+        /// Reference equality is the cycle test: value equality would call arbitrary user
+        /// Equals overrides (and Unity's destroyed-object equality) while walking a graph.
+        /// </summary>
+        private sealed class ReferenceComparer : IEqualityComparer<object>
+        {
+            internal static readonly ReferenceComparer Instance = new ReferenceComparer();
+
+            public bool Equals(object x, object y) => ReferenceEquals(x, y);
+            public int GetHashCode(object obj) => RuntimeHelpers.GetHashCode(obj);
+        }
+
+        internal static object Serialize(object obj)
+        {
+            string ignored;
+            return Serialize(obj, 0, out ignored);
+        }
+
+        internal static object Serialize(object obj, int depth)
+        {
+            string ignored;
+            return Serialize(obj, depth, out ignored);
+        }
+
+        internal static object Serialize(object obj, out string serializationError)
+        {
+            return Serialize(obj, 0, out serializationError);
+        }
+
+        private static object Serialize(object obj, int depth, out string serializationError)
+        {
+            serializationError = null;
+            try
+            {
+                return SerializeValue(obj, depth, new HashSet<object>(ReferenceComparer.Instance));
+            }
+            catch (Exception ex)
+            {
+                // Serialization is a reporting convenience; it must never turn a successful
+                // snippet into an error response. Callers still get a readable value and the
+                // reason travels in meta instead of being swallowed.
+                serializationError = ErrorText(ex);
+                return SafeToString(obj);
+            }
+        }
+
+        private static object SerializeValue(object obj, int depth, HashSet<object> path)
         {
             if (obj == null) return null;
-            if (depth > 4) return obj.ToString();
+
             var type = obj.GetType();
             if (type.IsPrimitive || type == typeof(string) || type == typeof(decimal)) return obj;
             if (type.IsEnum) return obj.ToString();
-            if (type.Name.StartsWith("FixedString")) return obj.ToString();
-            // A Task still reachable here was never awaited (nested inside a collection
-            // or a field). Reflecting over it yields AsyncState/Status noise, so name
-            // the state instead.
-            if (obj is Task task)
+            if (type.Name.StartsWith("FixedString", StringComparison.Ordinal)) return obj.ToString();
+            if (obj is DateTime || obj is DateTimeOffset || obj is TimeSpan || obj is Guid)
+                return obj.ToString();
+            if (obj is Type typeValue) return typeValue.FullName ?? typeValue.Name;
+
+            // A Unity object's ToString already carries the useful identity ("Main Camera
+            // (UnityEngine.Camera)"). Dumping its properties would walk the scene graph, and
+            // Transform/GameObject graphs contain cycles.
+            if (obj is UnityEngine.Object) return SafeToString(obj);
+
+            var tracked = !type.IsValueType;
+            if (tracked)
             {
-                if (task.IsCompleted && !task.IsFaulted && !task.IsCanceled)
-                {
-                    var inner = TaskResultOf(task);
-                    return inner == null ? "<completed>" : Serialize(inner, depth + 1);
-                }
-                return $"<task {task.Status}>";
+                if (path.Contains(obj)) return "<cycle: " + type.Name + ">";
+                path.Add(obj);
             }
-            if (obj is IDictionary dict)
+
+            try
             {
-                var r = new Dictionary<string, object>();
-                foreach (DictionaryEntry e in dict)
-                    r[e.Key.ToString()] = Serialize(e.Value, depth + 1);
-                return r;
-            }
-            if (obj is IEnumerable enumerable)
-            {
-                var list = new List<object>();
-                int count = 0;
-                foreach (var item in enumerable)
+                // A Task still reachable here was never awaited (nested inside a collection
+                // or a member). Reflecting over it yields AsyncState/Status noise, so name
+                // the state instead.
+                if (obj is Task task)
                 {
-                    if (count++ >= 100) { list.Add("... (truncated at 100)"); break; }
-                    list.Add(Serialize(item, depth + 1));
-                }
-                return list;
-            }
-            if (type.IsValueType || type.IsClass)
-            {
-                var fields = type.GetFields(BindingFlags.Public | BindingFlags.Instance);
-                if (fields.Length > 0)
-                {
-                    var r = new Dictionary<string, object>();
-                    foreach (var f in fields)
+                    if (task.IsCompleted && !task.IsFaulted && !task.IsCanceled)
                     {
-                        try { r[f.Name] = Serialize(f.GetValue(obj), depth + 1); }
-                        catch { r[f.Name] = "<error>"; }
+                        var inner = TaskResultOf(task);
+                        return inner == null ? "<completed>" : SerializeValue(inner, depth + 1, path);
                     }
-                    return r;
+                    return $"<task {task.Status}>";
+                }
+
+                if (depth >= MaxDepth) return "<truncated at depth " + MaxDepth + ">";
+
+                if (obj is IDictionary dict) return SerializeDictionary(dict, depth, path);
+                if (obj is IEnumerable enumerable) return SerializeEnumerable(enumerable, depth, path);
+
+                var mathMembers = MathMemberNames(type);
+                if (mathMembers != null)
+                    return SerializeMath(obj, type, mathMembers, depth, path);
+
+                if (type.IsValueType || type.IsClass)
+                    return SerializeMembers(obj, type, depth, path);
+
+                return SafeToString(obj);
+            }
+            finally
+            {
+                if (tracked) path.Remove(obj);
+            }
+        }
+
+        private static object SerializeDictionary(IDictionary dict, int depth, HashSet<object> path)
+        {
+            var result = new Dictionary<string, object>();
+            var count = 0;
+            foreach (DictionaryEntry entry in dict)
+            {
+                if (count++ >= MaxCollectionItems)
+                {
+                    result[TruncatedMarker] = TruncatedMarker;
+                    break;
+                }
+
+                var key = entry.Key == null ? "null" : SafeToString(entry.Key);
+                if (key == null) key = "null";
+                try { result[key] = SerializeValue(entry.Value, depth + 1, path); }
+                catch (Exception ex) { result[key] = ErrorText(ex); }
+            }
+            return result;
+        }
+
+        private static object SerializeEnumerable(IEnumerable enumerable, int depth, HashSet<object> path)
+        {
+            var result = new List<object>();
+            var count = 0;
+            foreach (var item in enumerable)
+            {
+                if (count++ >= MaxCollectionItems)
+                {
+                    result.Add(TruncatedMarker);
+                    break;
+                }
+
+                try { result.Add(SerializeValue(item, depth + 1, path)); }
+                catch (Exception ex) { result.Add(ErrorText(ex)); }
+            }
+            return result;
+        }
+
+        private static object SerializeMath(object obj, Type type, string[] memberNames, int depth,
+            HashSet<object> path)
+        {
+            var result = new Dictionary<string, object>();
+            foreach (var name in memberNames)
+            {
+                var property = type.GetProperty(name, BindingFlags.Public | BindingFlags.Instance);
+                if (property != null && property.CanRead && property.GetIndexParameters().Length == 0)
+                {
+                    try { result[name] = SerializeValue(property.GetValue(obj, null), depth + 1, path); }
+                    catch (Exception ex) { result[name] = ErrorText(ex); }
+                    continue;
+                }
+
+                var field = type.GetField(name, BindingFlags.Public | BindingFlags.Instance);
+                if (field == null) continue;
+                try { result[name] = SerializeValue(field.GetValue(obj), depth + 1, path); }
+                catch (Exception ex) { result[name] = ErrorText(ex); }
+            }
+            return result.Count > 0 ? (object)result : SafeToString(obj);
+        }
+
+        private static object SerializeMembers(object obj, Type type, int depth, HashSet<object> path)
+        {
+            var result = new Dictionary<string, object>();
+            var count = 0;
+            var truncated = false;
+
+            foreach (var property in type.GetProperties(BindingFlags.Public | BindingFlags.Instance))
+            {
+                if (count >= MaxCollectionItems) { truncated = true; break; }
+                if (!property.CanRead || property.GetIndexParameters().Length > 0) continue;
+                var getter = property.GetGetMethod();
+                if (getter == null || getter.IsStatic) continue;
+                if (result.ContainsKey(property.Name)) continue;
+
+                count++;
+                try { result[property.Name] = SerializeValue(property.GetValue(obj, null), depth + 1, path); }
+                catch (Exception ex) { result[property.Name] = ErrorText(ex); }
+            }
+
+            if (!truncated)
+            {
+                foreach (var field in type.GetFields(BindingFlags.Public | BindingFlags.Instance))
+                {
+                    if (count >= MaxCollectionItems) { truncated = true; break; }
+                    if (field.IsStatic || result.ContainsKey(field.Name)) continue;
+
+                    count++;
+                    try { result[field.Name] = SerializeValue(field.GetValue(obj), depth + 1, path); }
+                    catch (Exception ex) { result[field.Name] = ErrorText(ex); }
                 }
             }
-            return obj.ToString();
+
+            if (truncated) result[TruncatedMarker] = TruncatedMarker;
+            return result.Count > 0 ? (object)result : SafeToString(obj);
+        }
+
+        /// <summary>
+        /// The data members of Unity's math structs. Reflecting over all their properties
+        /// would visit computed ones such as Vector3.normalized, which returns another
+        /// Vector3 and would recurse until the depth cutoff (or forever without one).
+        /// Rect and Bounds expose only properties in this Unity version, so their simple
+        /// extent members are named here rather than recursing into derived ones.
+        /// </summary>
+        private static string[] MathMemberNames(Type type)
+        {
+            if (type == typeof(Vector2)) return new[] { "x", "y" };
+            if (type == typeof(Vector2Int)) return new[] { "x", "y" };
+            if (type == typeof(Vector3)) return new[] { "x", "y", "z" };
+            if (type == typeof(Vector3Int)) return new[] { "x", "y", "z" };
+            if (type == typeof(Vector4)) return new[] { "x", "y", "z", "w" };
+            if (type == typeof(Quaternion)) return new[] { "x", "y", "z", "w" };
+            if (type == typeof(Color)) return new[] { "r", "g", "b", "a" };
+            if (type == typeof(Color32)) return new[] { "r", "g", "b", "a" };
+            if (type == typeof(Rect)) return new[] { "x", "y", "width", "height" };
+            if (type == typeof(RectInt)) return new[] { "x", "y", "width", "height" };
+            if (type == typeof(Bounds)) return new[] { "center", "extents" };
+            if (type == typeof(BoundsInt)) return new[] { "position", "size" };
+            if (type == typeof(Matrix4x4))
+                return new[]
+                {
+                    "m00", "m10", "m20", "m30",
+                    "m01", "m11", "m21", "m31",
+                    "m02", "m12", "m22", "m32",
+                    "m03", "m13", "m23", "m33",
+                };
+            return null;
+        }
+
+        private static string ErrorText(Exception ex)
+        {
+            // Reflection getters wrap the getter's own exception.
+            if (ex is System.Reflection.TargetInvocationException { InnerException: { } inner })
+                ex = inner;
+            return "<error: " + ex.GetType().Name + ": " + ex.Message + ">";
+        }
+
+        private static string SafeToString(object obj)
+        {
+            if (obj == null) return null;
+            try { return obj.ToString(); }
+            catch (Exception ex) { return ErrorText(ex); }
         }
 
         private static object TaskResultOf(Task task)
