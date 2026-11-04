@@ -137,7 +137,7 @@ The Unity Connector:
 5. Routes incoming commands to the matching handler on the main thread
 6. Survives domain reloads (script recompilation)
 
-Before compiling or reloading, the Connector records the state (`compiling`, `reloading`) to the instance file. When the main thread freezes, the timestamp stops updating. The CLI detects this and waits for a fresh timestamp before sending commands.
+Before compiling or reloading, the Connector records the state (`compiling`, `reloading`) to the instance file. When the main thread freezes, the timestamp stops updating. The CLI detects this and waits for a fresh timestamp before sending commands. A player build holds the main thread for minutes without compiling or reloading anything; the Connector keeps beating as `building` from the build's own writer thread (see [Build a Player](#build-a-player-long-running)), so a building editor is not mistaken for a wedged one.
 
 ## Built-in Commands
 
@@ -149,6 +149,7 @@ Before compiling or reloading, the Connector records the state (`compiling`, `re
 | `exec` | Run arbitrary C# code inside Unity |
 | `test` | Run EditMode/PlayMode tests |
 | `verify` | Compile, list errors in your code, run tests: one call, brief output |
+| `build` | Start a player build as a job, watch progress, report the BuildReport |
 | `menu` | Execute any Unity menu item by path |
 | `reserialize` | Re-serialize assets through Unity's serializer |
 | `clear_burst_cache` | Delete `Library/BurstCache` so Burst recompiles from scratch |
@@ -464,6 +465,64 @@ compile: 1 error(s)
 
 `verify` clears the console first (a Burst error stays there after its code changes; Burst logs a live one again on the next compile; `--keep-console` skips the clear), refreshes and compiles, and lists this compile's errors from the connector's `compile_diagnostics` tool, leaving out `Library/` and `PackageCache/` unless nothing else failed. It then saves dirty open scenes and runs the tests, printing `passed/total` and the first line of each failure (`--max` caps both lists, default 20). Exit code 0 means it compiles and every test passed; 1 means compile errors, failing tests or no test ran; 2 means the editor couldn't answer: not running, timed out, or blocked by a modal dialog, which is named along with the command that answers it. Connectors before 0.7.0 have no `compile_diagnostics` and ignore `--assembly`; `verify` then lists console errors and says so.
 
+### Build a Player (long-running)
+
+```bash
+# Build with a Build Profile and wait for the result (progress on stderr, JSON on stdout)
+unity-cli build --profile macOS_dev --output Builds/Mac/App.app
+
+# Same build with development player options
+unity-cli build --profile macOS --output Builds/Mac/App.app --development
+
+# Build by BuildTarget instead, with explicit scenes
+unity-cli build --target StandaloneOSX --output Builds/Mac/App.app --scenes Assets/Main.unity
+
+# Start it and go away; poll it later
+unity-cli build --no-wait --profile macOS_dev --output Builds/Mac/App.app
+unity-cli build status
+unity-cli build status build-20240101-114213-9f0ac1
+```
+
+```
+build job build-20240101-114213-9f0ac1 queued (macOS_dev -> /proj/Builds/Mac/App.app)
+building 12s  Compiling PlayerAssemblies 23%
+building 3m27s  Compiling PlayerAssemblies 61%
+build succeeded in 5m02s — 132.4 MB, 0 error(s), 4 warning(s) -> /proj/Builds/Mac/App.app
+```
+
+`BuildPipeline.BuildPlayer` runs on Unity's main thread and blocks it for the whole build, so a build
+asked for through `exec` looks like a hung editor: the connection dies, every other command queues
+behind it, and the only way to watch it is to scrape `Editor.log`.
+
+`build` does the same build as a job. The connector validates the parameters and records the job
+(`<project>/Temp/unity-cli/build-jobs.json`, so it survives the domain reload a build can trigger),
+then returns its id; the build starts on a later editor update tick, outside the command lock. While
+it runs:
+
+- the heartbeat says `building` with the job id, phase and elapsed time instead of `ready`, so waiters
+  and restart daemons can tell a building editor from a wedged one;
+- `build_status` answers on a thread that never waits for the main thread, so `unity-cli build status`
+  and `unity-cli status` keep working;
+- the wait keeps polling through dropped connections and the domain reload, instead of aborting on the
+  first failed request (it gives up only after 3 minutes with no answer at all, and returns the last
+  report it got).
+
+The percent comes from Unity's Progress window and only appears when the build pumps the editor update
+loop; when it does not, the lines carry elapsed time alone. Every Progress API throws off the main
+thread, so nothing else can be read from there while the build is running.
+
+While one build is running, a second `build` is refused immediately, from the heartbeat: asking the
+connector instead would queue the request behind the running build and look like a hang. Things only
+the editor can know — an unknown build profile, scenes that no longer exist in the project, a target
+whose module is not installed — are refused before the job starts, not minutes later inside the build.
+
+Phases are `queued`, `building`, `succeeded`, `failed`, `cancelled`, `interrupted` — the last one means
+the editor stopped reporting the job while it was building, so that build's outcome is unknown. The
+final JSON on stdout is the job record: phase, `result`, output path, size, duration, error and
+warning counts, and the first error messages from the `BuildReport`. Exit 0 on success, 1 on failure,
+including the up-front validation errors (unknown build profile, a target whose module is not
+installed, an output inside `Assets/`).
+
 ### Modal Dialogs (macOS)
 
 ```bash
@@ -554,7 +613,7 @@ unity-cli status
 #   PID:     12345
 ```
 
-The CLI also checks Unity's state automatically before sending any command. If Unity is busy (compiling, reloading), it waits for Unity to become responsive. If a modal dialog is open (state `modal`), it fails immediately and shows the dialog; see [Modal Dialogs](#modal-dialogs-macos). If nothing answers but the project looks open (`Temp/UnityLockfile`, or a heartbeat that went silent), the state is `editor_starting_or_blocked`; see [Startup Dialogs](#startup-dialogs-macos-host).
+The CLI also checks Unity's state automatically before sending any command. If Unity is busy (compiling, reloading), it waits for Unity to become responsive. If a modal dialog is open (state `modal`), it fails immediately and shows the dialog; see [Modal Dialogs](#modal-dialogs-macos). If a player build has the main thread (state `building`), the job id, phase and elapsed time are printed with it; see [Build a Player](#build-a-player-long-running). If nothing answers but the project looks open (`Temp/UnityLockfile`, or a heartbeat that went silent), the state is `editor_starting_or_blocked`; see [Startup Dialogs](#startup-dialogs-macos-host).
 
 ## Global Options
 
@@ -666,6 +725,9 @@ unity-cli spawn --params '{"x":1,"y":0,"z":5,"prefab":"Goblin"}'
 - Class name is auto-converted to snake_case for the command name
 - Override with `[UnityCliTool(Name = "my_name")]` if needed
 - Runs on Unity main thread, so all Unity APIs are safe to call
+- `[UnityCliTool(RunOffMainThread = true)]` runs it on the HTTP request thread instead — past the command
+  lock and the compilation gate, so it still answers while a modal dialog or a player build has the main
+  thread. Such a handler may call no Unity API except through a thread-safe path of its own
 - Discovered automatically on Editor start and after every script recompilation
 - Duplicate tool names are detected and logged as errors — only the first discovered handler is used
 

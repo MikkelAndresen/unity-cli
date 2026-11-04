@@ -5,6 +5,7 @@ using System.Text;
 using Newtonsoft.Json;
 using UnityEditor;
 using UnityEngine;
+using UnityCliConnector.BuildJobs;
 using UnityCliConnector.Modal;
 
 namespace UnityCliConnector
@@ -31,6 +32,11 @@ namespace UnityCliConnector
         static string s_LastState = "ready";
         static bool s_LastCompileErrors;
         static long s_LastCompileFinishedAt;
+
+        // Set while a build job holds the main thread. GetState is main-thread only, so the flag is
+        // what keeps a heartbeat written from the build's own beater thread saying "building".
+        static volatile bool s_BuildActive;
+        static volatile BuildHeartbeatSnapshot s_BuildInfo;
 
         static Heartbeat()
         {
@@ -66,6 +72,33 @@ namespace UnityCliConnector
         {
             s_CompileRequestTime = EditorApplication.timeSinceStartup;
             WriteState("compiling");
+        }
+
+        /// <summary>
+        /// Publishes what the running build job is doing. Safe from any thread; the value is an
+        /// immutable snapshot, so the heartbeat never serializes a half-updated one.
+        /// </summary>
+        internal static void PublishBuild(BuildHeartbeatSnapshot info)
+        {
+            s_BuildInfo = info;
+        }
+
+        /// <summary>
+        /// Marks the editor as building. Two paths keep the heartbeat saying so: the state written here
+        /// is what the build's beater thread re-writes while BuildPlayer holds the main thread, and the
+        /// flag is what GetState returns if the main thread does tick during a build.
+        /// </summary>
+        internal static void MarkBuildStarted()
+        {
+            s_BuildActive = true;
+            WriteState(BuildJobRecord.PhaseBuilding);
+        }
+
+        internal static void MarkBuildFinished()
+        {
+            s_BuildActive = false;
+            s_BuildInfo = null;
+            Write();
         }
 
         static void Tick()
@@ -135,7 +168,8 @@ namespace UnityCliConnector
                 modal != null ? "modal" : s_LastState,
                 s_LastCompileErrors,
                 s_LastCompileFinishedAt,
-                modal);
+                modal,
+                s_BuildActive ? s_BuildInfo : null);
 
             lock (s_WriteLock)
             {
@@ -155,7 +189,8 @@ namespace UnityCliConnector
         /// Builds the heartbeat payload. Property names here are the contract with the Go CLI's
         /// client.Instance struct, so renaming one breaks polling silently.
         /// </summary>
-        internal static object BuildStatus(string state, bool compileErrors, long compileFinishedAt, ModalDialog modal)
+        internal static object BuildStatus(string state, bool compileErrors, long compileFinishedAt,
+            ModalDialog modal, BuildHeartbeatSnapshot build = null)
         {
             return new
             {
@@ -169,6 +204,7 @@ namespace UnityCliConnector
                 compileErrors,
                 compileFinishedAt,
                 modal,
+                build,
             };
         }
 
@@ -179,6 +215,9 @@ namespace UnityCliConnector
 
         static string GetState()
         {
+            // A build blocks the main thread for minutes without touching isCompiling/isUpdating;
+            // without this the heartbeat would say "ready" while nothing can be answered.
+            if (s_BuildActive) return BuildJobRecord.PhaseBuilding;
             if (EditorApplication.isCompiling) return "compiling";
             if (EditorApplication.isUpdating) return "refreshing";
             if (EditorApplication.isPlaying)

@@ -9,6 +9,7 @@ cmd/                  # Go CLI — thin passthrough layer
   root.go             # Entry point, flag/arg parsing, default passthrough
   editor.go           # editor command (waitForReady polling)
   test.go             # test command (PlayMode result polling)
+  build.go            # build command (job start, build_status polling, progress lines)
   verify.go           # verify command (compile + compile_diagnostics + tests, brief output)
   status.go           # status, waitForAlive, heartbeat reading
   evidence.go         # editor_starting_or_blocked: the startup-dialog report built from on-disk evidence
@@ -20,6 +21,7 @@ unity-connector/      # C# Unity Editor package (UPM)
   Editor/
     Core/             # Shared utilities (Response, ParamCoercion, ToolParams, StringCaseUtility)
     Tools/            # Tool implementations (auto-registered via [UnityCliTool] attribute)
+    BuildJobs/        # Player build jobs: job record, Temp/ persistence across reloads, runner off the command lock
     InputInjection/   # `input` tool — own asmdef, only compiles when com.unity.inputsystem is present
     Modal/            # macOS modal dialog handling: AppKit via objc_msgSend, runs during the modal loop
     TestRunner/       # Test runner (RunTests, TestRunnerState)
@@ -37,6 +39,10 @@ unity-connector/      # C# Unity Editor package (UPM)
    `defineConstraints` (see `Editor/InputInjection/`); ToolDiscovery scans every loaded assembly, so
    no registration is needed. Unity must generate the `.meta` files — refresh the asset database
    rather than writing GUIDs.
+6. A tool that must answer while the main thread is busy (a modal loop, a player build) is marked
+   `[UnityCliTool(RunOffMainThread = true)]`: the HTTP server calls it on the request thread, past the
+   command lock and the compilation gate. It may then touch no Unity API except through a thread-safe
+   path of its own (`modal`, `build_status`).
 
 ## Verification
 
