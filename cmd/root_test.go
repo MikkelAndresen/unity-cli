@@ -355,3 +355,29 @@ func sliceEqual(a, b []string) bool {
 	}
 	return true
 }
+
+func TestBuildParams_ExecUsingsFlags(t *testing.T) {
+	p, err := buildParams([]string{"--usings", "System,UnityEngine", "--no_default_usings"}, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if p["usings"] != "System,UnityEngine" {
+		t.Errorf("usings = %v, want System,UnityEngine", p["usings"])
+	}
+	if p["no_default_usings"] != true {
+		t.Errorf("no_default_usings = %v, want true", p["no_default_usings"])
+	}
+
+	// The example in exec help puts the flag after the snippet; a bare boolean
+	// followed by a positional would consume the snippet as its value.
+	p, err = buildParams([]string{"return 1;", "--no_default_usings"}, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if p["no_default_usings"] != true {
+		t.Errorf("no_default_usings = %v, want true", p["no_default_usings"])
+	}
+	if args, ok := p["args"].([]string); !ok || len(args) != 1 || args[0] != "return 1;" {
+		t.Errorf("args = %v, want [return 1;]", p["args"])
+	}
+}

@@ -24,7 +24,7 @@ internal/client/      # Unity HTTP client, instance discovery, Temp/UnityLockfil
 unity-connector/      # C# Unity Editor package (UPM)
   Editor/
     Core/             # Shared utilities (Response, ParamCoercion, ToolParams, StringCaseUtility, StackTraceFilter, CompileProvenance,
-                      # ExecAwait, ExecCompileCache, ExecCompiler, MainThread,
+                      # ExecAwait, ExecCompileCache, ExecCompiler, ExecSource, MainThread,
                       # RequestTicket/RequestTracker (every accepted request gets one answer: queue deadline,
                       # domain-reload answer, skip-on-abandon), ErrorCodes (data.code contract with the CLI),
                       # ResponseJson (serialization can never leave a connection unanswered))

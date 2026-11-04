@@ -357,10 +357,15 @@ Run arbitrary C# code inside the Unity Editor at runtime. This is the most power
 
 Use `return` to get output. Common namespaces are included by default. Add `--usings` only for project-specific types (e.g. `Unity.Entities`). The csc compiler and dotnet runtime are auto-detected; if detection fails, specify manually with `--csc <path>` or `--dotnet <path>`.
 
+`System` and `UnityEngine` both define `Object`, `Random`, and `Debug`, so those names resolve through default aliases to the Unity types instead of failing with CS0104. A `using` directive at the top of the snippet is moved above the generated method, and your own alias wins over the default one. To replace the default set completely, pass `--no_default_usings` (the default imports and aliases are dropped) and list what you want with `--usings`.
+
 ```bash
 unity-cli exec "return Application.dataPath;"
 unity-cli exec "return EditorSceneManager.GetActiveScene().name;"
 unity-cli exec "return World.All.Count;" --usings Unity.Entities
+unity-cli exec "return typeof(Object).FullName;"                  # UnityEngine.Object
+unity-cli exec "using Object = System.Object; return typeof(Object).FullName;"   # System.Object
+unity-cli exec "return typeof(Object).FullName;" --no_default_usings --usings System
 
 # Pipe via stdin to avoid shell escaping issues
 echo 'Debug.Log("hello"); return null;' | unity-cli exec
