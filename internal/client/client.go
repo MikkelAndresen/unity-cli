@@ -32,6 +32,9 @@ type Instance struct {
 	// It is published by the build's own heartbeat writer, which is what keeps the timestamp fresh
 	// while BuildPlayer has the main thread for minutes at a time.
 	Build *BuildJob `json:"build,omitempty"`
+	// SourceFile is where this heartbeat was read from. It is the CLI's own annotation, never a field
+	// of the file, and it is what lets a report point at the record of an editor that is gone.
+	SourceFile string `json:"-"`
 }
 
 // BuildJob mirrors the connector's UnityCliConnector.BuildJobs.BuildHeartbeatSnapshot.
@@ -120,6 +123,9 @@ func rawInstanceFiles() ([]instanceFile, error) {
 			continue
 		}
 		files = append(files, instanceFile{Path: fp, Instance: inst})
+	}
+	for i := range files {
+		files[i].Instance.SourceFile = files[i].Path
 	}
 	return files, nil
 }
@@ -260,10 +266,13 @@ func Send(inst *Instance, command string, params interface{}, timeoutMs int) (*C
 
 	url := fmt.Sprintf("http://127.0.0.1:%d/command", inst.Port)
 	httpClient := &http.Client{Timeout: time.Duration(timeoutMs) * time.Millisecond}
+	// The moment the request left, not now: crash artifacts are matched against it so that a dump from
+	// an earlier crash is not blamed on this request.
+	start := time.Now()
 
 	resp, err := httpClient.Post(url, "application/json", bytes.NewReader(body))
 	if err != nil {
-		return nil, fmt.Errorf("cannot connect to Unity at port %d: %v", inst.Port, err)
+		return nil, explainDroppedConnection(command, inst, start, err)
 	}
 	defer resp.Body.Close()
 

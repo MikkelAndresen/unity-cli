@@ -579,6 +579,8 @@ Status:
   status                        Show Unity Editor state (ready, compiling, etc.)
                                 editor_starting_or_blocked means Unity is open but the connector
                                 has not loaded; see "unity-cli dialogs --help"
+                                crashed means the editor process died instead: the report names the
+                                crash log and its first exception line, and the command exits non-zero
 
 Update:
   update                        Update to the latest version
@@ -1261,6 +1263,26 @@ When no heartbeat answers but the project's Temp/UnityLockfile (or a heartbeat t
 went silent) says an editor is open, status reports "editor_starting_or_blocked": the
 connector has not loaded yet, or a startup dialog is waiting. That dialog is invisible
 to the connector — read it with "unity-cli dialogs" on the macOS host.
+
+A silent heartbeat is told apart from a dead editor. The state becomes "crashed", and the command
+exits non-zero, when either:
+
+  - the heartbeat's pid is gone from a machine whose process table still lists Unity processes (so
+    the pid is visible there and simply not running), or
+  - the heartbeat stopped without writing its "stopped" marker AND a crash artifact newer than that
+    last beat exists: <project>/mono_crash.*.json, ~/Library/Logs/DiagnosticReports/Unity-*.ips, or
+    ~/Library/Logs/Unity/Editor-prev.log with crash wording in its tail.
+
+The report names the artifact and its first exception line, because Logs/Editor.log rotates on the next
+editor start and the dump is the only surviving record. Artifacts older than the last beat belong to an
+earlier crash and are never blamed on this silence. Inside a container that cannot see the host's
+processes the pid proves nothing, so only the artifact route can decide — that is why the verdict
+always carries its evidence.
+
+The same judgement runs on any command whose request dies mid-flight (EOF, connection reset or
+refused): instead of a bare "cannot connect to Unity at port 8090: EOF" it says the editor process
+exited during the request, or that the heartbeat shows a domain reload/port change. A request that
+merely timed out is never called a crash.
 
 Example:
   unity-cli status
