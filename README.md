@@ -143,7 +143,8 @@ Every command the Connector accepts gets exactly one answer. It tracks each requ
 editor's main thread has not started it within the request's queue deadline, the Connector itself
 answers with why the editor is busy — the command holding it, the heartbeat state, the queue depth —
 and states that the command did not run. A request still queued when Unity reloads or quits is answered
-`domain reload in progress, retry` before the listener closes, instead of being dropped. See
+"never ran" (with `data.code` `domain_reload` for a reload, so the caller can retry) before the
+listener closes, instead of being dropped. See
 [Queued Commands and Server-Side Deadlines](#queued-commands-and-server-side-deadlines).
 
 ## Built-in Commands
@@ -1122,7 +1123,7 @@ be late or never come. The Connector bounds the wait instead of leaving the conn
   whose tool had already returned keeps its own result: the reload wait gives the unwritten response
   a bounded window to reach the socket. Answers to a quit carry no `data.code`: the editor is gone,
   so there is nothing to wait for, and repeating the command depends on whether it had started.
-  Tools marked `RunOffMainThread` (`modal`, `build_status`, `compile_diagnostics`, …) stay callable
+  Tools marked `RunOffMainThread` (`modal`, `build_status`) stay callable
   throughout.
 - A request that was already answered is skipped when its turn comes, so it cannot apply side effects
   after the caller was told it did not run.
