@@ -584,6 +584,7 @@ Execute C#:
   exec "<code>" --usings x,y    Add extra using directives
   exec "<code>" --no_default_usings     Drop the default usings and aliases
   exec "<code>" --await_timeout 60000   Wait longer for a Task/coroutine to finish
+  exec "<code>" --skip_compile_check    Run even while Unity reports compile errors
 
   Examples:
     exec "Time.time"
@@ -891,6 +892,9 @@ Options:
                        to supply the whole set
   --await_timeout <ms> Max ms to await a returned Task / pump a returned coroutine
                        (default 30000; 0 or negative waits forever)
+  --skip_compile_check Run even when Unity reports outstanding compile errors. The
+                       central gate normally blocks every tool (including exec) on
+                       errors from the current compile; this is its escape hatch.
   --csc <path>         Path to csc compiler (csc.dll or csc.exe). Auto-detected if omitted.
   --dotnet <path>      Path to dotnet runtime. Auto-detected if omitted.
   --meta               Print the response's meta (compile cache state, timing) to stderr.

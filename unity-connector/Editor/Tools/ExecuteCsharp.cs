@@ -61,6 +61,9 @@ namespace UnityCliConnector.Tools
             // there as an attribute argument (CS0182), so it cannot be referenced.
             [ToolParameter("Max ms to await a returned Task / pump a returned coroutine (default 30000; 0 or negative waits forever)")]
             public int AwaitTimeout { get; set; }
+
+            [ToolParameter("Run even when Unity reports outstanding compile errors (the central compilation gate's escape hatch)")]
+            public bool SkipCompileCheck { get; set; }
         }
 
         public static async Task<object> HandleCommand(JObject parameters)

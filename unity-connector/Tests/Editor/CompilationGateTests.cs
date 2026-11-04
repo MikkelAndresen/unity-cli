@@ -1,3 +1,4 @@
+using System;
 using System.Collections.Generic;
 using Newtonsoft.Json.Linq;
 using NUnit.Framework;
@@ -18,6 +19,7 @@ namespace UnityCliConnector.Tests
         public void SetUp()
         {
             CompilationGate.ResetForTests();
+            CompilationGate.FileExistsForTests = _ => true;
             ConsoleLogEntries.TestOverride = null;
         }
 
@@ -94,6 +96,148 @@ namespace UnityCliConnector.Tests
                 "snake_case opt-out should bypass the gate");
             Assert.IsNull(CompilationGate.CheckOrNull(new JObject { ["skipCompileCheck"] = true }),
                 "camelCase opt-out should bypass the gate");
+        }
+
+        // ─── Console staleness ──────────────────────────────────
+
+        [Test]
+        public void CheckOrNull_StaleConsoleEntry_AfterCleanCompile_DoesNotBlock()
+        {
+            var now = NowMs();
+            CompilationGate.SeedCompileClockForTests(now - 5000, now - 1000);
+            ConsoleLogEntries.TestOverride = _ => new List<ConsoleLogEntries.CompileDiag>
+            {
+                new ConsoleLogEntries.CompileDiag
+                {
+                    File = "Assets/Old.cs", Line = 1, Col = 1, Severity = "error",
+                    Code = "CS1002", Message = "; expected",
+                    HasTimestamp = true, TimeOfDaySeconds = AgoSeconds(600)
+                }
+            };
+
+            Assert.IsNull(CompilationGate.CheckOrNull(new JObject()),
+                "a console error logged 10 minutes before the last compile must not block exec");
+        }
+
+        [Test]
+        public void CheckOrNull_FreshConsoleEntry_FromCurrentCompile_Blocks()
+        {
+            var now = NowMs();
+            CompilationGate.SeedCompileClockForTests(now - 5000, now - 1000);
+            ConsoleLogEntries.TestOverride = _ => new List<ConsoleLogEntries.CompileDiag>
+            {
+                new ConsoleLogEntries.CompileDiag
+                {
+                    File = "Assets/Fresh.cs", Line = 7, Col = 2, Severity = "error",
+                    Code = "CS0103", Message = "The name 'x' does not exist",
+                    HasTimestamp = true, TimeOfDaySeconds = TimeOfDaySeconds(now)
+                }
+            };
+
+            var response = CompilationGate.CheckOrNull(new JObject());
+            Assert.IsInstanceOf<ErrorResponse>(response);
+            var (errors, _) = ExtractDiagnostics((ErrorResponse)response);
+            Assert.AreEqual(1, errors.Count);
+            Assert.AreEqual("console", errors[0]["source"].Value<string>());
+
+            var message = ((ErrorResponse)response).message;
+            StringAssert.Contains("Assets/Fresh.cs(7,2)", message, "the blocked message must name the error");
+            StringAssert.Contains("skip_compile_check", message, "the escape hatch must be in the message");
+        }
+
+        [Test]
+        public void CheckOrNull_FreshStickyConsoleError_DoesNotBlock()
+        {
+            var now = NowMs();
+            CompilationGate.SeedCompileClockForTests(now - 5000, now - 1000);
+            ConsoleLogEntries.TestOverride = _ => new List<ConsoleLogEntries.CompileDiag>
+            {
+                new ConsoleLogEntries.CompileDiag
+                {
+                    File = "", Line = 0, Col = 0, Severity = "error",
+                    Message = "All compiler errors have to be fixed before you can enter play mode!",
+                    Sticky = true, HasTimestamp = true, TimeOfDaySeconds = TimeOfDaySeconds(now)
+                }
+            };
+
+            Assert.IsNull(CompilationGate.CheckOrNull(new JObject()),
+                "sticky build/runtime failures are not compiler diagnostics");
+        }
+
+        [Test]
+        public void CheckOrNull_ConsoleEntryForDeletedFile_DoesNotBlock()
+        {
+            var now = NowMs();
+            CompilationGate.SeedCompileClockForTests(now - 5000, now - 1000);
+            CompilationGate.FileExistsForTests = _ => false;
+            ConsoleLogEntries.TestOverride = _ => new List<ConsoleLogEntries.CompileDiag>
+            {
+                new ConsoleLogEntries.CompileDiag
+                {
+                    File = "Assets/Deleted.cs", Line = 1, Col = 1, Severity = "error",
+                    Code = "CS1002", Message = "; expected",
+                    HasTimestamp = true, TimeOfDaySeconds = TimeOfDaySeconds(now)
+                }
+            };
+
+            Assert.IsNull(CompilationGate.CheckOrNull(new JObject()),
+                "an error pointing at a file that no longer exists is stale");
+        }
+
+        [Test]
+        public void CheckOrNull_Message_NamesFirstThreeErrors_AndEscapeHatch()
+        {
+            CompilationGate.SeedForTests("Library/ScriptAssemblies/Foo.dll", new[]
+            {
+                MakeCompilerMessage("Assets/A.cs", 1, 1, "CS0103: a", CompilerMessageType.Error),
+                MakeCompilerMessage("Assets/B.cs", 2, 2, "CS0103: b", CompilerMessageType.Error),
+                MakeCompilerMessage("Assets/C.cs", 3, 3, "CS0103: c", CompilerMessageType.Error),
+                MakeCompilerMessage("Assets/D.cs", 4, 4, "CS0103: d", CompilerMessageType.Error)
+            });
+
+            var message = ((ErrorResponse)CompilationGate.CheckOrNull(new JObject())).message;
+            StringAssert.Contains("Compilation has 4 errors", message);
+            StringAssert.Contains("Assets/A.cs(1,1)", message);
+            StringAssert.Contains("Assets/B.cs(2,2)", message);
+            StringAssert.Contains("Assets/C.cs(3,3)", message);
+            StringAssert.Contains("(+1 more)", message);
+            StringAssert.DoesNotContain("Assets/D.cs", message);
+            StringAssert.Contains("--skip_compile_check", message);
+        }
+
+        [Test]
+        public void GetLiveDiagnostics_DropsStaleConsoleEntry_ButKeepsFreshOne()
+        {
+            var now = NowMs();
+            CompilationGate.SeedCompileClockForTests(now - 5000, now - 1000);
+            ConsoleLogEntries.TestOverride = _ => new List<ConsoleLogEntries.CompileDiag>
+            {
+                new ConsoleLogEntries.CompileDiag
+                {
+                    File = "Assets/Old.cs", Line = 1, Col = 1, Severity = "error",
+                    Code = "CS1002", Message = "; expected",
+                    HasTimestamp = true, TimeOfDaySeconds = AgoSeconds(600)
+                },
+                new ConsoleLogEntries.CompileDiag
+                {
+                    File = "Assets/Now.cs", Line = 2, Col = 2, Severity = "error",
+                    Code = "CS0103", Message = "missing",
+                    HasTimestamp = true, TimeOfDaySeconds = TimeOfDaySeconds(now)
+                }
+            };
+
+            var diags = CompilationGate.GetLiveDiagnostics();
+            Assert.AreEqual(1, diags.Count);
+            Assert.AreEqual("Assets/Now.cs", diags[0].File);
+        }
+
+        [Test]
+        public void ParseTimestampSeconds_ReadsLogEntriesPrefix()
+        {
+            Assert.AreEqual(7 * 3600 + 20 * 60 + 9,
+                ConsoleLogEntries.ParseTimestampSeconds("[07:20:09] unitycli_caps_marker"));
+            Assert.AreEqual(-1, ConsoleLogEntries.ParseTimestampSeconds(null));
+            Assert.AreEqual(-1, ConsoleLogEntries.ParseTimestampSeconds("no timestamp"));
         }
 
         // ─── Dedup ──────────────────────────────────────────────
@@ -313,6 +457,7 @@ namespace UnityCliConnector.Tests
 
             Assert.IsTrue(ok, "sticky compile-error banner should be treated as a compile error");
             Assert.AreEqual("error", diag.Severity);
+            Assert.IsTrue(diag.Sticky, "the gate needs the sticky marker to exclude build/runtime failures");
         }
 
         [Test]
@@ -374,6 +519,20 @@ namespace UnityCliConnector.Tests
         }
 
         // ─── Helpers ────────────────────────────────────────────
+
+        static long NowMs() => DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+
+        static long TimeOfDaySeconds(long epochMs)
+        {
+            var local = DateTimeOffset.FromUnixTimeMilliseconds(epochMs).ToLocalTime();
+            return local.Hour * 3600L + local.Minute * 60L + local.Second;
+        }
+
+        static long AgoSeconds(int secondsAgo)
+        {
+            var sod = TimeOfDaySeconds(NowMs()) - secondsAgo;
+            return sod < 0 ? sod + 86400 : sod;
+        }
 
         static CompilerMessage MakeCompilerMessage(string file, int line, int column, string message,
             CompilerMessageType type)
