@@ -20,6 +20,7 @@ unity-connector/      # C# Unity Editor package (UPM)
   Editor/
     Core/             # Shared utilities (Response, ParamCoercion, ToolParams, StringCaseUtility)
     Tools/            # Tool implementations (auto-registered via [UnityCliTool] attribute)
+    InputInjection/   # `input` tool — own asmdef, only compiles when com.unity.inputsystem is present
     Modal/            # macOS modal dialog handling: AppKit via objc_msgSend, runs during the modal loop
     TestRunner/       # Test runner (RunTests, TestRunnerState)
 ```
@@ -32,6 +33,10 @@ unity-connector/      # C# Unity Editor package (UPM)
 2. CLI command name matches the tool name — default passthrough handles dispatch
 3. Positional args arrive as `args` array, flags as named params
 4. Go-side code is only needed for polling/waiting logic (editor, test)
+5. A tool that needs an optional package goes in its own folder + asmdef with `versionDefines` and
+   `defineConstraints` (see `Editor/InputInjection/`); ToolDiscovery scans every loaded assembly, so
+   no registration is needed. Unity must generate the `.meta` files — refresh the asset database
+   rather than writing GUIDs.
 
 ## Verification
 
