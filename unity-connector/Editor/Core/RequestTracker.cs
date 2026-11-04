@@ -220,7 +220,10 @@ namespace UnityCliConnector
             }
 
             var neverRan = $"{ticket.Command} never ran: Unity stopped answering before the main thread picked it up "
-                + $"({why}, waited {FormatSeconds(ticket.WaitedMs)}). Retry it once Unity answers again.";
+                + $"({why}, waited {FormatSeconds(ticket.WaitedMs)}). "
+                + (quitting
+                    ? "The editor was quitting, so nothing was applied."
+                    : "Retry it once Unity answers again.");
 
             return new ErrorResponse(neverRan,
                 new RequestFailureInfo(quitting ? null : ErrorCodes.DomainReload, ticket, diag, false));

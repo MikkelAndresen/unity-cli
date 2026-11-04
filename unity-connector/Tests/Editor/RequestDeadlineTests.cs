@@ -224,6 +224,22 @@ namespace UnityCliConnector.Tests
         }
 
         [Test]
+        public void BuildReloadError_AQueuedRequestDuringAQuitIsNotToldToWait()
+        {
+            // The editor is gone, so "retry it once Unity answers again" would be advice the caller
+            // can never act on; a queued request only has to learn that nothing was applied.
+            var queued = RequestTracker.Track(new RequestTicket("exec", 60000));
+
+            var error = RequestTracker.BuildReloadError(queued, "the editor is quitting", quitting: true);
+
+            Assert.That(error.message, Does.Contain("exec never ran"));
+            Assert.That(error.message, Does.Not.Contain("Retry it once Unity answers again"),
+                "a quit editor is not coming back, so there is no answer to wait for");
+            var json = JObject.Parse(JsonConvert.SerializeObject(error));
+            Assert.IsNull(json["data"]["code"].Value<string>());
+        }
+
+        [Test]
         public void BuildRefusedError_SaysNothingRanAndCarriesTheReloadCode()
         {
             // A request that arrives once the reload has begun must be refused on the spot instead of

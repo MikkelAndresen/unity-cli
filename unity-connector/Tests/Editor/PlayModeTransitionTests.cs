@@ -73,26 +73,44 @@ namespace UnityCliConnector.Tests
         {
             // Nothing changed: an ordinary exec must not claim a state change.
             Assert.IsNull(PlayModeTransitions.ChangeStartedSince(
-                wasPlaying: false, wasChanging: false, nowPlaying: false, nowChanging: false, compiling: false));
+                wasPlaying: false, wasChanging: false, wasCompiling: false,
+                nowPlaying: false, nowChanging: false, compiling: false));
             Assert.IsNull(PlayModeTransitions.ChangeStartedSince(
-                wasPlaying: true, wasChanging: true, nowPlaying: true, nowChanging: true, compiling: false),
+                wasPlaying: true, wasChanging: true, wasCompiling: false,
+                nowPlaying: true, nowChanging: true, compiling: false),
                 "the play-mode flags stay set across an exit, so there is nothing to report yet");
 
             // Requested entry, seen before and after the transition completes.
             Assert.AreEqual("a play mode change is in flight", PlayModeTransitions.ChangeStartedSince(
-                wasPlaying: false, wasChanging: false, nowPlaying: false, nowChanging: true, compiling: false));
+                wasPlaying: false, wasChanging: false, wasCompiling: false,
+                nowPlaying: false, nowChanging: true, compiling: false));
             Assert.AreEqual("entered play mode", PlayModeTransitions.ChangeStartedSince(
-                wasPlaying: false, wasChanging: false, nowPlaying: true, nowChanging: true, compiling: false));
+                wasPlaying: false, wasChanging: false, wasCompiling: false,
+                nowPlaying: true, nowChanging: true, compiling: false));
 
             // A completed exit is only visible as isPlaying going from true to false.
             Assert.AreEqual("left play mode", PlayModeTransitions.ChangeStartedSince(
-                wasPlaying: true, wasChanging: true, nowPlaying: false, nowChanging: false, compiling: false));
+                wasPlaying: true, wasChanging: true, wasCompiling: false,
+                nowPlaying: false, nowChanging: false, compiling: false));
 
             // A snippet that asked for a compile: reported only once the compile is actually running.
             Assert.IsNull(PlayModeTransitions.ChangeStartedSince(
-                wasPlaying: false, wasChanging: false, nowPlaying: false, nowChanging: false, compiling: false));
+                wasPlaying: false, wasChanging: false, wasCompiling: false,
+                nowPlaying: false, nowChanging: false, compiling: false));
             Assert.AreEqual("a script compilation is in flight", PlayModeTransitions.ChangeStartedSince(
-                wasPlaying: false, wasChanging: false, nowPlaying: false, nowChanging: false, compiling: true));
+                wasPlaying: false, wasChanging: false, wasCompiling: false,
+                nowPlaying: false, nowChanging: false, compiling: true));
+        }
+
+        [Test]
+        public void ChangeStartedSince_DoesNotBlameTheSnippetForACompileAlreadyRunning()
+        {
+            // A compile that was already running when the snippet started is not the snippet's, and
+            // exec must not claim it as one it started.
+            Assert.IsNull(PlayModeTransitions.ChangeStartedSince(
+                wasPlaying: false, wasChanging: false, wasCompiling: true,
+                nowPlaying: false, nowChanging: false, compiling: true),
+                "the compile was already in flight when the snippet started");
         }
 
         [Test]
@@ -102,7 +120,8 @@ namespace UnityCliConnector.Tests
             // in the one state an EditMode fixture is guaranteed to be in with nothing in flight.
             Assume.That(!EditorApplication.isCompiling && !EditorApplication.isPlayingOrWillChangePlaymode);
             Assert.IsNull(PlayModeTransitions.ChangeStartedSince(
-                EditorApplication.isPlaying, EditorApplication.isPlayingOrWillChangePlaymode),
+                EditorApplication.isPlaying, EditorApplication.isPlayingOrWillChangePlaymode,
+                EditorApplication.isCompiling),
                 "reading the change against the state it was read from can only report nothing");
         }
     }

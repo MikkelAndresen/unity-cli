@@ -243,6 +243,7 @@ namespace UnityCliConnector.Tools
 
             var playModeBefore = EditorApplication.isPlaying;
             var playModeChangingBefore = EditorApplication.isPlayingOrWillChangePlaymode;
+            var compilingBefore = EditorApplication.isCompiling;
             object result;
             try
             {
@@ -288,13 +289,15 @@ namespace UnityCliConnector.Tools
                 ? $"OK (routine completed in {outcome.Steps} steps)"
                 : "OK";
             // A snippet that changed play mode may have reloaded the domain this very response is
-            // being written from, so the answer says what the snippet set in motion. It is reported
-            // in meta rather than guessed at, because the reload may still be a tick away.
+            // being written from, so the answer says what the editor's state moved to. It is reported
+            // in meta rather than guessed at, because the reload may still be a tick away, and it
+            // names the state rather than the snippet because a change made by an asset import or by
+            // the user while the snippet yields is indistinguishable from one the snippet asked for.
             var stateChange = MainThread.IsCurrent
-                ? PlayModeTransitions.ChangeStartedSince(playModeBefore, playModeChangingBefore)
+                ? PlayModeTransitions.ChangeStartedSince(playModeBefore, playModeChangingBefore, compilingBefore)
                 : null;
             if (stateChange != null)
-                message += $" (this snippet started {stateChange}; the next command may have to wait for the editor)";
+                message += $" (since the snippet started: {stateChange}; the next command may have to wait for the editor)";
             string serializationError;
             var data = Serialize(outcome.Value, out serializationError);
             return new SuccessResponse(message, data,
