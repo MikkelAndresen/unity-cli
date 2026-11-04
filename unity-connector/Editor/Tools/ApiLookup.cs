@@ -97,8 +97,9 @@ namespace UnityCliConnector.Tools
         /// types declaring that member, else the closest types to the whole query.</summary>
         private static Resolution Resolve(string query, List<string> assemblyFilter, int maxTypes, Deadline scanBudget)
         {
-            var whole = InAssemblies(ApiIndex.FindTypes(query, maxTypes, 0), assemblyFilter);
-            if (whole.Count > 0) return new Resolution { types = whole, matchedBy = "type" };
+            var accept = AssemblyPredicate(assemblyFilter);
+            var whole = ApiIndex.FindTypes(query, maxTypes, 0, accept);
+            if (whole.Count > 0) return new Resolution { types = whole.ToList(), matchedBy = "type" };
 
             var lastDot = query.LastIndexOf('.');
             if (lastDot > 0)
@@ -107,10 +108,11 @@ namespace UnityCliConnector.Tools
                 var typeQuery = query.Substring(0, lastDot).Trim();
                 if (memberQuery.Length > 0)
                 {
-                    var owner = InAssemblies(ApiIndex.FindTypes(typeQuery, maxTypes, 0), assemblyFilter);
-                    if (owner.Count > 0) return new Resolution { types = owner, member = memberQuery, matchedBy = "type.member" };
+                    var owner = ApiIndex.FindTypes(typeQuery, maxTypes, 0, accept);
+                    if (owner.Count > 0)
+                        return new Resolution { types = owner.ToList(), member = memberQuery, matchedBy = "type.member" };
 
-                    var declaring = InAssemblies(ApiIndex.TypesWithMember(memberQuery, maxTypes, scanBudget), assemblyFilter);
+                    var declaring = ApiIndex.TypesWithMember(memberQuery, maxTypes, scanBudget, accept);
                     if (declaring.Count > 0)
                         return new Resolution { types = declaring, member = memberQuery, matchedBy = "member" };
                 }
@@ -118,19 +120,16 @@ namespace UnityCliConnector.Tools
             else if (query.Length > 2)
             {
                 // A bare name that is no type is most likely a member: "api GetSingletonBuffer".
-                var declaring = InAssemblies(ApiIndex.TypesWithMember(query, maxTypes, scanBudget), assemblyFilter);
+                var declaring = ApiIndex.TypesWithMember(query, maxTypes, scanBudget, accept);
                 if (declaring.Count > 0) return new Resolution { types = declaring, member = query, matchedBy = "member" };
             }
 
-            var closest = InAssemblies(ApiIndex.FindTypes(query, maxTypes), assemblyFilter);
-            return new Resolution { types = closest, matchedBy = "closest_types" };
+            var closest = ApiIndex.FindTypes(query, maxTypes, int.MaxValue, accept);
+            return new Resolution { types = closest.ToList(), matchedBy = "closest_types" };
         }
 
-        private static List<Type> InAssemblies(IReadOnlyList<Type> types, List<string> assemblyFilter)
-        {
-            if (assemblyFilter.Count == 0) return types.ToList();
-            return types.Where(t => AssemblyMatches(t.Assembly, assemblyFilter)).ToList();
-        }
+        private static Func<Type, bool> AssemblyPredicate(List<string> assemblyFilter) =>
+            assemblyFilter.Count == 0 ? null : t => AssemblyMatches(t.Assembly, assemblyFilter);
 
         private sealed class Resolution
         {

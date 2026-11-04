@@ -231,6 +231,32 @@ namespace UnityCliConnector.Tests
         }
 
         [Test]
+        public void Hint_MissOnAPartialIndex_IsNotCached()
+        {
+            ApiIndex.ResetForTests();
+            CompileHints.ResetForTests();
+
+            Assert.IsNull(CompileHints.ForDiagnostic("CS0246", Cs0246, 0),
+                "a spent budget indexes nothing, so the cold index has no candidate to suggest");
+
+            ApiIndex.EnsureIndexed(5000);
+            var hint = CompileHints.ForDiagnostic("CS0246", Cs0246, 5000);
+            StringAssert.Contains("Vector3", hint,
+                "a miss recorded while the index was partial must not shadow the answer a later call can find");
+        }
+
+        [Test]
+        public void Hint_SpentBudget_DoesNotKeepIndexing()
+        {
+            ApiIndex.ResetForTests();
+            CompileHints.ResetForTests();
+
+            CompileHints.ForDiagnostic("CS0246", Cs0246, 0);
+            Assert.AreEqual(0, ApiIndex.IndexedAssemblyCount,
+                "one budget bounds the indexing for the whole call, including after it is spent");
+        }
+
+        [Test]
         public void Hint_IsAlwaysWithinTheSizeBudget()
         {
             foreach (var diag in new[]

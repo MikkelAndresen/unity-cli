@@ -1,5 +1,6 @@
 using System;
 using System.Linq;
+using System.Reflection;
 using NUnit.Framework;
 using UnityCliConnector;
 using UnityEditor;
@@ -80,6 +81,17 @@ namespace UnityCliConnector.Tests
             Assert.IsTrue(members.Any(m => m.Name == "Magnitude"), "properties are members too");
             Assert.IsEmpty(members.Where(m => m.Name.StartsWith("get_") || m.Name.StartsWith("set_")),
                 "accessors are reported as properties, not as methods");
+        }
+
+        [Test]
+        public void PublicMembers_KeepsOperators()
+        {
+            var members = ApiIndex.PublicMembers(typeof(Vector3));
+            Assert.IsTrue(members.Any(m => m is MethodInfo mi && mi.Name == "op_Addition"),
+                "operators are callable members; only accessors are noise");
+            Assert.IsTrue(members.Any(m => m.Name == "op_Multiply"));
+            Assert.IsEmpty(members.Where(m => m.Name.StartsWith("get_") || m.Name.StartsWith("set_")),
+                "accessors are still reported as properties, not as methods");
         }
 
         [Test]

@@ -96,7 +96,8 @@ namespace UnityCliConnector.Tools
             var packageTargets = targets.Count - projectTargets.Count;
             var candidates = p.GetBool("include_packages") ? targets : projectTargets;
 
-            var errors = BurstErrors.Collect(CompilationGate.GetLiveDiagnostics(false), CompileErrors());
+            // BurstError has no use for the hint field, so it does not pay for hint generation.
+            var errors = BurstErrors.Collect(CompilationGate.GetLiveDiagnostics(false, -1), CompileErrors());
 
             var filterGiven = !string.IsNullOrEmpty(p.Get("type")) ||
                               !string.IsNullOrEmpty(p.Get("namespace")) ||

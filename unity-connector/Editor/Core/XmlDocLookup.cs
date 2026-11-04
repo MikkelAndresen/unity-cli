@@ -110,6 +110,12 @@ namespace UnityCliConnector
             if (member == null) return null;
             switch (member)
             {
+                case ConstructorInfo c:
+                {
+                    var parameters = c.GetParameters();
+                    var suffix = parameters.Length == 0 ? "" : "(" + string.Join(",", parameters.Select(ParamName)) + ")";
+                    return "M:" + Declaring(c) + ".#ctor" + suffix;
+                }
                 case MethodInfo m:
                 {
                     var name = m.Name + (m.IsGenericMethod ? "``" + m.GetGenericArguments().Length : "");
