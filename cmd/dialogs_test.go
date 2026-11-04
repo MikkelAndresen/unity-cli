@@ -234,7 +234,9 @@ func TestButtonMatches(t *testing.T) {
 		{"continue", "Continue", true},
 		{"dont save", "Don\u2019t Save", true},
 		{"don't save", "Don\u2019t Save", true},
-		{"save", "Don\u2019t Save", true},
+		{"save", "Save Changes", true},
+		{"Save", "Don\u2019t Save", false},
+		{"quit", "Don't Quit", false},
 		{"cancel", "OK", false},
 		{"", "OK", false},
 	}
@@ -242,6 +244,45 @@ func TestButtonMatches(t *testing.T) {
 		if got := buttonMatches(tc.want, tc.have); got != tc.expect {
 			t.Errorf("buttonMatches(%q, %q): got %v, want %v", tc.want, tc.have, got, tc.expect)
 		}
+	}
+}
+
+// TestSelectButton_DoesNotPressNegatedTitle is the destructive case: a prompt whose only match is
+// "Don't Save" must not be clicked by "Save".
+func TestSelectButton_DoesNotPressNegatedTitle(t *testing.T) {
+	windows := []dialogWindow{{PID: 1, Title: "Save Changes?", Buttons: []string{"Don't Save", "Cancel"}}}
+	_, _, _, err := selectButton(windows, "Save", "")
+	if err == nil || !strings.Contains(err.Error(), "no button matching") {
+		t.Fatalf("got err %v, want no match for Save", err)
+	}
+}
+
+func TestClickScopeError(t *testing.T) {
+	one := []dialogWindow{{PID: 1, Title: "Unity"}, {PID: 1, Title: "Scene - Foo - Unity"}}
+	two := []dialogWindow{{PID: 1, Title: "Unity"}, {PID: 2, Title: "Scene - Bar - Unity"}}
+
+	tests := []struct {
+		name    string
+		filter  string
+		window  string
+		windows []dialogWindow
+		wantErr bool
+	}{
+		{name: "filtered listing is safe", filter: "Foo", windows: two},
+		{name: "named window is safe", windows: two, window: "Unity"},
+		{name: "fallback with one process is safe", windows: one},
+		{name: "fallback across two processes is refused", windows: two, wantErr: true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			err := clickScopeError(tc.filter, tc.window, tc.windows)
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("got err %v, want error %v", err, tc.wantErr)
+			}
+			if err != nil && !strings.Contains(err.Error(), "--window") {
+				t.Errorf("error should point at --window: %v", err)
+			}
+		})
 	}
 }
 

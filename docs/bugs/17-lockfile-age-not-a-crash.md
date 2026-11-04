@@ -128,3 +128,18 @@ exit=1
   line below it. Changing that first line would be a larger presentation change outside this follow-up.
 - The live shared editor was not used for the final verification, per the worker instructions, so the
   integration check is the fake-HOME binary run above rather than a wedged real editor.
+
+## Review follow-up
+
+A code review of the #17 stack found one remaining misclassification in this fix. `status` calls an
+editor unresponsive once its heartbeat is 3 s old (`client.BeatSilenceAge`), but the evidence path
+only had a *silent* heartbeat after 10 s (`heartbeatStaleAge`). A 3–10 s gap — an ordinary domain
+reload or compile pause — therefore had a fresh `SessionHeartbeat` and no `StaleHeartbeat`, so the
+report fell through to the lockfile branch and said `editor_starting_or_blocked ... the connector has
+not loaded` about a connector that had demonstrably loaded this session.
+
+`(*client.EditorEvidence).UnresponsiveHeartbeat()` now returns the silent heartbeat, or the session
+heartbeat once it is at least `BeatSilenceAge` old, and `cmd/evidence.go` uses that single predicate
+for the state sentence, the heartbeat line, and the restart advice. A clean `stopped` heartbeat and a
+heartbeat written before the lockfile still read as not-unresponsive, and a heartbeat inside the 3 s
+margin changes nothing.

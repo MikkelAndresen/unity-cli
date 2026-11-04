@@ -276,3 +276,34 @@ func TestStaleHeartbeatReport_AfterSessionHeartbeatSaysUnresponsive(t *testing.T
 		t.Errorf("a heartbeat this session rules out the lockfile crash hint:\n%s", got)
 	}
 }
+
+// TestAnnotateNoEditor_ShortSilenceAfterSessionHeartbeatIsUnresponsive covers the gap between
+// status's 3s cut-off and the client's 10s "stale" cut-off: a domain reload pauses the heartbeat
+// for a few seconds, and the connector has plainly loaded this session.
+func TestAnnotateNoEditor_ShortSilenceAfterSessionHeartbeatIsUnresponsive(t *testing.T) {
+	isolatedHome(t)
+	dir := openUnityProjectDir(t, 6*time.Hour)
+	writeInstanceFile(t, client.Instance{
+		State:       "ready",
+		ProjectPath: dir,
+		Port:        8090,
+		PID:         os.Getpid(),
+		Timestamp:   time.Now().Add(-5 * time.Second).UnixMilli(),
+	})
+
+	msg := annotateNoEditor(errors.New("no active instance on port 8090"), "", 8090).Error()
+	for _, want := range []string{
+		"editor_unresponsive",
+		"stopped answering 5s ago",
+		"last state \"ready\"",
+	} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("message missing %q:\n%s", want, msg)
+		}
+	}
+	for _, unwanted := range []string{"editor_starting_or_blocked", "connector has not loaded", "probably crashed"} {
+		if strings.Contains(msg, unwanted) {
+			t.Errorf("message must not contain %q:\n%s", unwanted, msg)
+		}
+	}
+}

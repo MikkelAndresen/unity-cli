@@ -972,10 +972,12 @@ heartbeat from that session exists; once a heartbeat postdates the lockfile, a s
 
 Windows are narrowed to the requested project by matching the project folder name in the window
 title; when nothing matches, every Unity window is listed, because startup dialogs rarely name the
-project. If Accessibility is missing, the error names the exact grant (System Settings → Privacy &
-Security → Accessibility, for `/usr/bin/osascript` and the app running the command). Button matching
-is exact-title first, then case- and apostrophe-insensitive, and an ambiguous title is reported
-instead of clicking a possibly-wrong dialog.
+project. A click in that unfiltered listing needs `--window` unless all listed windows belong to one
+Unity process, so it cannot press a button in another project's editor. If Accessibility is missing,
+the error names the exact grant (System Settings → Privacy & Security → Accessibility, for
+`/usr/bin/osascript` and the app running the command). Button matching is exact-title first, then
+case- and apostrophe-insensitive from the start of the title (so `Save` cannot press `Don't Save`),
+and an ambiguous title is reported instead of clicking a possibly-wrong dialog.
 
 Windows Unity draws itself (IMGUI panels, some Safe Mode prompts) expose no native buttons to
 Accessibility: `dialogs` lists their title and texts, but there is nothing to click, and only a

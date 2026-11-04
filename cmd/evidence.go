@@ -62,13 +62,13 @@ func evidenceSentence(ev *client.EditorEvidence) string {
 	if project == "" {
 		project = "this project"
 	}
-	if ev.SilentHeartbeatThisSession() {
+	if beat, age := ev.UnresponsiveHeartbeat(); beat != nil {
 		pid := ""
-		if ev.StaleHeartbeat.PID > 0 {
-			pid = fmt.Sprintf(", pid %d", ev.StaleHeartbeat.PID)
+		if beat.PID > 0 {
+			pid = fmt.Sprintf(", pid %d", beat.PID)
 		}
 		return fmt.Sprintf("%s: Unity's connector for %s stopped answering %s ago%s (last state %q) — the main thread is likely blocked (long exec/build/import), a modal dialog is open, or the editor hung.",
-			editorUnresponsiveState, project, client.FormatAge(ev.StaleBeatAge), pid, ev.StaleHeartbeat.State)
+			editorUnresponsiveState, project, client.FormatAge(age), pid, beat.State)
 	}
 	if ev.LockfilePath != "" {
 		return fmt.Sprintf("%s: Unity appears open for %s (%s) but the connector has not loaded — it is still importing/compiling, or %s.",
@@ -80,7 +80,7 @@ func evidenceSentence(ev *client.EditorEvidence) string {
 
 // evidenceHint is the one-line form, for paths that already print their own message.
 func evidenceHint(ev *client.EditorEvidence) string {
-	if ev.SilentHeartbeatThisSession() {
+	if beat, _ := ev.UnresponsiveHeartbeat(); beat != nil {
 		return fmt.Sprintf("%s Try 'unity-cli dialogs' on the macOS host; if it stays silent, restart the editor ('unity-restart' in agent-sandbox).", evidenceSentence(ev))
 	}
 	return fmt.Sprintf("%s Run 'unity-cli dialogs' on the macOS host, or ask the user.", evidenceSentence(ev))
@@ -102,14 +102,17 @@ func evidenceReport(ev *client.EditorEvidence, discovery error) string {
 		fmt.Fprintf(&b, "  Lockfile: none at %s/Temp/UnityLockfile, so Unity may not be holding this project open\n", ev.ProjectPath)
 	}
 
-	if ev.StaleHeartbeat != nil {
+	if beat, age := ev.UnresponsiveHeartbeat(); beat != nil {
+		fmt.Fprintf(&b, "  Heartbeat: %s (state %q, pid %d, last beat %s ago)\n",
+			beat.SourceFile, beat.State, beat.PID, client.FormatAge(age))
+	} else if ev.StaleHeartbeat != nil {
 		fmt.Fprintf(&b, "  Heartbeat: %s (state %q, pid %d, last beat %s ago)\n",
 			ev.StaleFile, ev.StaleHeartbeat.State, ev.StaleHeartbeat.PID, client.FormatAge(ev.StaleBeatAge))
 	}
 	if discovery != nil {
 		fmt.Fprintf(&b, "  Lookup:   %s\n", strings.ReplaceAll(discovery.Error(), "\n", " "))
 	}
-	if ev.SilentHeartbeatThisSession() {
+	if beat, _ := ev.UnresponsiveHeartbeat(); beat != nil {
 		b.WriteString("  Next:     try 'unity-cli dialogs' on the macOS host; if it stays silent, restart the editor ('unity-restart' in agent-sandbox).")
 	} else {
 		b.WriteString("  Next:     run 'unity-cli dialogs' on the macOS host to read the dialog's title and buttons, or ask the user to look at the editor.")

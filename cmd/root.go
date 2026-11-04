@@ -1481,14 +1481,18 @@ The agent sandbox is granted no Accessibility permission, so run it in a Termina
 the host.
 
 Options:
-  --click "<title>"  Press the button. Exact title first, then a case-insensitive
-                     substring match against the titles just listed.
+  --click "<title>"  Press the button. Exact title first, then a case- and
+                     apostrophe-insensitive match from the start of the title
+                     ("Continue" also matches "Continue Anyway", but "Save" does
+                     not match "Don't Save").
   --window "<title>" Only click in a window whose title contains this. Also used to
                      break a tie when the same button title is on several windows.
 
 Windows are narrowed to the requested project (--project, or the running instance) by
 matching the project folder name in the window title; when nothing matches, every
 Unity window is listed instead, because startup dialogs rarely name the project.
+A click in that unfiltered listing needs --window unless all listed windows belong to
+one Unity process, so it cannot press a button in another project's editor.
 
 Output is JSON: pid, window title, role, button titles, and the window's static
 texts (capped at 12 per window; texts_total reports the real count).

@@ -76,6 +76,29 @@ func (e *EditorEvidence) SilentHeartbeatThisSession() bool {
 	return e.heartbeatAfterLockfile(e.StaleHeartbeat)
 }
 
+// UnresponsiveHeartbeat returns the heartbeat that proves the connector loaded and then stopped
+// answering, with how long it has been silent. The stale record covers anything past
+// heartbeatStaleAge; the session heartbeat also covers the gap down to BeatSilenceAge, where
+// `status` already calls the editor unresponsive, so an ordinary domain reload is not reported as
+// "the connector never loaded".
+func (e *EditorEvidence) UnresponsiveHeartbeat() (*Instance, time.Duration) {
+	if e == nil {
+		return nil, 0
+	}
+	if e.SilentHeartbeatThisSession() {
+		return e.StaleHeartbeat, e.StaleBeatAge
+	}
+	beat := e.SessionHeartbeat
+	if beat == nil || beat.State == "stopped" || !e.HeartbeatThisSession() {
+		return nil, 0
+	}
+	age := time.Since(time.UnixMilli(beat.Timestamp))
+	if age < BeatSilenceAge {
+		return nil, 0
+	}
+	return beat, age
+}
+
 // Summary is the compact reason an editor looks open, e.g. "Temp/UnityLockfile, age 42s".
 func (e *EditorEvidence) Summary() string {
 	if e == nil {
