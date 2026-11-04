@@ -190,9 +190,11 @@ changed here.
 - Windows `--force` now runs the same process-name guard as unix: `verifyUnityProcess` asks
   `tasklist` for the pid's image name and refuses anything that is not Unity, so a recycled pid is
   never terminated. The name test itself is shared (`isUnityProcessName`) and covered on any OS.
-- `editor restart --clean` now checks `LockfileHeld` after the editor is stopped and refuses to
-  delete `Library/`/`Temp/` while `Temp/UnityLockfile` is still held, which is what that helper's
-  doc always required. It was previously dead code outside its unit test.
+- `LockfileHeld` (dead outside its unit test) was removed rather than wired into `restart --clean`:
+  it only tests that `Temp/UnityLockfile` exists, and a crashed or force-killed editor leaves that
+  file behind — exactly the state `restart --clean` exists to recover from. Restart already waits
+  for the stopped editor to exit, and Unity itself refuses a second editor on the same project, so
+  there is no live holder for the gate to catch.
 - The unreachable `if !resp.Success { os.Exit(1) }` after a quit/restart reply is gone; a refused
   lifecycle command now returns normally so the deferred signal teardown runs, and a future non-zero
   reply still cannot exit 0.

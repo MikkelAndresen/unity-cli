@@ -60,6 +60,11 @@ func TestIsUnityProcessName(t *testing.T) {
 		{`"Unity.exe","65279","Console","1","1,234 K"`, true},
 		{`C:\\Program Files\\Unity\\Hub\\Editor\\Unity.exe`, true},
 		{"nginx", false},
+		{"/opt/community/tool", false},
+		{"/Applications/Unity Hub.app/Contents/MacOS/Unity Hub", false},
+		{"UnityShaderCompiler", false},
+		{`"UnityHub.exe","4242","Console","1","9,000 K"`, false},
+		{"INFO: No tasks are running which match the specified criteria.", false},
 		{"python3", false},
 		{"", false},
 	}

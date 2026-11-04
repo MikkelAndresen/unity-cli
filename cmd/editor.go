@@ -56,7 +56,7 @@ func editorCmd(ctx context.Context, args []string, send sendFn, resolve instance
 			return editorRefreshCompile(ctx, send, resolve, params, keepConsole, os.Stderr)
 		}
 		if keepConsole {
-			return nil, fmt.Errorf("editor refresh --keep-console only applies with --compile (it keeps a previous compile's errors out of the compile report)")
+			return nil, fmt.Errorf("editor refresh --keep-console only applies with --compile (it keeps the console uncleared before the compile, so the compile report may include older errors)")
 		}
 		return send("refresh_unity", params)
 

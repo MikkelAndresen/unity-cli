@@ -110,3 +110,23 @@ func TestPollTestResults_NoSecondDeadline(t *testing.T) {
 		t.Errorf("the poll ignored its context: %v", elapsed)
 	}
 }
+
+// TestCountedWriter_MarksWritesInFlight: verify and wait write their reports straight to stdout, so
+// the signal fallback can only wait for them if their writer is counted.
+func TestCountedWriter_MarksWritesInFlight(t *testing.T) {
+	var seen int32
+	w := countedWriter{writerFunc(func(p []byte) (int, error) {
+		seen = stdoutWrites.Load()
+		return len(p), nil
+	})}
+	if _, err := w.Write([]byte("x")); err != nil {
+		t.Fatal(err)
+	}
+	if seen != 1 || stdoutWrites.Load() != 0 {
+		t.Errorf("in-flight count during write = %d, after = %d; want 1 and 0", seen, stdoutWrites.Load())
+	}
+}
+
+type writerFunc func([]byte) (int, error)
+
+func (f writerFunc) Write(p []byte) (int, error) { return f(p) }

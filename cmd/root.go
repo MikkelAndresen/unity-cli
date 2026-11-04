@@ -228,9 +228,9 @@ func Execute() error {
 		testSend := sendWatchingModal(func(command string, params interface{}) (*client.CommandResponse, error) {
 			return sendAfterReload(ctx, resolve, gate, command, params, 0)
 		}, resolve)
-		exitNow(verifyCmd(ctx, subArgs, send, testSend, resolve, currentInst.Port, os.Stdout))
+		exitNow(verifyCmd(ctx, subArgs, send, testSend, resolve, currentInst.Port, countedWriter{os.Stdout}))
 	case waitCategory:
-		exitNow(waitCmd(ctx, subArgs, send, resolveForWait, os.Stdout))
+		exitNow(waitCmd(ctx, subArgs, send, resolveForWait, countedWriter{os.Stdout}))
 	case "exec":
 		// --await_timeout already widened the one invocation budget above, so the client never
 		// gives up before the connector's own timed_out marker.
@@ -1142,7 +1142,6 @@ Subcommands:
     --discard         Discard unsaved scene changes explicitly (the default).
     --force           Terminate Unity if it does not quit gracefully.
     --clean           Delete Library/ and Temp/ before relaunching (full reimport).
-                      Refused while Temp/UnityLockfile is still held.
     --editor-path <exe>  Unity executable to launch (default: $UNITY_EDITOR or Unity Hub).
                       --timeout <ms> overrides the quit and startup budgets
                       (default: 60s to quit; 5m to start, 15m with --clean).

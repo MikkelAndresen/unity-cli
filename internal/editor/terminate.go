@@ -38,5 +38,14 @@ func Terminate(pid int) error {
 // reports whether it names the Unity editor. Shared so the two platform guards cannot disagree
 // about what may be terminated.
 func isUnityProcessName(line string) bool {
-	return strings.Contains(strings.ToLower(line), "unity")
+	image := strings.TrimSpace(line)
+	if strings.HasPrefix(image, `"`) {
+		// tasklist /FO CSV: the image name is the first quoted field.
+		image = strings.SplitN(strings.TrimPrefix(image, `"`), `"`, 2)[0]
+	}
+	if i := strings.LastIndexAny(image, `/\`); i >= 0 {
+		image = image[i+1:]
+	}
+	image = strings.TrimSuffix(strings.ToLower(image), ".exe")
+	return image == "unity"
 }

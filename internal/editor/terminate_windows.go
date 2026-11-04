@@ -19,7 +19,8 @@ var processCommand = func(pid int) (string, error) {
 // unrelated program. tasklist is the Windows equivalent of ps -o comm=.
 func verifyUnityProcess(pid int) error {
 	line, err := processCommand(pid)
-	if err != nil || line == "" {
+	// tasklist answers an unknown pid on stdout with an "INFO: No tasks ..." line, not an error.
+	if err != nil || line == "" || strings.HasPrefix(line, "INFO:") {
 		return fmt.Errorf("pid %d is not visible from this process; if the CLI runs in a container, stop Unity from the host", pid)
 	}
 	if !isUnityProcessName(line) {

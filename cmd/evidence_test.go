@@ -317,3 +317,25 @@ func TestAnnotateNoEditor_ShortSilenceAfterSessionHeartbeatIsUnresponsive(t *tes
 		}
 	}
 }
+
+// TestEvidenceHint_NoLockfileDoesNotSendToDialogs: status prints the one-line hint, which once kept
+// "try 'unity-cli dialogs'" after concluding the editor had exited.
+func TestEvidenceHint_NoLockfileDoesNotSendToDialogs(t *testing.T) {
+	project := t.TempDir()
+	writeInstanceFile(t, client.Instance{
+		State:       "ready",
+		ProjectPath: project,
+		Port:        8090,
+		PID:         os.Getpid(),
+		Timestamp:   time.Now().Add(-4 * time.Minute).UnixMilli(),
+	})
+
+	ev := client.FindEditorEvidence(project, 0)
+	if beat, _ := ev.UnresponsiveHeartbeat(); beat == nil {
+		t.Fatalf("expected an unresponsive heartbeat, got %+v", ev)
+	}
+	hint := evidenceHint(ev)
+	if strings.Contains(hint, "dialogs") || !strings.Contains(hint, "probably exited") {
+		t.Errorf("hint must agree with the no-lockfile verdict:\n%s", hint)
+	}
+}

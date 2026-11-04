@@ -1057,7 +1057,7 @@ unity-cli status
 #   Crash log: /Users/me/Work/MyGame/mono_crash.1b6a4e0a.0.json (mono_crash, written 25s ago)
 #              signal 11 (SIGSEGV); System.NullReferenceException: Object reference not set to an instance of an object
 #   Next:      Unity has to be relaunched by the user — no CLI call brings it back. Editor.log rotates when it does, so read the crash log above first.
-# Error: crashed (port 8090, pid 65279): <one line saying what proved the crash>
+# Error: crashed (port 8090, pid 65279): the crash report above names the evidence
 # (exit 1)
 ```
 

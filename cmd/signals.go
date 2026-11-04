@@ -3,6 +3,7 @@ package cmd
 import (
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"os/signal"
 	"sync/atomic"
@@ -29,6 +30,20 @@ func endStdoutWrite()   { stdoutWrites.Add(-1) }
 // signalWriteGrace bounds how long the fallback waits for an in-flight response write.
 var signalWriteGrace = 5 * time.Second
 
+// signalSettle is the head start a command gets to observe the canceled context and print its own
+// answer before the fallback exits; a write that begins in that window is then waited for.
+var signalSettle = 250 * time.Millisecond
+
+// countedWriter marks every write in flight, for reports written straight to stdout instead of
+// through printResponse (verify, wait).
+type countedWriter struct{ w io.Writer }
+
+func (c countedWriter) Write(p []byte) (int, error) {
+	beginStdoutWrite()
+	defer endStdoutWrite()
+	return c.w.Write(p)
+}
+
 // waitForStdoutWrites blocks until no response write is in flight, or the grace expires.
 func waitForStdoutWrites(grace time.Duration) {
 	deadline := time.Now().Add(grace)
@@ -53,6 +68,7 @@ func installSignalCancellation() (context.Context, context.CancelFunc) {
 		signalExitCode.Store(int32(code))
 		fmt.Fprintf(os.Stderr, "unity-cli: interrupted by %s\n", sig)
 		cancel()
+		time.Sleep(signalSettle)
 		waitForStdoutWrites(signalWriteGrace)
 		os.Exit(code)
 	}()

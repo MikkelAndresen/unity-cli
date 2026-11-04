@@ -175,13 +175,6 @@ func verifyCmd(ctx context.Context, args []string, send, testSend sendFn, resolv
 		return noReply("compile: still compiling after %s", compileWaitTimeout)
 	}
 	hasErrors := outcome.HasErrors
-	if outcome.NothingToCompile {
-		note := "no script compilation was observed after the refresh; the compile verdict is the editor's current state"
-		r.Notes = append(r.Notes, note)
-		if !asJSON {
-			_, _ = fmt.Fprintf(out, "  (%s)\n", note)
-		}
-	}
 
 	findings, err := verifyDiagnostics(send, max, hasErrors, verifyDiagnosticsWait)
 	if err != nil {
@@ -193,6 +186,13 @@ func verifyCmd(ctx context.Context, args []string, send, testSend sendFn, resolv
 	if !asJSON {
 		printCompile(out, r.Compile.OK, findings.Total, findings.Diags, findings.Source, hasErrors)
 		printProvenance(out, findings.Provenance)
+	}
+	if outcome.NothingToCompile {
+		note := "no script compilation was observed after the refresh; the compile verdict is the editor's current state"
+		r.Notes = append(r.Notes, note)
+		if !asJSON {
+			_, _ = fmt.Fprintf(out, "  (%s)\n", note)
+		}
 	}
 	if !r.Compile.OK {
 		return finish(verifyFailed)
