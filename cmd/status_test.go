@@ -300,14 +300,14 @@ func TestWaitForCompile_ClockAdvanceAfterRequestIsEvidence(t *testing.T) {
 func TestWaitForCompile_KeepsWaitingWhileCompiling(t *testing.T) {
 	compileTestBudgets(t)
 	resolve := func() (*client.Instance, error) {
-		return &client.Instance{State: "compiling", CompileFinishedAt: 1_000}, nil
+		return &client.Instance{State: "compiling", CompileFinishedAt: 1_000, CompileErrors: true}, nil
 	}
 
 	out, err := waitForCompileTo(resolve, io.Discard, "editor refresh --compile", compileBaseline{FinishedAt: 1_000})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if !out.TimedOut || out.NothingToCompile {
-		t.Errorf("outcome = %+v, want a timeout while the editor never left 'compiling'", out)
+	if !out.TimedOut || out.NothingToCompile || !out.HasErrors {
+		t.Errorf("outcome = %+v, want a timeout that keeps the last seen compile state", out)
 	}
 }

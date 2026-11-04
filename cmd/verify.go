@@ -156,7 +156,7 @@ func verifyCmd(ctx context.Context, args []string, send, testSend sendFn, resolv
 		return noReply("compile: still compiling after 5 minutes")
 	}
 
-	findings, err := verifyDiagnostics(send, max, hasErrors)
+	findings, err := verifyDiagnostics(send, max, hasErrors, verifyDiagnosticsWait)
 	if err != nil {
 		return noReply("compile: %v", err)
 	}
@@ -269,14 +269,19 @@ func verifyCmd(ctx context.Context, args []string, send, testSend sendFn, resolv
 	return finish(verifyOK)
 }
 
+// verifyDiagnosticsWait is how long compile_diagnostics may keep answering "still compiling"
+// before the diagnostic read gives up. A variable so the compile report can skip the wait after
+// its own compile wait already timed out.
+var verifyDiagnosticsWait = time.Minute
+
 // verifyDiagnostics returns this compile's findings: the errors in the project's own code and the
 // provenance object that came with them. When the heartbeat reports errors but none are in the
 // source tree, it returns the third-party ones instead, so a failed compile is never reported as
 // clean. Connectors before 0.7.0 have no compile_diagnostics; their console errors stand in, marked
 // with source "console", and they predate provenance too.
-func verifyDiagnostics(send sendFn, max int, hasErrors bool) (compileFindings, error) {
+func verifyDiagnostics(send sendFn, max int, hasErrors bool, wait time.Duration) (compileFindings, error) {
 	query := func(sourceTreeOnly bool) (compileFindings, bool, error) {
-		deadline := time.Now().Add(time.Minute)
+		deadline := time.Now().Add(wait)
 		for {
 			resp, err := send("compile_diagnostics", map[string]interface{}{"source_tree_only": sourceTreeOnly, "limit": max})
 			if err != nil {

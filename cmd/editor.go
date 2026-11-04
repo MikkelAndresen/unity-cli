@@ -108,12 +108,11 @@ func editorRefreshCompile(send sendFn, resolve instanceResolver, params map[stri
 	// race-free baseline. The heartbeat fills it in for connectors that do not echo it, and gives
 	// the process id used to notice an editor restart while waiting.
 	baseline := compileBaseline{}
-	trackedReply := false
 	if v, ok := reportFieldInt(resp.Data, "compile_finished_at"); ok {
-		baseline.FinishedAt, trackedReply = v, true
+		baseline.FinishedAt, baseline.Tracked = v, true
 	}
 	if current, rerr := resolve(); rerr == nil && current != nil {
-		if !trackedReply {
+		if !baseline.Tracked {
 			baseline.FinishedAt = current.CompileFinishedAt
 		}
 		baseline.PID = current.PID
@@ -124,16 +123,14 @@ func editorRefreshCompile(send sendFn, resolve instanceResolver, params map[stri
 		return nil, err
 	}
 
-	findings, err := compileReportDiagnostics(send, outcome.HasErrors)
-	if err != nil {
-		return nil, fmt.Errorf("compile: %w", err)
-	}
+	findings, diagErr := compileReportDiagnostics(send, outcome.HasErrors, compileDiagnosticsWait(outcome))
+	diagLabel := "compile"
 
 	// A compile can finish clean while a DLL is still older than its sources: Unity's Bee cache
 	// believed the assembly was unchanged. Ask once for a clean-cache rebuild, then report the
 	// result as-is; repeating it would only burn another full compile.
 	cleanRetry := false
-	if reportFieldBool(resp.Data, "clean_compile_supported") && staleAssemblies(findings) > 0 &&
+	if diagErr == nil && reportFieldBool(resp.Data, "clean_compile_supported") && staleAssemblies(findings) > 0 &&
 		!outcome.TimedOut && !outcome.HasErrors && findings.Total == 0 {
 		cleanRetry = true
 		retryParams := map[string]interface{}{}
@@ -151,7 +148,7 @@ func editorRefreshCompile(send sendFn, resolve instanceResolver, params map[stri
 		resp = retryResp
 		baseline = compileBaseline{}
 		if v, ok := reportFieldInt(resp.Data, "compile_finished_at"); ok {
-			baseline.FinishedAt = v
+			baseline.FinishedAt, baseline.Tracked = v, true
 		}
 		if current, rerr := resolve(); rerr == nil && current != nil {
 			baseline.PID = current.PID
@@ -160,15 +157,16 @@ func editorRefreshCompile(send sendFn, resolve instanceResolver, params map[stri
 		if err != nil {
 			return nil, err
 		}
-		findings, err = compileReportDiagnostics(send, outcome.HasErrors)
-		if err != nil {
-			return nil, fmt.Errorf("clean retry: %w", err)
-		}
+		findings, diagErr = compileReportDiagnostics(send, outcome.HasErrors, compileDiagnosticsWait(outcome))
+		diagLabel = "clean retry"
 	}
 
 	total := findings.Total
-	succeeded := !outcome.TimedOut && !outcome.HasErrors && total == 0
+	succeeded := diagErr == nil && !outcome.TimedOut && !outcome.HasErrors && total == 0
 	notes := compileReportNotes(outcome, findings.Source, findings.Provenance)
+	if diagErr != nil {
+		notes = append(notes, "this compile's diagnostics could not be read: "+firstLine(diagErr.Error()))
+	}
 	if cleanRetry {
 		if staleAssemblies(findings) > 0 {
 			notes = append(notes, "assemblies were still stale after one CleanBuildCache rebuild; the DLLs on disk do not match the sources")
@@ -184,6 +182,9 @@ func editorRefreshCompile(send sendFn, resolve instanceResolver, params map[stri
 	case outcome.TimedOut:
 		resp.Message = fmt.Sprintf("Refresh done; compilation did not finish within %s.", compileWaitTimeout)
 		return resp, fmt.Errorf("compilation did not finish within %s (still compiling, or the connector never reported it)", compileWaitTimeout)
+	case diagErr != nil:
+		resp.Message = "Refresh done; this compile's diagnostics could not be read."
+		return resp, fmt.Errorf("%s: %w", diagLabel, diagErr)
 	case !succeeded:
 		if total > 0 {
 			resp.Message = fmt.Sprintf("Refresh done; compilation failed with %d error(s).", total)
@@ -315,16 +316,24 @@ func cappedBudget(ctx context.Context, budget time.Duration) time.Duration {
 
 // compileReportDiagnostics reads this compile's errors, retrying while the editor is still back
 // from the domain reload the compile triggered: its HTTP connection drops across the reload, so a
-// single failed call proves nothing.
-func compileReportDiagnostics(send sendFn, hasErrors bool) (compileFindings, error) {
+// single failed call proves nothing. wait bounds how long a still-compiling answer is polled; zero
+// reads once, because the compile wait itself already timed out.
+func compileReportDiagnostics(send sendFn, hasErrors bool, wait time.Duration) (compileFindings, error) {
 	deadline := time.Now().Add(30 * time.Second)
 	for {
-		findings, err := verifyDiagnostics(send, compileReportMaxDiags, hasErrors)
-		if err == nil || !isConnectionFailure(err) || time.Now().After(deadline) {
+		findings, err := verifyDiagnostics(send, compileReportMaxDiags, hasErrors, wait)
+		if err == nil || !isConnectionFailure(err) || wait <= 0 || time.Now().After(deadline) {
 			return findings, err
 		}
 		time.Sleep(statusPollInterval)
 	}
+}
+
+func compileDiagnosticsWait(outcome compileOutcome) time.Duration {
+	if outcome.TimedOut {
+		return 0
+	}
+	return verifyDiagnosticsWait
 }
 
 // isConnectionFailure reports an editor that was momentarily unreachable (mid-reload) rather than

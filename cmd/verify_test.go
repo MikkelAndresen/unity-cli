@@ -15,28 +15,29 @@ import (
 
 // fakeEditor answers the tools verify uses and records every call.
 type fakeEditor struct {
-	t              *testing.T
-	compileErrors  bool                     // heartbeat flag after the compile
-	connector      string                   // heartbeat connectorVersion
-	finishedAt     int64                    // heartbeat compileFinishedAt seen while polling
-	echoFinished   *int64                   // refresh_unity echoes compile_finished_at; nil: connector without the clock
-	pid            int                      // heartbeat pid (0: no restart, no restart detection)
-	stuckState     string                   // heartbeat state while polling (default "ready")
-	diagnostics    map[bool][]interface{}   // compile_diagnostics by source_tree_only; nil: tool unknown (old connector)
-	console        []string                 // console error entries (old-connector fallback)
-	consoleCapped  bool                     // console reply wraps the entries in the capped object
-	provenance     map[string]interface{}   // compile_diagnostics' provenance object; nil: connector predates it
-	provenanceSeq  []map[string]interface{} // per-call provenance; overrides provenance while non-empty
-	refreshReplies []map[string]interface{} // per-call refresh_unity extras; overrides reply while non-empty
-	tests          map[string]interface{}   // run_tests summary; nil: tests not expected
-	testsSuccess   bool
-	testsMessage   string
-	burst          map[string]interface{} // burst_status reply; nil: connector has no burst_status tool
-	burstSuccess   bool
-	burstMessage   string
-	refreshErr     error
-	calls          []string
-	params         map[string]map[string]interface{}
+	t                    *testing.T
+	compileErrors        bool                     // heartbeat flag after the compile
+	connector            string                   // heartbeat connectorVersion
+	finishedAt           int64                    // heartbeat compileFinishedAt seen while polling
+	echoFinished         *int64                   // refresh_unity echoes compile_finished_at; nil: connector without the clock
+	pid                  int                      // heartbeat pid (0: no restart, no restart detection)
+	stuckState           string                   // heartbeat state while polling (default "ready")
+	diagnostics          map[bool][]interface{}   // compile_diagnostics by source_tree_only; nil: tool unknown (old connector)
+	diagnosticsCompiling bool                     // compile_diagnostics keeps answering compiling=true
+	console              []string                 // console error entries (old-connector fallback)
+	consoleCapped        bool                     // console reply wraps the entries in the capped object
+	provenance           map[string]interface{}   // compile_diagnostics' provenance object; nil: connector predates it
+	provenanceSeq        []map[string]interface{} // per-call provenance; overrides provenance while non-empty
+	refreshReplies       []map[string]interface{} // per-call refresh_unity extras; overrides reply while non-empty
+	tests                map[string]interface{}   // run_tests summary; nil: tests not expected
+	testsSuccess         bool
+	testsMessage         string
+	burst                map[string]interface{} // burst_status reply; nil: connector has no burst_status tool
+	burstSuccess         bool
+	burstMessage         string
+	refreshErr           error
+	calls                []string
+	params               map[string]map[string]interface{}
 }
 
 func (f *fakeEditor) send(command string, params interface{}) (*client.CommandResponse, error) {
@@ -93,7 +94,7 @@ func (f *fakeEditor) send(command string, params interface{}) (*client.CommandRe
 		}
 		list := f.diagnostics[p["source_tree_only"] == true]
 		reply := map[string]interface{}{
-			"compiling": false, "total": len(list), "diagnostics": list,
+			"compiling": f.diagnosticsCompiling, "total": len(list), "diagnostics": list,
 		}
 		prov := f.provenance
 		if len(f.provenanceSeq) > 0 {

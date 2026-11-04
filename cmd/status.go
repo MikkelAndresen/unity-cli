@@ -397,9 +397,9 @@ func waitForReadyTo(resolve instanceResolver, logw io.Writer, command string) (h
 var (
 	compileWaitTimeout = 5 * time.Minute
 	// compileIdleGrace is how long a requested compile is given to show any sign of having run
-	// before the CLI concludes the asset refresh left nothing to recompile. The connector keeps
-	// its heartbeat "compiling" for 3 s after a request, so a real compile is visible long before
-	// this elapses; without it, a no-op compile request would wait out the full timeout.
+	// before the CLI concludes the asset refresh left nothing to recompile. The connector only
+	// guarantees a 3 s "compiling" heartbeat after a request; a compile queued behind other
+	// editor work can start later, so this is a heuristic rather than proof.
 	compileIdleGrace = 20 * time.Second
 )
 
@@ -408,7 +408,10 @@ var (
 // and the first poll still counts as evidence.
 type compileBaseline struct {
 	FinishedAt int64
-	PID        int
+	// Tracked says the reply carried the compile-clock key, so a clock that still reads 0 is a new
+	// connector that has not stamped it yet, not one without the clock.
+	Tracked bool
+	PID     int
 }
 
 // compileOutcome says how waiting for a requested compile ended.
@@ -430,6 +433,7 @@ func waitForCompileTo(resolve instanceResolver, logw io.Writer, command string, 
 
 	start := time.Now()
 	deadline := start.Add(compileWaitTimeout)
+	lastErrors := false
 	for time.Now().Before(deadline) {
 		time.Sleep(statusPollInterval)
 		status, err := resolve()
@@ -440,26 +444,28 @@ func waitForCompileTo(resolve instanceResolver, logw io.Writer, command string, 
 			return compileOutcome{}, modalBlockedError(status, command, true)
 		}
 
-		outcome := compileOutcome{Elapsed: time.Since(start), HasErrors: status.CompileErrors}
-		tracked := baseline.FinishedAt != 0 || status.CompileFinishedAt != 0
+		lastErrors = status.CompileErrors
+		outcome := compileOutcome{Elapsed: time.Since(start), HasErrors: lastErrors}
+		tracked := baseline.Tracked || status.CompileFinishedAt != 0
 		restarted := baseline.PID != 0 && status.PID != 0 && status.PID != baseline.PID
 		// The compile clock advances when the compilation ends, which is *before* the domain reload
 		// it triggers; the editor only answers again once that reload is over, hence "ready" too.
 		finished := status.State == "ready" && status.CompileFinishedAt > baseline.FinishedAt
 
 		switch {
-		case finished:
-			outcome.Evidence = true
-			_, _ = fmt.Fprintf(logw, "%s\n", compileResultLine(status.CompileErrors))
-			return outcome, nil
 		case restarted:
 			// The editor restarted under the request; its startup compile state is the freshest
-			// answer, but the CLI cannot claim this request caused it.
+			// answer, but the CLI cannot claim this request caused it. Checked before finished:
+			// the reopened process's startup compile also advances the wall clock past the baseline.
 			if status.State != "ready" {
 				continue
 			}
 			outcome.Restarted = true
 			outcome.Untracked = !tracked
+			_, _ = fmt.Fprintf(logw, "%s\n", compileResultLine(status.CompileErrors))
+			return outcome, nil
+		case finished:
+			outcome.Evidence = true
 			_, _ = fmt.Fprintf(logw, "%s\n", compileResultLine(status.CompileErrors))
 			return outcome, nil
 		case !tracked && status.State == "ready":
@@ -476,7 +482,7 @@ func waitForCompileTo(resolve instanceResolver, logw io.Writer, command string, 
 	}
 
 	_, _ = fmt.Fprintf(logw, "Timed out waiting for compilation (%s).\n", compileWaitTimeout)
-	return compileOutcome{TimedOut: true, Elapsed: time.Since(start)}, nil
+	return compileOutcome{TimedOut: true, HasErrors: lastErrors, Elapsed: time.Since(start)}, nil
 }
 
 func compileResultLine(hasErrors bool) string {
