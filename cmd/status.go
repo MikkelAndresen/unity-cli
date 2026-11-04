@@ -39,6 +39,9 @@ func statusCmd(inst *client.Instance) error {
 	fmt.Printf("  Version: %s\n", status.UnityVersion)
 	printVersionSummary(os.Stdout, status)
 	fmt.Printf("  PID:     %d\n", status.PID)
+	if isStartingState(status.State) {
+		fmt.Println("  Note:    the HTTP listener is up; the editor has not run its first update tick yet")
+	}
 	if isModal(status) {
 		fmt.Print(describeModal(status.Modal))
 	}
@@ -294,8 +297,10 @@ func waitForAliveContext(ctx context.Context, resolve instanceResolver, timeoutM
 			return nil, err
 		}
 		baseline = inst.Timestamp
-		// Already fresh — check if timestamp was updated within the last second
-		if time.Now().UnixMilli()-baseline < 1000 {
+		// Already fresh and past startup — check if timestamp was updated within the last second.
+		// A fresh "starting" heartbeat means the listener answered but the editor has not ticked
+		// yet, so returning it would send the command to an editor that cannot run it.
+		if time.Now().UnixMilli()-baseline < 1000 && !isStartingState(inst.State) {
 			return inst, nil
 		}
 	}
@@ -323,7 +328,9 @@ func waitForAliveContext(ctx context.Context, resolve instanceResolver, timeoutM
 		if err != nil {
 			continue
 		}
-		if inst.Timestamp > baseline {
+		// The startup beater keeps advancing the timestamp while the state is still "starting";
+		// only the first tick that replaces it proves the editor can run a command.
+		if inst.Timestamp > baseline && !isStartingState(inst.State) {
 			fmt.Fprintf(os.Stderr, "Unity is ready.\n")
 			return inst, nil
 		}

@@ -34,6 +34,18 @@ namespace UnityCliConnector.Tests
         }
 
         [Test]
+        public void BuildStatus_CarriesStartingBeforeTheFirstMainThreadTick()
+        {
+            // The listener writes this immediately after Start(), before EditorApplication.update
+            // has run once. It is the daemon's only evidence that a connector exists during a cold
+            // import; losing the state would put it back to reporting None.
+            var json = JObject.Parse(Newtonsoft.Json.JsonConvert.SerializeObject(
+                Heartbeat.BuildStatus("starting", false, 0, null)));
+
+            Assert.AreEqual("starting", json["state"].Value<string>());
+        }
+
+        [Test]
         public void BuildStatus_ReportsTheRunningBuildSoWaitersDoNotSeeAWedge()
         {
             // While BuildPlayer holds the main thread, "building" plus the job id is all the CLI has

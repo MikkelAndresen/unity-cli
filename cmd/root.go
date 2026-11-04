@@ -156,9 +156,17 @@ func Execute() error {
 		return client.DiscoverInstance(targetProject, 0)
 	}
 
-	alive, err := waitForAliveContext(ctx, resolve, remainingTimeoutMs(ctx, effectiveTimeout))
-	if err != nil {
-		return noEditor(annotateNoEditor(err, targetProject, flagPort))
+	var alive *client.Instance
+	if category == waitCategory && isStartingState(inst.State) {
+		// wait's own --timeout is the budget for startup, and waitCmd polls "starting" itself.
+		// Holding it in waitForAlive here would spend the global request deadline instead, so
+		// `wait --timeout 2` could sit for two minutes before its own clock even started.
+		alive = inst
+	} else {
+		alive, err = waitForAliveContext(ctx, resolve, remainingTimeoutMs(ctx, effectiveTimeout))
+		if err != nil {
+			return noEditor(annotateNoEditor(err, targetProject, flagPort))
+		}
 	}
 	gate := newVersionGate(category)
 	if err := gate.check(alive); err != nil {

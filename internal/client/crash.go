@@ -755,7 +755,7 @@ func reloadNote(beat *Instance, requestedPort int) string {
 	}
 	if age < BeatSilenceAge {
 		switch beat.State {
-		case "compiling", "reloading", "refreshing", "building", "modal":
+		case "starting", "compiling", "reloading", "refreshing", "building", "modal":
 			return fmt.Sprintf("%s still says %q (last beat %s ago)", beat.SourceFile, beat.State, FormatAge(age))
 		}
 	}

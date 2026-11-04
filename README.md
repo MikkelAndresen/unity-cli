@@ -137,7 +137,7 @@ The Unity Connector:
 5. Routes incoming commands to the matching handler on the main thread
 6. Survives domain reloads (script recompilation)
 
-Before compiling or reloading, the Connector records the state (`compiling`, `reloading`) to the instance file. When the main thread freezes, the timestamp stops updating. The CLI detects this and waits for a fresh timestamp before sending commands. A player build holds the main thread for minutes without compiling or reloading anything; the Connector keeps beating as `building` from the build's own writer thread (see [Build a Player](#build-a-player-long-running)), so a building editor is not mistaken for a wedged one.
+Before compiling or reloading, the Connector records the state (`compiling`, `reloading`) to the instance file. As soon as the HTTP listener is up it writes `starting` and keeps that heartbeat fresh until the editor's first update tick, so a cold import is not reported as "no connector". When the main thread freezes, the timestamp stops updating. The CLI detects this and waits for a fresh timestamp before sending commands. A player build holds the main thread for minutes without compiling or reloading anything; the Connector keeps beating as `building` from the build's own writer thread (see [Build a Player](#build-a-player-long-running)), so a building editor is not mistaken for a wedged one.
 
 Every command the Connector accepts gets exactly one answer. It tracks each request, and if the
 editor's main thread has not started it within the request's queue deadline, the Connector itself
@@ -787,8 +787,8 @@ unity-cli compile_status --scan false        # timestamps only, no filesystem wa
 unity-cli compile_status --scan_budget 1000  # let the scan take up to a second
 ```
 
-`wait` exits 0 when the editor is idle (heartbeat `ready`, `playing` or `paused` — not compiling,
-refreshing, reloading, building, and no dialog open), 1 when it gave up, and 2 when the editor could
+`wait` exits 0 when the editor is idle (heartbeat `ready`, `playing` or `paused` — not starting,
+compiling, refreshing, reloading, building, and no dialog open), 1 when it gave up, and 2 when the editor could
 not answer, naming a modal dialog and the command that answers it. `--timeout` is seconds and belongs
 after the command name; the global `--timeout` before it stays a request timeout in milliseconds.
 
