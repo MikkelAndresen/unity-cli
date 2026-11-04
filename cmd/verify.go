@@ -224,15 +224,32 @@ func consoleErrors(send sendFn, max int) ([]verifyDiag, int, string, error) {
 	if err != nil {
 		return nil, 0, "", err
 	}
-	var messages []string
-	if len(resp.Data) > 0 {
-		_ = json.Unmarshal(resp.Data, &messages)
-	}
+	messages := consoleEntryMessages(resp.Data)
 	diags := make([]verifyDiag, 0, len(messages))
 	for _, m := range messages {
 		diags = append(diags, verifyDiag{Severity: "error", Message: firstLine(m)})
 	}
 	return diags, len(diags), "console", nil
+}
+
+// consoleEntryMessages reads the entry list out of a console reply. A bare array is what a
+// connector without caps returns; the capped connector wraps the entries in an object that also
+// carries the truncation counts.
+func consoleEntryMessages(data []byte) []string {
+	if len(data) == 0 {
+		return nil
+	}
+	var list []string
+	if err := json.Unmarshal(data, &list); err == nil {
+		return list
+	}
+	var capped struct {
+		Entries []string `json:"entries"`
+	}
+	if err := json.Unmarshal(data, &capped); err != nil {
+		return nil
+	}
+	return capped.Entries
 }
 
 func printCompile(out io.Writer, ok bool, total int, diags []verifyDiag, source string, hasErrors bool) {

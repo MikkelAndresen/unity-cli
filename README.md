@@ -145,7 +145,7 @@ Before compiling or reloading, the Connector records the state (`compiling`, `re
 |---------|-------------|
 | `editor` | Play/stop/pause/refresh the Unity Editor |
 | `input` | Inject new-Input-System keyboard/mouse/gamepad/touch state in Play mode and pump the player loop |
-| `console` | Read, filter, and clear console logs |
+| `console` | Read, filter, and clear console logs (newest 50 entries, capped stack traces) |
 | `exec` | Run arbitrary C# code inside Unity |
 | `test` | Run EditMode/PlayMode tests |
 | `verify` | Compile, list errors in your code, run tests: one call, brief output |
@@ -279,22 +279,64 @@ without the Input System package compile unchanged and simply have no `input` to
 
 ### Console Logs
 
+`console` is small by default so one chatty editor still fits in one tool output: the **newest 50**
+entries, at most **6 stack frames** each, at most **1000 characters** per entry and **15 KB** of
+entry text in total. `--stacktrace user` (the default) keeps only user-code frames — a frame is
+engine noise when its declaring type's root namespace is Unity's or the runtime's
+(`UnityEngine.*`, `UnityEditor.*`, `Unity.*` including Entities/Burst/Jobs/Collections, `System.*`,
+`Mono.*`, `NUnit.*`), when it carries no managed type at all (native addresses, `<Module>`,
+compiler-generated `<...>` holders, `(wrapper ...)`), or when its source is under `Library/`; runs of
+them collapse into one `... (+N engine frames)` line. A trace whose frames are all engine noise keeps
+its first non-`UnityEngine.Debug` frame, so there is still a location to act on.
+
 ```bash
-# Read error and warning logs (default)
+# Newest 50 entries, capped stack traces
 unity-cli console
 
-# Read last 20 log entries of all types
-unity-cli console --lines 20 --filter error,warning,log
+# Newest 20 entries of all types
+unity-cli console --lines 20 --type error,warning,log
 
-# Read only errors
-unity-cli console --type error
+# Only errors, one line each
+unity-cli console --type error --stacktrace none
 
-# Include stack traces (user: user code only, full: raw)
-unity-cli console --stacktrace user
+# Every frame of every error, still per-entry capped
+unity-cli console --type error --stacktrace full --frames -1
+
+# No caps at all
+unity-cli console --full
 
 # Clear console
 unity-cli console --clear
 ```
+
+Every cap has its own flag — `--lines`, `--entry_chars` and `--max_bytes` are removed by 0, `--frames`
+is removed by -1 and set to "no frames" by 0 — and `--full` removes all of them. When anything was
+cut the reply says what and how much, so a caller knows how to widen the query instead of guessing:
+
+```json
+{
+  "entries": [
+    "IndexOutOfRangeException : Index was out of bounds.\n... (+12 engine frames)\nFoW.FogOfWarUpdater:Update () (at Assets/FogOfWar/Runtime/Components/FogOfWarUpdater.cs:31)"
+  ],
+  "entries_total": 213,
+  "entries_returned": 50,
+  "entries_omitted": 163,
+  "frames_omitted": 412,
+  "chars_omitted": 0,
+  "truncated": true,
+  "truncated_by": ["lines", "frames"],
+  "limits": { "lines": 50, "frames": 6, "entry_chars": 1000, "max_bytes": 15360, "stacktrace": "user" }
+}
+```
+
+`entries` is oldest-first and holds the newest entries the caps allowed; `entries_total` counts the
+entries matching `--type`, before any cap. The list being read is the Console window's own list: with
+the window's Log/Warning toggles off those entries are not in it at all, so `--type log` answers empty
+in an editor that logged plenty.
+
+Before the caps release `console` returned a bare array of
+all matching entries and `stacktrace=user` filtered with a hardcoded list of names that Burst and
+Entities traces slipped through, which is what a single call costing 35 KB came from.
 
 ### Execute C# Code
 

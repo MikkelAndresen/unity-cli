@@ -405,10 +405,11 @@ Input Injection (Play mode, new Input System only):
   input reset                     Release injected state, drop virtual devices, restore settings
 
 Console:
-  console                       Read error & warning logs (default)
-  console --lines 20            Limit to N entries
+  console                       Newest 50 entries, capped stack traces (default)
+  console --lines 20            Newest N entries
   console --type error,warning,log   Filter by log types (comma-separated)
   console --stacktrace full     Stack trace: none, user (default), full
+  console --full                No caps: every entry, frame and character
   console --clear               Clear console
 
 Execute C#:
@@ -632,19 +633,28 @@ Examples:
 
 Read Unity console log entries.
 
+Small by default so a chatty editor fits in one tool output: the newest 50 entries, at most 6
+stack frames each, at most 1000 characters per entry and 15 KB of entry text in total. The reply
+says what was cut (truncated, entries_total/entries_returned/entries_omitted, frames_omitted).
+
 Options:
-  --lines <N>          Limit to N entries
+  --lines <N>          Newest N entries (default 50; 0 = no limit)
   --type <types>       Comma-separated log types: error, warning, log (default: error,warning,log)
   --stacktrace <mode>  none: first line only
-                        user: with stack trace, internal frames filtered (default)
-                        full: raw message including all frames
+                        user: user-code frames only, Unity/runtime frames collapsed (default)
+                        full: every frame, still capped by --frames unless --full
+  --frames <N>         Stack frames kept per entry (default 6; 0 = none, -1 = all)
+  --entry_chars <N>    Max characters per entry (default 1000; 0 = no limit)
+  --max_bytes <N>      Max total bytes of entry text (default 15360; 0 = no limit)
+  --full               Remove every cap
   --clear              Clear console
 
 Examples:
   unity-cli console
   unity-cli console --lines 20 --type error,warning,log
-  unity-cli console --stacktrace user
-  unity-cli console --type error --stacktrace full
+  unity-cli console --stacktrace none --type error
+  unity-cli console --type error --stacktrace full --frames -1
+  unity-cli console --full
   unity-cli console --clear
 `)
 	case "exec":

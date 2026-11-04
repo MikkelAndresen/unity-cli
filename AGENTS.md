@@ -19,7 +19,7 @@ cmd/                  # Go CLI — thin passthrough layer
 internal/client/      # Unity HTTP client, instance discovery, Temp/UnityLockfile evidence
 unity-connector/      # C# Unity Editor package (UPM)
   Editor/
-    Core/             # Shared utilities (Response, ParamCoercion, ToolParams, StringCaseUtility)
+    Core/             # Shared utilities (Response, ParamCoercion, ToolParams, StringCaseUtility, StackTraceFilter)
     Tools/            # Tool implementations (auto-registered via [UnityCliTool] attribute)
     BuildJobs/        # Player build jobs: job record, Temp/ persistence across reloads, runner off the command lock
     InputInjection/   # `input` tool — own asmdef, only compiles when com.unity.inputsystem is present
