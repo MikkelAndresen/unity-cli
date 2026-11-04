@@ -91,7 +91,13 @@ func waitCmd(ctx context.Context, args []string, send sendFn, resolve instanceRe
 	if raw, ok := flags["timeout"]; ok {
 		seconds, err := strconv.Atoi(raw)
 		if err != nil || seconds <= 0 {
-			_, _ = fmt.Fprintf(out, "wait: --timeout wants a whole number of seconds, got %q\n", raw)
+			msg := fmt.Sprintf("wait: --timeout wants a whole number of seconds, got %q", raw)
+			if asJSON {
+				b, _ := json.Marshal(waitResult{Error: msg, Exit: waitTimedOut})
+				_, _ = fmt.Fprintln(out, string(b))
+				return waitTimedOut
+			}
+			_, _ = fmt.Fprintln(out, msg)
 			return waitTimedOut
 		}
 		timeout = time.Duration(seconds) * time.Second
@@ -155,6 +161,7 @@ func waitCmd(ctx context.Context, args []string, send sendFn, resolve instanceRe
 	deadline := start.Add(timeout)
 	var staleSince time.Time
 	restartNoted := false
+	reloadNoted := false
 	for {
 		status, err := resolve()
 		if err != nil {
@@ -166,22 +173,40 @@ func waitCmd(ctx context.Context, args []string, send sendFn, resolve instanceRe
 			return noReply("%s", modalBlockedError(status, "wait", true))
 		}
 		r.State, r.Port, r.PID = status.State, status.Port, status.PID
-		r.CompileLanded = status.CompileFinishedAt > baseline.CompileFinishedAt
 
 		// The editor coming back under a new pid restamps the compile clock too, and that is not
-		// evidence the caller's edit was compiled into anything.
-		if !restartNoted && baseline.PID != 0 && status.PID != 0 && status.PID != baseline.PID {
-			restartNoted = true
-			r.Notes = append(r.Notes, "the Unity editor restarted while waiting; the compile clock shows its startup compile")
+		// evidence the caller's edit was compiled into anything. Rebase the clock so a compile this
+		// new process runs after the restart is still proof, while its startup compile is not.
+		if baseline.PID != 0 && status.PID != 0 && status.PID != baseline.PID {
+			if !restartNoted {
+				restartNoted = true
+				r.Notes = append(r.Notes, "the Unity editor restarted while waiting; the compile clock shows its startup compile")
+			}
+			baseline = status
+			r.CompileLanded = false
+		} else {
+			r.CompileLanded = status.CompileFinishedAt > baseline.CompileFinishedAt
 		}
 
 		// The connector rewrites its heartbeat twice a second even while compiling, and a player build
 		// has its own writer, so long silence means the editor wedged or restarted: no amount of
-		// --timeout will make it answer. The threshold is looser than statusCmd's because a domain
-		// reload pauses the writes for a couple of seconds.
+		// --timeout will make it answer. A domain reload also stops the update-driven writes for its
+		// whole duration, so silence there is only a reason to stop if the editor died in it.
 		if age := heartbeatAge(status); age > waitSilentHeartbeat {
-			report := stalledEditorReport(status, age, assessCrash(status))
-			return noReply("%s", report)
+			verdict := assessCrash(status)
+			if status.State != "reloading" || verdict.Crashed {
+				return noReply("%s", stalledEditorReport(status, age, verdict))
+			}
+			if !reloadNoted {
+				reloadNoted = true
+				r.Notes = append(r.Notes, fmt.Sprintf("the heartbeat has been silent for %s, but the editor reports a domain reload; still waiting (--timeout bounds it)", age.Truncate(time.Second)))
+			}
+		}
+
+		// The grace is for an idle editor with stale sources; time spent compiling or reloading is
+		// not part of it, or a compile that finished between polls would leave the timer expired.
+		if !isIdleState(status.State) {
+			staleSince = time.Time{}
 		}
 
 		if isIdleState(status.State) {
@@ -201,25 +226,29 @@ func waitCmd(ctx context.Context, args []string, send sendFn, resolve instanceRe
 				return finish(waitIdle)
 			}
 			if prov.StaleCount == 0 {
-				r.Notes = append(r.Notes, "no compilation ran while waiting and no source file is newer than the last compile: your edit is already in")
-				if !prov.ScanComplete {
-					r.Notes = append(r.Notes, "the source scan stopped early, so \"not stale\" is not certain")
+				if prov.ScanNote != provenanceNotScanned {
+					r.Notes = append(r.Notes, "no compilation ran while waiting and no source file is newer than the last compile: your edit is already in")
+					if !prov.ScanComplete {
+						r.Notes = append(r.Notes, "the source scan stopped early, so \"not stale\" is not certain")
+					}
+					return finish(waitIdle)
 				}
-				return finish(waitIdle)
-			}
-
-			// Stale and not compiling: the editor has not picked the change up yet. Wait for it to
-			// start; the compile clock ends the wait, so the tree is not scanned again.
-			if staleSince.IsZero() {
-				staleSince = time.Now()
-			} else if time.Since(staleSince) > waitStaleGrace {
-				r.TimedOut = true
-				r.Reason = fmt.Sprintf("no compilation started within %s of finding uncompiled sources", waitStaleGrace)
-				r.Notes = append(r.Notes, "Unity only auto-refreshes while it has focus; run unity-cli verify (or unity-cli editor refresh --compile) to compile them")
-				// Re-ask: the lines the editor wrote say "(3 s ago)" as of when it wrote them, and
-				// these were written one grace period ago.
-				askProvenance(true)
-				return finish(waitTimedOut)
+				// compile_status answered a compiling editor from the previous record without a scan;
+				// "not stale" there means "not looked", so wait for the compile to move the clock.
+			} else {
+				// Stale and not compiling: the editor has not picked the change up yet. Wait for it to
+				// start; the compile clock ends the wait, so the tree is not scanned again.
+				if staleSince.IsZero() {
+					staleSince = time.Now()
+				} else if time.Since(staleSince) > waitStaleGrace {
+					r.TimedOut = true
+					r.Reason = fmt.Sprintf("no compilation started within %s of finding uncompiled sources", waitStaleGrace)
+					r.Notes = append(r.Notes, "Unity only auto-refreshes while it has focus; run unity-cli verify (or unity-cli editor refresh --compile) to compile them")
+					// Re-ask: the lines the editor wrote say "(3 s ago)" as of when it wrote them, and
+					// these were written one grace period ago.
+					askProvenance(true)
+					return finish(waitTimedOut)
+				}
 			}
 		}
 
