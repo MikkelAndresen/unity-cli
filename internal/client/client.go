@@ -74,16 +74,22 @@ func instancesDir() string {
 	return filepath.Join(home, ".unity-cli", "instances")
 }
 
-// ScanInstances reads all instance files from ~/.unity-cli/instances/.
-// Stale files whose PID is no longer running are automatically removed.
-func ScanInstances() ([]Instance, error) {
+// instanceFile is one heartbeat file on disk plus its parsed contents.
+type instanceFile struct {
+	Path     string
+	Instance Instance
+}
+
+// rawInstanceFiles reads every instance file without judging or deleting anything, so callers
+// that need the dead/stopped ones (evidence of an editor that stopped answering) can see them.
+func rawInstanceFiles() ([]instanceFile, error) {
 	dir := instancesDir()
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return nil, err
 	}
 
-	var instances []Instance
+	var files []instanceFile
 	for _, e := range entries {
 		if e.IsDir() || !strings.HasSuffix(e.Name(), ".json") {
 			continue
@@ -97,11 +103,26 @@ func ScanInstances() ([]Instance, error) {
 		if err := json.Unmarshal(data, &inst); err != nil {
 			continue
 		}
-		if inst.PID > 0 && isProcessDead(inst.PID) {
-			_ = os.Remove(fp)
+		files = append(files, instanceFile{Path: fp, Instance: inst})
+	}
+	return files, nil
+}
+
+// ScanInstances reads all instance files from ~/.unity-cli/instances/.
+// Stale files whose PID is no longer running are automatically removed.
+func ScanInstances() ([]Instance, error) {
+	files, err := rawInstanceFiles()
+	if err != nil {
+		return nil, err
+	}
+
+	var instances []Instance
+	for _, f := range files {
+		if f.Instance.PID > 0 && isProcessDead(f.Instance.PID) {
+			_ = os.Remove(f.Path)
 			continue
 		}
-		instances = append(instances, inst)
+		instances = append(instances, f.Instance)
 	}
 	return instances, nil
 }
@@ -183,7 +204,7 @@ func DiscoverInstance(project string, port int) (*Instance, error) {
 
 	if project != "" {
 		for _, inst := range alive {
-			if strings.Contains(filepath.ToSlash(inst.ProjectPath), filepath.ToSlash(project)) {
+			if projectMatches(inst.ProjectPath, project) {
 				return &inst, nil
 			}
 		}

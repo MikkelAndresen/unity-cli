@@ -11,9 +11,11 @@ cmd/                  # Go CLI — thin passthrough layer
   test.go             # test command (PlayMode result polling)
   verify.go           # verify command (compile + compile_diagnostics + tests, brief output)
   status.go           # status, waitForAlive, heartbeat reading
+  evidence.go         # editor_starting_or_blocked: the startup-dialog report built from on-disk evidence
+  dialogs.go          # dialogs command (macOS only): list/click Unity windows with AppleScript
   update.go           # self-update from GitHub releases
   version_check.go    # periodic update notice (12h interval)
-internal/client/      # Unity HTTP client, instance discovery
+internal/client/      # Unity HTTP client, instance discovery, Temp/UnityLockfile evidence
 unity-connector/      # C# Unity Editor package (UPM)
   Editor/
     Core/             # Shared utilities (Response, ParamCoercion, ToolParams, StringCaseUtility)

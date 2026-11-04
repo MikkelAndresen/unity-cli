@@ -68,9 +68,13 @@ func Execute() error {
 	case "status":
 		inst, err := discoverStatusInstance(flagProject, flagPort)
 		if err != nil {
-			return err
+			return annotateNoEditor(err, flagProject, flagPort)
 		}
 		return statusCmd(inst)
+	case "dialogs":
+		// Runs with no connector and no heartbeat at all: startup dialogs are exactly the
+		// window where neither exists yet.
+		return dialogsCmd(subArgs)
 	}
 
 	// verify reports an editor that can't answer as exit code 2, not as a CLI error.
@@ -83,7 +87,7 @@ func Execute() error {
 
 	inst, err := client.DiscoverInstance(flagProject, flagPort)
 	if err != nil {
-		return noEditor(err)
+		return noEditor(annotateNoEditor(err, flagProject, flagPort))
 	}
 
 	targetProject := flagProject
@@ -100,7 +104,7 @@ func Execute() error {
 
 	alive, err := waitForAlive(resolve, flagTimeout)
 	if err != nil {
-		return noEditor(err)
+		return noEditor(annotateNoEditor(err, targetProject, flagPort))
 	}
 	if err := checkConnectorVersion(alive, Version, flagIgnoreVersionMismatch); err != nil {
 		return noEditor(err)
@@ -459,6 +463,12 @@ Modal Dialogs (macOS):
   modal                         Show the modal dialog blocking the editor
   modal answer --button <title> Click a button by title (or --index <n>)
 
+Startup Dialogs (macOS host, no connector needed):
+  dialogs                       List Unity's windows, their texts and button names (JSON)
+  dialogs --click "<title>"    Press a button by title (--window "<title>" to pick the window)
+  Use this when status says editor_starting_or_blocked: the editor is open but its connector
+  has not loaded, so 'modal' cannot see anything. Needs macOS + Accessibility permission.
+
 Custom Tools:
   list                          List all registered tools with parameter schemas
   <name>                        Call a custom tool directly
@@ -466,6 +476,8 @@ Custom Tools:
 
 Status:
   status                        Show Unity Editor state (ready, compiling, etc.)
+                                editor_starting_or_blocked means Unity is open but the connector
+                                has not loaded; see "unity-cli dialogs --help"
 
 Update:
   update                        Update to the latest version
@@ -770,6 +782,49 @@ Examples:
   unity-cli modal answer --button "Don't Save"
   unity-cli modal answer --index 0 --id 27186
 `)
+	case "dialogs":
+		fmt.Print(`Usage: unity-cli dialogs [--click "<button title>"] [--window "<window title>"]
+
+List — and optionally answer — the windows of the Unity processes on this machine,
+read from OUTSIDE the editor with AppleScript + System Events (Accessibility).
+
+This is the only way to see a dialog that appears before the connector assembly loads:
+license / sign-in prompts, safe mode, "project already open", package resolution.
+status reports that window as "editor_starting_or_blocked".
+
+macOS only: on other systems the command explains that it must run on the macOS host.
+The agent sandbox is granted no Accessibility permission, so run it in a Terminal on
+the host.
+
+Options:
+  --click "<title>"  Press the button. Exact title first, then a case-insensitive
+                     substring match against the titles just listed.
+  --window "<title>" Only click in a window whose title contains this. Also used to
+                     break a tie when the same button title is on several windows.
+
+Windows are narrowed to the requested project (--project, or the running instance) by
+matching the project folder name in the window title; when nothing matches, every
+Unity window is listed instead, because startup dialogs rarely name the project.
+
+Output is JSON: pid, window title, role, button titles, and the window's static
+texts (capped at 12 per window; texts_total reports the real count).
+
+If Accessibility permission is missing, the error names the exact grant to make in
+System Settings -> Privacy & Security -> Accessibility (for /usr/bin/osascript and the
+app running this command).
+
+Windows Unity draws itself (IMGUI panels, some Safe Mode prompts) expose no native
+buttons to Accessibility: they are listed with their title and texts, but there is
+nothing to click. Then only a human can answer them.
+
+Examples:
+  unity-cli --project ~/Work/MyProject dialogs
+  unity-cli dialogs
+  unity-cli dialogs --click "Continue"
+  unity-cli dialogs --click "Don't Save" --window "Save Changes"
+
+See also: 'unity-cli modal' — the in-editor equivalent, available once the connector loads.
+`)
 	case "list":
 		fmt.Print(`Usage: unity-cli list
 
@@ -785,6 +840,11 @@ Show the current Unity Editor state: port, project path, version, PID.
 Reports "not responding" if heartbeat is older than 3 seconds.
 State "modal" means a dialog blocks the editor; its text and buttons are
 printed (see "unity-cli modal --help").
+
+When no heartbeat answers but the project's Temp/UnityLockfile (or a heartbeat that
+went silent) says an editor is open, status reports "editor_starting_or_blocked": the
+connector has not loaded yet, or a startup dialog is waiting. That dialog is invisible
+to the connector — read it with "unity-cli dialogs" on the macOS host.
 
 Example:
   unity-cli status
