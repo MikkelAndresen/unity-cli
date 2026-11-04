@@ -144,6 +144,7 @@ Before compiling or reloading, the Connector records the state (`compiling`, `re
 | Command | Description |
 |---------|-------------|
 | `editor` | Play/stop/pause/refresh the Unity Editor |
+| `input` | Inject new-Input-System keyboard/mouse/gamepad/touch state in Play mode and pump the player loop |
 | `console` | Read, filter, and clear console logs |
 | `exec` | Run arbitrary C# code inside Unity |
 | `test` | Run EditMode/PlayMode tests |
@@ -197,6 +198,83 @@ compile failed or timed out, and the report is printed either way. `--compile` c
 first so an error left over from an earlier compile is not reported as this one's; `--keep-console`
 skips the clear. Connectors without the compile-finished clock fall back to the heartbeat's
 `compileErrors` flag and say so in `notes`.
+
+### Input Injection (Play mode)
+
+```bash
+# Enter play mode first — injection needs a running player
+unity-cli editor play --wait
+
+# Keyboard: Key enum names (aliases: ctrl, alt, shift, cmd, esc, return, up, down)
+unity-cli input key Space            # default mode is press
+unity-cli input key Space press
+unity-cli input key Space release
+unity-cli input key W tap --hold_ms 200
+
+# Mouse: Game view pixels (0,0 is the top-left of the Game View), deltas, buttons, wheel
+unity-cli input mouse --x 100 --y 200
+unity-cli input mouse --dx 10 --dy -4
+unity-cli input mouse --button left --mode click
+unity-cli input mouse --scroll_y -2
+
+# Gamepad: a virtual Gamepad is added on demand; --control names the InputSystem control
+# ('axis' is an alias for 'gamepad')
+unity-cli input gamepad --control leftStick --x 1 --y 0
+unity-cli input gamepad --control leftTrigger --value 0.6
+unity-cli input gamepad --control buttonSouth --mode tap
+unity-cli input axis --control dpad --x 1 --y 0
+
+# Touch: virtual Touchscreen added on demand
+unity-cli input touch --x 64 --y 128 --mode tap
+
+# What the Input System currently sees, plus focus and InputSettings state
+unity-cli input state
+
+# Release injected state, remove the virtual devices the tool added, restore InputSettings
+unity-cli input reset
+```
+
+`input` writes device state instead of sending OS keystrokes: it queues a `StateEvent` built from the
+device's current state with one control overwritten (so other keys, the mouse position and the other
+stick survive), runs `InputSystem.Update()`, then pumps the player loop
+(`EditorApplication.QueuePlayerLoopUpdate` plus a repaint) so game code sees the change in the same
+call. Positional shorthand works (`unity-cli input key Space press` — the key and mode are taken by
+content, so either order reads the same) and flags always win over positional values. Only `state`
+and `reset` work outside play mode.
+
+Injected events are visible to the **new Input System** (`UnityEngine.InputSystem`, `InputAction`s on
+it) and never to legacy `UnityEngine.Input` or IMGUI `Event` code; every injection response repeats
+that in `legacy_input_note`.
+
+Response fields:
+
+| Field | Meaning |
+|-------|---------|
+| `consumed` | The device state now matches the request — `isPressed`/`value` read back after the pump |
+| `fresh_press_frames`, `fresh_release_frames` | How many input updates reported the control as freshly pressed/released. This is the view game code gets in `Update()` via `wasPressedThisFrame`/`wasReleasedThisFrame` |
+| `held_state`, `state` | The control read back while held, and after the final pump |
+| `focus.game_view_focused` | A Game View window currently has editor focus |
+| `focus.application_is_focused` | The flag the Input System's own focus gating reads; it can be true while the editor is not frontmost |
+| `focus.editor_focused` | Unity is the frontmost application (`EditorApplication.isFocused`) |
+| `settings` | InputSettings in effect, the values saved before the tool changed them, and `held_controls` |
+
+While the tool has anything injected that is not neutral, it also sets
+`InputSettings.editorInputBehaviorInPlayMode = AllDeviceInputAlwaysGoesToGameView` and
+`backgroundBehavior = IgnoreFocus`. With the project defaults the Input System defers keyboard and
+pointer events into editor updates (they never reach the player) and disables those devices on focus
+loss, which is what made queued events look dropped. The saved values are reported under `settings`,
+and are restored when nothing is held anymore, by `input reset`, and when play mode exits. If the
+project sets `InputSettings.UpdateMode.ProcessEventsManually`, the tool leaves `InputSystem.Update()`
+to the game instead of calling it itself.
+
+Injected state is *device state*, so the device's own backend can overwrite it later — a real mouse
+move replaces an injected position, for example. Read `input state` right after injecting, or inject
+again. Virtual devices the tool added (Gamepad, Touchscreen) are removed by `input reset` and are
+also dropped automatically when play mode exits.
+
+The connector keeps this tool in its own assembly
+(`unity-connector/Editor/InputInjection/`, define-constrained on `com.unity.inputsystem`), so projects
+without the Input System package compile unchanged and simply have no `input` tool.
 
 ### Console Logs
 

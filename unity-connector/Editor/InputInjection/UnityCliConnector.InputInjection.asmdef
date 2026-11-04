@@ -1,0 +1,23 @@
+{
+  "name": "UnityCliConnector.InputInjection",
+  "rootNamespace": "UnityCliConnector",
+  "references": [
+    "UnityCliConnector.Editor",
+    "Unity.InputSystem"
+  ],
+  "includePlatforms": ["Editor"],
+  "excludePlatforms": [],
+  "allowUnsafeCode": false,
+  "overrideReferences": false,
+  "precompiledReferences": [],
+  "autoReferenced": true,
+  "defineConstraints": ["UNITY_CLI_HAS_INPUTSYSTEM"],
+  "versionDefines": [
+    {
+      "name": "com.unity.inputsystem",
+      "expression": "1.0.0",
+      "define": "UNITY_CLI_HAS_INPUTSYSTEM"
+    }
+  ],
+  "noEngineReferences": false
+}

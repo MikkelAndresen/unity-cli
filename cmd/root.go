@@ -384,6 +384,14 @@ Editor Control:
   editor refresh [--force]      Refresh asset database (blocked in play mode unless forced)
   editor refresh --compile      Recompile scripts and wait until done
 
+Input Injection (Play mode, new Input System only):
+  input key <name> [press|release|tap]   e.g. input key Space press
+  input mouse --x 100 --y 200            Game view pixels; --button left --mode click
+  input gamepad|axis --control leftStick --x 1 --y 0
+  input touch --x 64 --y 128 --mode tap
+  input state                     Keys/mouse/gamepads as the Input System currently sees them
+  input reset                     Release injected state, drop virtual devices, restore settings
+
 Console:
   console                       Read error & warning logs (default)
   console --lines 20            Limit to N entries
@@ -459,6 +467,17 @@ Profiler:
   profiler status                Show profiler state
   profiler clear                 Clear all captured frames
 
+Input Injection (Play mode):
+  input key <name> [press|release|tap]   Keyboard key by Key enum name (Space, W, LeftShift)
+  input mouse [--x --y | --dx --dy] [--button left|right|middle|forward|back] [--mode ...]
+  input gamepad|axis --control <name> [--x --y | --value] [--mode set|press|release|tap]
+  input touch [--x --y] [--mode began|moved|stationary|ended|tap] [--index N]
+  input state                      Report pressed keys, mouse position, gamepads, focus, settings
+  input reset                      Release everything, remove virtual devices, restore settings
+
+  Injected state reaches the NEW Input System only; UnityEngine.Input and IMGUI Event code
+  will not see it. Requires play mode except for state/reset. See 'unity-cli input --help'.
+
 Modal Dialogs (macOS):
   modal                         Show the modal dialog blocking the editor
   modal answer --button <title> Click a button by title (or --index <n>)
@@ -502,6 +521,62 @@ Notes:
 
 func printTopicHelp(topic string) {
 	switch topic {
+	case "input":
+		fmt.Print(`Usage: unity-cli input <key|mouse|gamepad|axis|touch|state|reset> [options]
+
+Injects device state into the new Input System (com.unity.inputsystem) and pumps the player loop
+so the events are consumed inside the same call. No OS keystrokes are involved.
+
+Actions:
+  key <name> [press|release|tap]   Key enum name: Space, W, A, LeftShift, Enter, Digit1 …
+                                   Aliases: ctrl, alt, shift, cmd, esc, return, up, down.
+                                   Default mode: press. --hold_ms / --hold_frames tune a tap.
+  mouse                            --x/--y (Game view pixels, 0,0 = top-left), --dx/--dy,
+                                   --button left|right|middle|forward|back, --scroll_x/--scroll_y,
+                                   --mode press|release|tap|click|move|set.
+  gamepad / axis                   --control leftStick|rightStick|dpad|leftTrigger|buttonSouth|…
+                                   --x/--y for sticks, --value for buttons/triggers (default 1),
+                                   --mode set|press|release|tap. Adds a virtual Gamepad on demand.
+  touch                            --x/--y, --mode began|moved|stationary|ended|tap, --index N.
+                                   Adds a virtual Touchscreen on demand.
+  state                            Read-only: pressed keys, mouse position/buttons/scroll,
+                                   gamepad axes, touch phase, focus flags and InputSettings.
+  reset                            Release injected state, remove the virtual devices the tool
+                                   added, restore the InputSettings it changed.
+
+Response fields:
+  consumed                The device state now matches the request (isPressed / value read back).
+  fresh_press_frames      Input updates that saw the control as freshly pressed — what game code
+                          in Update() sees through wasPressedThisFrame. The was_pressed_this_frame
+                          field of 'state' is read after the tool's own input update, so it is
+                          usually false.
+  held_state / state      The control read back while held and after the final pump.
+  focus.*                game_view_focused (a Game View window has editor focus),
+                          application_is_focused (what the Input System's own focus gating uses),
+                          editor_focused (Unity is the frontmost application).
+  settings.*              InputSettings in effect, the values saved before the override, and
+                          held_controls — what is still keeping the override in place.
+
+Injected events are visible to the new Input System only. Code reading UnityEngine.Input or
+IMGUI Event sees nothing; every injection response repeats this in legacy_input_note.
+key/mouse/gamepad (or its alias axis)/touch require play mode; state and reset work any time. While
+the tool holds injected state it sets editorInputBehaviorInPlayMode=AllDeviceInputAlwaysGoesToGameView
+and backgroundBehavior=IgnoreFocus, because with the defaults the Input System defers or drops
+keyboard/pointer events while the Game View lacks focus. The values are restored when nothing is
+held anymore, on 'input reset', and when play mode exits.
+
+Examples:
+  unity-cli editor play --wait
+  unity-cli input key Space press
+  unity-cli input state
+  unity-cli input key Space release
+  unity-cli input key W tap --hold_ms 200
+  unity-cli input mouse --x 100 --y 200
+  unity-cli input mouse --button left --mode click
+  unity-cli input gamepad --control leftStick --x 1 --y 0
+  unity-cli input reset
+  unity-cli editor stop
+`)
 	case "editor":
 		fmt.Print(`Usage: unity-cli editor <play|stop|pause|refresh> [options]
 
