@@ -1,3 +1,6 @@
+using System;
+using System.Collections.Concurrent;
+using System.Threading;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
 using NUnit.Framework;
@@ -162,7 +165,7 @@ namespace UnityCliConnector.Tests
             Assert.IsTrue(running.TryBegin());
 
             var answered = RequestTracker.AnswerAllPending(
-                ticket => RequestTracker.BuildReloadError(ticket, "domain reload in progress, retry"));
+                ticket => RequestTracker.BuildReloadError(ticket, "the domain is reloading"));
             Assert.AreEqual(2, answered);
 
             var queuedError = (ErrorResponse)queued.Tcs.Task.Result;
@@ -170,17 +173,54 @@ namespace UnityCliConnector.Tests
             Assert.That(queuedError.message, Does.Contain("Retry it once Unity answers again"));
 
             var runningError = (ErrorResponse)running.Tcs.Task.Result;
-            Assert.That(runningError.message, Does.Contain("test_run was running when Unity stopped answering"));
-            Assert.That(runningError.message, Does.Contain("may have partially run"));
+            Assert.That(runningError.message, Does.Contain("test_run had already started when Unity stopped answering"));
+            Assert.That(runningError.message, Does.Contain("its return value was lost"));
+            Assert.That(runningError.message, Does.Not.Contain("never ran"),
+                "the handler was entered, so saying it did not run would be a lie");
 
-            foreach (var ticket in new[] { queued, running })
-            {
-                var json = JObject.Parse(JsonConvert.SerializeObject(ticket.Tcs.Task.Result));
-                Assert.AreEqual(ErrorCodes.DomainReload, json["data"]["code"].Value<string>());
-            }
+            var queuedJson = JObject.Parse(JsonConvert.SerializeObject(queued.Tcs.Task.Result));
+            var runningJson = JObject.Parse(JsonConvert.SerializeObject(running.Tcs.Task.Result));
+            Assert.AreEqual(ErrorCodes.DomainReload, queuedJson["data"]["code"].Value<string>());
+            Assert.AreEqual(ErrorCodes.ReloadDuringCommand, runningJson["data"]["code"].Value<string>(),
+                "a command that ran must not be reported as one the caller can safely repeat");
+            Assert.AreEqual(false, queuedJson["data"]["started"].Value<bool>());
+            Assert.AreEqual(true, runningJson["data"]["started"].Value<bool>());
 
-            Assert.AreEqual(true, JObject.Parse(JsonConvert.SerializeObject(running.Tcs.Task.Result))["data"]["started"].Value<bool>());
             Assert.IsFalse(queued.TryBegin(), "a request answered by the reload must not run later");
+        }
+
+        [Test]
+        public void BuildReloadError_KeepsTheRealResultOfACompletedRequest()
+        {
+            // A tool that had already returned keeps its own answer: the reload only answers what is
+            // still unanswered, so the caller gets the value rather than a reload notice for work that
+            // finished. RequestTracker.AwaitForAnswers is what gives the unwritten response its window.
+            var completed = RequestTracker.Track(new RequestTicket("exec", 60000));
+            Assert.IsTrue(completed.TryBegin());
+            Assert.IsTrue(completed.TryAnswer(new SuccessResponse("OK", 42)));
+
+            Assert.AreEqual(0, RequestTracker.AnswerAllPending(
+                ticket => RequestTracker.BuildReloadError(ticket, "the domain is reloading")));
+
+            var json = JObject.Parse(JsonConvert.SerializeObject(completed.Tcs.Task.Result));
+            Assert.AreEqual(true, json["success"].Value<bool>());
+            Assert.AreEqual(42, json["data"].Value<int>());
+        }
+
+        [Test]
+        public void BuildReloadError_AQuitAnswersWithoutAWaitableCode()
+        {
+            var running = RequestTracker.Track(new RequestTicket("exec", 60000));
+            Assert.IsTrue(running.TryBegin());
+
+            var error = RequestTracker.BuildReloadError(running, "the editor is quitting", quitting: true);
+            Assert.That(error.message, Does.Contain("exec had already started when Unity stopped answering"));
+            Assert.That(error.message, Does.Not.Contain("answers again once the reload is over"),
+                "a quit editor is not coming back, so the CLI must not be told to wait for it");
+
+            var json = JObject.Parse(JsonConvert.SerializeObject(error));
+            Assert.IsNull(json["data"]["code"].Value<string>());
+            Assert.AreEqual("stopped", json["data"]["heartbeat_state"].Value<string>());
         }
 
         [Test]
@@ -224,6 +264,23 @@ namespace UnityCliConnector.Tests
 
             RequestTracker.Complete(queued);
             Assert.IsNull(RequestTracker.Running);
+        }
+
+        [Test]
+        public void ReportSlowQueue_KeepsTheToolSOwnMetaAlongsideTheQueueNumbers()
+        {
+            // exec's meta says what the answer means (compile cache, and the play-mode change a snippet
+            // started). Overwriting it with the queue numbers hid that from every slow pickup.
+            var ticket = new RequestTicket("exec", 60000);
+            Thread.Sleep(HttpServer.SLOW_QUEUE_WAIT_MS + 150);
+            object result = new SuccessResponse("OK", 42, new { compile = "cached", state_change = "entered play mode" });
+
+            HttpServer.ReportSlowQueue(ticket, ref result);
+
+            var json = JObject.Parse(JsonConvert.SerializeObject(result));
+            Assert.AreEqual("cached", json["meta"]["compile"].Value<string>());
+            Assert.AreEqual("entered play mode", json["meta"]["state_change"].Value<string>());
+            Assert.That(json["meta"]["queue_wait_ms"].Value<int>(), Is.GreaterThanOrEqualTo(HttpServer.SLOW_QUEUE_WAIT_MS));
         }
 
         // ---- response serialization can never be the thing that leaves a connection unanswered ----

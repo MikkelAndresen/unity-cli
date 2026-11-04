@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -18,8 +19,9 @@ import (
 const compileReportMaxDiags = 20
 
 // editorCmd controls Unity play mode and asset database.
-// resolve is needed for compile polling so it can follow the current project instance.
-func editorCmd(args []string, send sendFn, resolve instanceResolver) (*client.CommandResponse, error) {
+// resolve is needed for play-mode confirmation (the heartbeat says which state the editor reached)
+// and for compile polling, so it can follow the current project instance.
+func editorCmd(ctx context.Context, args []string, send sendFn, resolve instanceResolver) (*client.CommandResponse, error) {
 	if len(args) == 0 {
 		return nil, fmt.Errorf("usage: unity-cli editor <play|stop|pause|refresh|quit|restart>")
 	}
@@ -31,15 +33,8 @@ func editorCmd(args []string, send sendFn, resolve instanceResolver) (*client.Co
 	}
 
 	switch action {
-	case "play":
-		_, wait := flags["wait"]
-		return send("manage_editor", map[string]interface{}{
-			"action":              "play",
-			"wait_for_completion": wait,
-		})
-
-	case "stop":
-		return send("manage_editor", map[string]interface{}{"action": "stop"})
+	case "play", "stop":
+		return editorPlayModeCmd(ctx, action, flags, send, resolve)
 
 	case "pause":
 		return send("manage_editor", map[string]interface{}{"action": "pause"})
@@ -140,6 +135,120 @@ func editorRefreshCompile(send sendFn, resolve instanceResolver, params map[stri
 		resp.Message = "Refresh and compilation completed."
 	}
 	return resp, nil
+}
+
+// playModeReport is what editor play/stop answers with: the state the command asked for, the state
+// the editor is in, and whether the connector's own answer survived the change.
+type playModeReport struct {
+	Action      string `json:"action"`
+	WantedState string `json:"wanted_state"`
+	EditorState string `json:"editor_state"`
+	EditorLabel string `json:"editor_label"`
+	Confirmed   bool   `json:"confirmed"`
+	// AnswerLost says the connector never got to report its own result (a domain reload the change
+	// itself caused took the response with it), which is why the heartbeat is the verdict here.
+	AnswerLost bool            `json:"answer_lost"`
+	WaitedMs   int64           `json:"waited_ms"`
+	Connector  json.RawMessage `json:"connector_reply,omitempty"`
+}
+
+// editorPlayModeCmd enters or leaves Play mode and answers with the state the editor is actually in.
+// The connector cannot confirm that itself when the change reloads the domain: the command that
+// starts a play-mode domain reload has its own answer taken down with the old domain (issue #10), so
+// the heartbeat is read back instead, and reaching the wanted state is what decides the exit code.
+func editorPlayModeCmd(ctx context.Context, action string, flags map[string]string, send sendFn,
+	resolve instanceResolver) (*client.CommandResponse, error) {
+
+	params := map[string]interface{}{"action": action}
+	if _, wait := flags["wait"]; wait {
+		params["wait_for_completion"] = true
+	}
+
+	resp, err := send("manage_editor", params)
+	lost := answerLostToReload(resp, err)
+	if err != nil && !lost {
+		return resp, err
+	}
+	if resp != nil && !resp.Success && !lost {
+		// The connector answered and said no (or refused the request): nothing is changing, so there
+		// is no state to wait for.
+		return resp, nil
+	}
+
+	if _, noWait := flags["no-wait"]; noWait {
+		return resp, err
+	}
+
+	wanted := "Edit mode"
+	want := []string{"ready"}
+	if action == "play" {
+		wanted = "Play mode"
+		want = []string{"playing", "paused"}
+	}
+
+	start := time.Now()
+	budget := cappedBudget(ctx, playModeConfirmTimeout)
+	inst, reached, waitErr := waitForEditorState(ctx, resolve, want, budget, "editor "+action)
+	if waitErr != nil {
+		return resp, waitErr
+	}
+
+	report := playModeReport{
+		Action:      action,
+		WantedState: wanted,
+		Confirmed:   reached,
+		AnswerLost:  lost,
+		WaitedMs:    time.Since(start).Milliseconds(),
+	}
+	if inst != nil {
+		report.EditorState = inst.State
+		report.EditorLabel = editorStateLabel(inst.State)
+	}
+	if resp != nil && len(resp.Data) > 0 && string(resp.Data) != "null" {
+		report.Connector = resp.Data
+	}
+	body, err := json.Marshal(report)
+	if err != nil {
+		return resp, fmt.Errorf("failed to build the play mode report: %w", err)
+	}
+
+	where := "no heartbeat"
+	if inst != nil {
+		where = fmt.Sprintf("%s (heartbeat %q, port %d)", report.EditorLabel, inst.State, inst.Port)
+	}
+
+	if reached {
+		message := fmt.Sprintf("editor %s: Unity is in %s.", action, where)
+		if lost {
+			message = fmt.Sprintf("editor %s: Unity's own answer was lost in the reload, but it is in %s now.",
+				action, where)
+		}
+		return &client.CommandResponse{Success: true, Message: message, Data: body}, nil
+	}
+
+	message := fmt.Sprintf("editor %s: Unity did not reach %s within %s; it is in %s.",
+		action, wanted, budget.Truncate(time.Second), where)
+	if lost {
+		message = fmt.Sprintf("editor %s: the change was asked for and Unity's answer was lost in the reload, but it is in %s, not %s.",
+			action, where, wanted)
+	}
+	return &client.CommandResponse{Success: false, Message: message, Data: body},
+		fmt.Errorf("editor %s did not reach %s (Unity is in %s)", action, wanted, where)
+}
+
+// cappedBudget is the wait's own timeout or the caller's remaining --timeout, whichever is smaller:
+// a wait that outlives the invocation deadline is cut short, and quoting the full default budget in
+// the failure line would point at a number the caller never had.
+func cappedBudget(ctx context.Context, budget time.Duration) time.Duration {
+	if d, ok := ctx.Deadline(); ok {
+		if remaining := time.Until(d); remaining < budget {
+			budget = remaining
+		}
+	}
+	if budget < 0 {
+		return 0
+	}
+	return budget
 }
 
 // compileReportDiagnostics reads this compile's errors, retrying while the editor is still back

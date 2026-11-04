@@ -191,7 +191,7 @@ func Execute() error {
 
 	switch category {
 	case "editor":
-		resp, err = editorCmd(subArgs, send, resolve)
+		resp, err = editorCmd(ctx, subArgs, send, resolve)
 	case "test":
 		currentInst, resolveErr := resolve()
 		if resolveErr != nil {
@@ -239,22 +239,58 @@ func Execute() error {
 		}
 	}
 
+	// A call whose answer was lost to a reload ended with the editor mid-change and no verdict, so the
+	// heartbeat is read back: whether the change landed is the caller's next question. Commands that
+	// already report the state in their own words (editor play/stop, verify, test, build, wait) are out.
+	lostToReload := answerLostToReload(resp, err) && stateNoteApplies(category)
+
+	// A call that never got a response object has its report carried by the returned error, so the
+	// state line goes into that error rather than onto stderr before it.
+	if lostToReload && resp == nil && err != nil {
+		if note := stateAfterReloadNote(ctx, resolve); note != "" {
+			err = fmt.Errorf("%w\n%s", err, strings.TrimRight(note, "\n"))
+		}
+		lostToReload = false
+	}
+
+	printStateAfterReload := func() {
+		if !lostToReload {
+			return
+		}
+		if note := stateAfterReloadNote(ctx, resolve); note != "" {
+			fmt.Fprint(os.Stderr, note)
+		}
+	}
+
 	if err != nil {
 		// A command may answer with a report and still fail (editor refresh --compile prints its
 		// compile report, then exits non-zero), so a failing exit code must not hide the JSON.
 		if resp != nil {
 			printResponse(resp)
+			printStateAfterReload()
 		}
 		return err
 	}
 
 	printResponse(resp)
+	printStateAfterReload()
 
 	if !resp.Success {
 		exitNow(1)
 	}
 
 	return nil
+}
+
+// stateNoteApplies excludes the commands that own their own reload wait: they would print the state
+// twice, with different budgets, for the same reload.
+func stateNoteApplies(category string) bool {
+	switch category {
+	case "editor", "test", "verify", "build", waitCategory:
+		return false
+	default:
+		return true
+	}
 }
 
 // sendFn is the function signature for sending a command to Unity.
@@ -584,8 +620,9 @@ func printHelp() {
 Usage: unity-cli <command> [subcommand] [options]
 
 Editor Control:
-  editor play [--wait]          Enter play mode (--wait blocks until fully entered)
-  editor stop                   Exit play mode
+  editor play [--wait|--no-wait]
+                                Enter play mode; answers once the editor reports Play mode
+  editor stop [--no-wait]       Exit play mode; answers once the editor reports Edit mode
   editor pause                  Toggle pause/resume (play mode only)
   editor refresh [--force]      Refresh asset database (blocked in play mode unless forced)
   editor refresh --compile      Recompile scripts and wait until done
@@ -791,7 +828,9 @@ Notes:
   - A subcommand flag other than --params may be given once; repeating it is an error, not a silent overwrite
   - Run 'list' to see all available tools
   - Every accepted command gets one answer: a queued command that the main thread never starts is
-    answered as main_thread_busy, and one still queued when Unity reloads as domain_reload (retry it)
+    answered as main_thread_busy, one still queued when Unity reloads as domain_reload (retry it),
+    and one whose tool was already running as reload_during_command (it ran; only its return value
+    was lost, so check the state before repeating it)
 `)
 }
 
@@ -857,10 +896,16 @@ Examples:
 		fmt.Print(`Usage: unity-cli editor <play|stop|pause|refresh|quit|restart> [options]
 
 Subcommands:
-  play [--wait]       Enter play mode
-                      --wait blocks until Unity fully enters play mode.
-                      Without --wait, returns immediately after requesting.
-  stop                Exit play mode. No effect if not playing.
+  play [--wait]       Enter play mode.
+                      Answers once the heartbeat reports the editor is in Play mode, which is
+                      how a change that reloads the domain is confirmed: the connector that
+                      asked for the reload cannot report its own result across it.
+                      --wait also asks the connector to wait for the state change itself
+                      (skipped when that change reloads the domain).
+  stop [--no-wait]    Exit play mode. No effect if not playing.
+                      Confirmed from the heartbeat like play.
+    --no-wait         Return as soon as the change is requested, without reading the
+                      resulting state back.
   pause               Toggle pause. Only works during play mode.
   refresh             Refresh AssetDatabase (reimport changed assets).
                       Blocked in play mode unless --force is set.

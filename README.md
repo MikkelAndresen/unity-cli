@@ -178,11 +178,15 @@ and states that the command did not run. A request still queued when Unity reloa
 # Enter play mode
 unity-cli editor play
 
-# Enter play mode and wait until fully loaded
+# Enter play mode and have the Connector itself wait for the state change (skipped when that
+# change reloads the domain — the CLI confirms the state from the heartbeat either way)
 unity-cli editor play --wait
 
 # Stop play mode
 unity-cli editor stop
+
+# Request the change without reading the resulting state back
+unity-cli editor stop --no-wait
 
 # Toggle pause (only works during play mode)
 unity-cli editor pause
@@ -196,6 +200,13 @@ unity-cli editor refresh --compile
 # Force refresh while in play mode
 unity-cli editor refresh --force
 ```
+
+`editor play` and `editor stop` answer with a report (`action`, `wanted_state`, `editor_state`,
+`editor_label`, `confirmed`, `answer_lost`, `waited_ms`) and exit non-zero if the editor never reached
+the requested state. Entering or leaving Play mode reloads the domain in most projects, and a command
+that starts a domain reload cannot report its own result across it, so the Connector defers the state
+change one update tick and the CLI confirms it from the heartbeat (see
+[issue #10 write-up](docs/bugs/10-reload-loses-response.md)).
 
 `editor refresh --compile` waits for the compilation and answers with one report instead of a bare
 `refresh_triggered`: `compile_requested`, `compile_succeeded`, `error_count`, `errors[]`
@@ -1050,10 +1061,13 @@ be late or never come. The Connector bounds the wait instead of leaving the conn
   `queue_deadline_ms` parameter overrides both (clamped to 0.5–600 s).
 - The deadline bounds the wait for the main thread to *start* the command, never the command's runtime.
   A running tool is bounded only by your `--timeout`.
-- On `beforeAssemblyReload` and on quit, every in-flight request is answered first
-  (`domain reload in progress, retry`), and new main-thread requests are refused until a listener is
-  up again. Tools marked `RunOffMainThread` (`modal`, `build_status`, `compile_diagnostics`, …) stay
-  callable throughout.
+- On `beforeAssemblyReload` and on quit, every in-flight request is answered first, and new
+  main-thread requests are refused until a listener is up again. A request that had not started is
+  answered `domain_reload` (retry it); one whose tool handler was already running is answered
+  `reload_during_command` — it ran, only its return value went down with the old domain. A request
+  whose tool had already returned keeps its own result: the reload wait gives the unwritten response
+  a bounded window to reach the socket. Tools marked `RunOffMainThread` (`modal`, `build_status`,
+  `compile_diagnostics`, …) stay callable throughout.
 - A request that was already answered is skipped when its turn comes, so it cannot apply side effects
   after the caller was told it did not run.
 
@@ -1073,8 +1087,14 @@ unity-cli exec --params '{"code":"AssetDatabase.Refresh(); return 1;","queue_dea
 | `data.code` | what happened | did the command run? |
 |-------------|---------------|----------------------|
 | `main_thread_busy` | the main thread never picked it up | no — nothing changed |
-| `domain_reload` | Unity reloaded or quit while it was queued (the message says so if it had already started) | no, unless the message says it may have partially run |
+| `domain_reload` | Unity reloaded or quit while the command was still queued | no — safe to repeat |
+| `reload_during_command` | Unity reloaded while the command was running | yes, at least partly — check the state before repeating it |
 | `serialization_failed` | the tool's result could not be serialized | yes — its effects stand, only the returned value is lost |
+
+For `reload_during_command` the CLI then reads the heartbeat back and prints where the editor ended up,
+so the caller sees `state: Unity is back: Edit mode (heartbeat "ready", port 8090)` instead of having
+to ask. Commands that own their own reload wait (`editor play/stop`, `editor refresh --compile`,
+`test`, `verify`, `build`, `wait`) report it themselves.
 
 A slow but successful pickup says so in `meta`: `--meta` shows `queue_wait_ms` and `queue_depth` once
 the wait exceeded a second.

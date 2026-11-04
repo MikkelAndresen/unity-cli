@@ -38,8 +38,7 @@ namespace UnityCliConnector
         /// A main-thread request that waited longer than this reports its wait in `meta`: without it a
         /// slow pickup leaves no trace, and "slow" is indistinguishable from "about to be answered
         /// late" after the fact.
-        const int SLOW_QUEUE_WAIT_MS = 1000;
-
+        internal const int SLOW_QUEUE_WAIT_MS = 1000;
         static HttpListener s_Listener;
         static CancellationTokenSource s_Cts;
         static int s_Port;
@@ -202,14 +201,20 @@ namespace UnityCliConnector
         static void OnBeforeAssemblyReload()
         {
             s_RefusingWork = true;
-            AnswerPending("domain reload in progress, retry", ErrorCodes.DomainReload);
+            AnswerPending("the domain is reloading", quitting: false);
             RequestTracker.AwaitForAnswers(PENDING_ANSWER_WAIT_MS);
             StopListener();
         }
 
-        static void AnswerPending(string why, string code)
+        /// <summary>
+        /// Answers every tracked request that has no answer yet. A request whose tool had already
+        /// returned keeps its own answer (the ticket is answered once), so what is left to do for it
+        /// is the <see cref="RequestTracker.AwaitForAnswers"/> window that follows: the response is
+        /// written from the request thread, and closing the listener first would drop it.
+        /// </summary>
+        static void AnswerPending(string why, bool quitting)
         {
-            var answered = RequestTracker.AnswerAllPending(ticket => RequestTracker.BuildReloadError(ticket, why, code));
+            var answered = RequestTracker.AnswerAllPending(ticket => RequestTracker.BuildReloadError(ticket, why, quitting));
             if (answered > 0)
                 Debug.Log($"[UnityCliConnector] Answered {answered} in-flight request(s): {why}");
         }
@@ -217,8 +222,8 @@ namespace UnityCliConnector
         static void Stop()
         {
             var port = s_Port;
-            // No error code: the editor is gone, so "wait for it and retry" would be a lie.
-            AnswerPending("the editor is quitting", null);
+            // No error code for a quit: the editor is gone, so "wait for it and retry" would be a lie.
+            AnswerPending("the editor is quitting", quitting: true);
             RequestTracker.AwaitForAnswers(PENDING_ANSWER_WAIT_MS);
             StopListener();
             Heartbeat.MarkStopped();
@@ -452,7 +457,7 @@ namespace UnityCliConnector
                 ModalWatchdog.Current?.title);
         }
 
-        static void ReportSlowQueue(RequestTicket ticket, ref object result)
+        internal static void ReportSlowQueue(RequestTicket ticket, ref object result)
         {
             if (result is not SuccessResponse success) return;
 
@@ -460,8 +465,11 @@ namespace UnityCliConnector
             if (waited < SLOW_QUEUE_WAIT_MS) return;
 
             // Merged into the tool's own meta (exec reports its compile cache there) so a slow pickup
-            // stays visible in the answer, not only in the failure paths.
-            var meta = success.meta as JObject ?? new JObject();
+            // stays visible in the answer, not only in the failure paths. The tool's meta is a CLR
+            // object rather than a JObject, so it has to be converted before anything is added to it —
+            // `as JObject` would silently replace it and drop the tool's own keys.
+            var meta = success.meta as JObject
+                ?? (success.meta == null ? new JObject() : JObject.FromObject(success.meta));
             meta["queue_wait_ms"] = waited;
             meta["queue_depth"] = RequestTracker.PendingCount;
             success.meta = meta;

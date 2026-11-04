@@ -31,6 +31,13 @@ func TestConnectorErrorHint(t *testing.T) {
 			want: "the command did not reach a tool handler",
 		},
 		{
+			name: "the command was running when the reload came",
+			resp: &client.CommandResponse{Success: false,
+				Message: "exec had already started when Unity stopped answering (the domain is reloading)",
+				Data:    json.RawMessage(`{"code":"reload_during_command","command":"exec","started":true}`)},
+			want: "the command had already started when Unity reloaded",
+		},
+		{
 			name: "the result could not be serialized",
 			resp: &client.CommandResponse{Success: false,
 				Message: "exec returned a value that could not be serialized",

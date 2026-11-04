@@ -19,7 +19,7 @@ namespace UnityCliConnector.Tools
             [ToolParameter("Action to perform: play, stop, pause, refresh, set_active_tool, add_tag, remove_tag, add_layer, remove_layer", Required = true)]
             public string Action { get; set; }
 
-            [ToolParameter("Wait for action to complete before responding")]
+            [ToolParameter("Wait for action to complete before responding. For play/stop this is skipped when the change reloads the domain; the CLI confirms that state from the heartbeat")]
             public bool WaitForCompletion { get; set; }
 
             [ToolParameter("Tool name (required for set_active_tool action)")]
@@ -48,17 +48,8 @@ namespace UnityCliConnector.Tools
             switch (action)
             {
                 case "play":
-                    if (!EditorApplication.isPlaying)
-                    {
-                        EditorApplication.isPlaying = true;
-                        if (waitForCompletion)
-                        {
-                            await WaitForPlayModeStateAsync(PlayModeStateChange.EnteredPlayMode, TimeSpan.FromSeconds(PlayModeTimeoutSeconds));
-                            return new SuccessResponse("Entered play mode (confirmed).");
-                        }
-                        return new SuccessResponse("Entered play mode.");
-                    }
-                    return new SuccessResponse("Already in play mode.");
+                case "stop":
+                    return await ChangePlayModeAsync(action, waitForCompletion);
 
                 case "pause":
                     if (EditorApplication.isPlaying)
@@ -67,19 +58,6 @@ namespace UnityCliConnector.Tools
                         return new SuccessResponse(EditorApplication.isPaused ? "Game paused." : "Game resumed.");
                     }
                     return new ErrorResponse("Cannot pause/resume: Not in play mode.");
-
-                case "stop":
-                    if (EditorApplication.isPlaying)
-                    {
-                        EditorApplication.isPlaying = false;
-                        if (waitForCompletion)
-                        {
-                            await WaitForPlayModeStateAsync(PlayModeStateChange.EnteredEditMode, TimeSpan.FromSeconds(PlayModeTimeoutSeconds));
-                            return new SuccessResponse("Exited play mode (confirmed).");
-                        }
-                        return new SuccessResponse("Exited play mode.");
-                    }
-                    return new SuccessResponse("Already stopped (not in play mode).");
 
                 case "set_active_tool":
                     var toolNameResult = p.GetRequired("tool_name", "'tool_name' parameter required.");
@@ -164,6 +142,44 @@ namespace UnityCliConnector.Tools
                 }
                 return new ErrorResponse($"User layer '{nameResult.Value}' not found.");
             }
+        }
+
+        /// <summary>
+        /// Enters or leaves Play mode. The state change is deferred one update tick so the answer is
+        /// written first: unless Enter Play Mode Options skipped it, the change reloads the domain, and
+        /// a reloading connector cannot promise that an already-decided response reached the socket.
+        /// With a reload coming, the confirmation is the caller's job — the CLI reads the target state
+        /// back from the heartbeat (cmd/playmode.go).
+        /// </summary>
+        private static async Task<object> ChangePlayModeAsync(string action, bool waitForCompletion)
+        {
+            var play = action == "play";
+            if (EditorApplication.isPlaying == play)
+                return new SuccessResponse(play ? "Already in play mode." : "Already stopped (not in play mode).");
+
+            var reloads = PlayModeTransitions.DomainReloadExpected();
+            PlayModeTransitions.ApplyOnNextTick(play);
+            var report = new { action, scheduled = true, domain_reload_expected = reloads };
+
+            if (!waitForCompletion)
+            {
+                return new SuccessResponse(play ? "Entering play mode." : "Exiting play mode.", report);
+            }
+
+            if (reloads)
+            {
+                // Awaiting the state change here would put this handler inside the reload it started,
+                // so the answer would come back as reload_during_command instead of a confirmation.
+                return new SuccessResponse(
+                    $"{(play ? "Entering" : "Exiting")} play mode; Unity reloads its domain for this, "
+                    + "so the state is confirmed from the heartbeat, not from this response.",
+                    report);
+            }
+
+            await WaitForPlayModeStateAsync(
+                play ? PlayModeStateChange.EnteredPlayMode : PlayModeStateChange.EnteredEditMode,
+                TimeSpan.FromSeconds(PlayModeTimeoutSeconds));
+            return new SuccessResponse(play ? "Entered play mode (confirmed)." : "Exited play mode (confirmed).", report);
         }
 
         private static Task WaitForPlayModeStateAsync(PlayModeStateChange targetState, TimeSpan timeout)

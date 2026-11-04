@@ -8,9 +8,10 @@ import (
 // unity-connector/Editor/Core/ErrorCodes.cs; the connector decides the code, the CLI decides what
 // the caller should do next.
 const (
-	codeMainThreadBusy    = "main_thread_busy"
-	codeDomainReload      = "domain_reload"
-	codeSerializationFail = "serialization_failed"
+	codeMainThreadBusy      = "main_thread_busy"
+	codeDomainReload        = "domain_reload"
+	codeReloadDuringCommand = "reload_during_command"
+	codeSerializationFail   = "serialization_failed"
 )
 
 // connectorErrorHint turns the connector's reason for answering without a result into the next step.
@@ -22,6 +23,8 @@ func connectorErrorHint(resp *client.CommandResponse) string {
 		return "the command did not run and nothing changed; run 'unity-cli wait' until the editor is idle, then repeat it"
 	case codeDomainReload:
 		return "the command did not reach a tool handler; run 'unity-cli wait' for the reloaded editor, then repeat it"
+	case codeReloadDuringCommand:
+		return "the command had already started when Unity reloaded, so its effects may be applied and only its return value was lost; check 'unity-cli status' before repeating it"
 	case codeSerializationFail:
 		return "the command ran and its effects stand; only the returned value was lost, so return something smaller (a string, or an object of scalars)"
 	default:
