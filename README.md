@@ -343,9 +343,12 @@ cut the reply says what and how much, so a caller knows how to widen the query i
 ```
 
 `entries` is oldest-first and holds the newest entries the caps allowed; `entries_total` counts the
-entries matching `--type`, before any cap. The list being read is the Console window's own list: with
-the window's Log/Warning toggles off those entries are not in it at all, so `--type log` answers empty
-in an editor that logged plenty.
+entries matching `--type`, before any cap. The tool temporarily turns on the Console window's
+Log/Warning/Error toggles, clears its search text and disables collapse for the read, then restores
+the window exactly as it was. `--type` therefore narrows every entry, not just the ones the window
+currently shows. When anything had to be overridden the reply says so in `console_window_filter`
+(e.g. `{"note":"ignored Console window filter: log/warning hidden, search 'foo'","log_hidden":true,
+"warning_hidden":true,"error_hidden":false,"search":"foo","collapsed":false}`).
 
 Before the caps release `console` returned a bare array of
 all matching entries and `stacktrace=user` filtered with a hardcoded list of names that Burst and

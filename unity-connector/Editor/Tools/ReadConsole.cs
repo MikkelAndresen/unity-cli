@@ -25,6 +25,8 @@ namespace UnityCliConnector.Tools
         private static MethodInfo _startGettingEntriesMethod, _endGettingEntriesMethod, _clearMethod, _getCountMethod, _getEntryMethod;
         private static FieldInfo _modeField, _messageField, _fileField, _lineField;
         private static Type _logEntryType;
+        private static PropertyInfo _consoleFlagsProperty;
+        private static MethodInfo _getFilteringTextMethod, _setFilteringTextMethod;
 
         static ReadConsole()
         {
@@ -46,6 +48,12 @@ namespace UnityCliConnector.Tools
                 _getEntryMethod = logEntriesType.GetMethod("GetEntryInternal", sf)
                     ?? throw new Exception("Method not found: LogEntries.GetEntryInternal");
 
+                // Optional: older Unity versions may not expose the Console window filter. The read
+                // still works then, it just cannot widen what the window is currently showing.
+                _consoleFlagsProperty = logEntriesType.GetProperty("consoleFlags", sf);
+                _getFilteringTextMethod = logEntriesType.GetMethod("GetFilteringText", sf);
+                _setFilteringTextMethod = logEntriesType.GetMethod("SetFilteringText", sf);
+
                 _logEntryType = typeof(EditorApplication).Assembly.GetType("UnityEditor.LogEntry")
                     ?? throw new Exception("Could not find UnityEditor.LogEntry");
                 _modeField = _logEntryType.GetField("mode", inf)
@@ -61,6 +69,8 @@ namespace UnityCliConnector.Tools
                 _startGettingEntriesMethod = _endGettingEntriesMethod = _clearMethod = _getCountMethod = _getEntryMethod = null;
                 _modeField = _messageField = _fileField = _lineField = null;
                 _logEntryType = null;
+                _consoleFlagsProperty = null;
+                _getFilteringTextMethod = _setFilteringTextMethod = null;
             }
         }
 
@@ -156,6 +166,7 @@ namespace UnityCliConnector.Tools
             bool cutByBytes = false;
             int framesOmitted = 0, framesOverCap = 0, charsOmitted = 0, bytes = 0;
 
+            var filterScope = EnterConsoleFilterOverride();
             try
             {
                 _startGettingEntriesMethod.Invoke(null, null);
@@ -204,6 +215,7 @@ namespace UnityCliConnector.Tools
             finally
             {
                 try { _endGettingEntriesMethod.Invoke(null, null); } catch { }
+                filterScope.Dispose();
             }
 
             texts.Reverse();
@@ -217,18 +229,19 @@ namespace UnityCliConnector.Tools
             string summary = truncatedBy.Count == 0
                 ? $"Retrieved {texts.Count} entries."
                 : $"Retrieved {texts.Count} of {matched.Count} entries (cut by {string.Join(",", truncatedBy)}): pass --full for everything.";
+            if (filterScope.Note != null) summary += $" ({filterScope.Note})";
 
-            return new SuccessResponse(summary, new
+            var data = new Dictionary<string, object>
             {
-                entries = texts,
-                entries_total = matched.Count,
-                entries_returned = texts.Count,
-                entries_omitted = matched.Count - texts.Count,
-                frames_omitted = framesOmitted,
-                chars_omitted = charsOmitted,
-                truncated = truncatedBy.Count > 0,
-                truncated_by = truncatedBy,
-                limits = new
+                ["entries"] = texts,
+                ["entries_total"] = matched.Count,
+                ["entries_returned"] = texts.Count,
+                ["entries_omitted"] = matched.Count - texts.Count,
+                ["frames_omitted"] = framesOmitted,
+                ["chars_omitted"] = charsOmitted,
+                ["truncated"] = truncatedBy.Count > 0,
+                ["truncated_by"] = truncatedBy,
+                ["limits"] = new
                 {
                     lines = limits.Lines,
                     frames = limits.Frames,
@@ -236,7 +249,126 @@ namespace UnityCliConnector.Tools
                     max_bytes = limits.MaxBytes,
                     stacktrace = StackTraceFilter.ModeName(mode),
                 },
-            });
+            };
+            if (filterScope.Changed) data["console_window_filter"] = filterScope.Details;
+            return new SuccessResponse(summary, data);
+        }
+
+        // Matches UnityEditor.ConsoleWindow+ConsoleFlags. The Console window writes them to
+        // LogEntries.consoleFlags, which is also what GetCount/GetEntryInternal filter on.
+        private const int CollapseFlag = 1 << 0;
+        private const int LogLevelLogFlag = 1 << 7;
+        private const int LogLevelWarningFlag = 1 << 8;
+        private const int LogLevelErrorFlag = 1 << 9;
+        private const int LogLevelMask = LogLevelLogFlag | LogLevelWarningFlag | LogLevelErrorFlag;
+
+        /// Temporarily widens the Console window's view to every entry. Save/restore happens here
+        /// rather than in the caller so console reads and the compile-diagnostics fallback cannot
+        /// drift apart. No-op when the filter API is unavailable.
+        private static ConsoleFilterScope EnterConsoleFilterOverride()
+        {
+            if (_consoleFlagsProperty == null) return ConsoleFilterScope.None;
+
+            int savedFlags;
+            try { savedFlags = (int)_consoleFlagsProperty.GetValue(null); }
+            catch { return ConsoleFilterScope.None; }
+
+            bool haveFilter = _getFilteringTextMethod != null && _setFilteringTextMethod != null;
+            string savedFilter = "";
+            if (haveFilter)
+            {
+                try { savedFilter = _getFilteringTextMethod.Invoke(null, null) as string ?? ""; }
+                catch { haveFilter = false; }
+            }
+
+            var hidden = new List<string>();
+            if ((savedFlags & LogLevelLogFlag) == 0) hidden.Add("log");
+            if ((savedFlags & LogLevelWarningFlag) == 0) hidden.Add("warning");
+            if ((savedFlags & LogLevelErrorFlag) == 0) hidden.Add("error");
+            bool collapsed = (savedFlags & CollapseFlag) != 0;
+
+            int desiredFlags = (savedFlags | LogLevelMask) & ~CollapseFlag;
+            bool changeFlags = desiredFlags != savedFlags;
+            bool changeFilter = haveFilter && !string.IsNullOrEmpty(savedFilter);
+
+            bool flagsSet = false, filterSet = false;
+            if (changeFlags)
+            {
+                try { _consoleFlagsProperty.SetValue(null, desiredFlags); flagsSet = true; }
+                catch { }
+            }
+            if (changeFilter)
+            {
+                try { _setFilteringTextMethod.Invoke(null, new object[] { "" }); filterSet = true; }
+                catch { }
+            }
+
+            if (!flagsSet && !filterSet) return ConsoleFilterScope.None;
+            return new ConsoleFilterScope(savedFlags, savedFilter, flagsSet, filterSet, hidden, collapsed);
+        }
+
+        private sealed class ConsoleFilterScope : IDisposable
+        {
+            public static readonly ConsoleFilterScope None = new ConsoleFilterScope();
+
+            private readonly int _savedFlags;
+            private readonly string _savedFilter;
+            private readonly bool _restoreFlags;
+            private readonly bool _restoreFilter;
+            private readonly List<string> _hidden;
+            private readonly bool _collapsed;
+
+            private ConsoleFilterScope()
+            {
+                _hidden = new List<string>();
+            }
+
+            public ConsoleFilterScope(int savedFlags, string savedFilter, bool restoreFlags, bool restoreFilter,
+                List<string> hidden, bool collapsed)
+            {
+                _savedFlags = savedFlags;
+                _savedFilter = savedFilter;
+                _restoreFlags = restoreFlags;
+                _restoreFilter = restoreFilter;
+                _hidden = hidden;
+                _collapsed = collapsed;
+            }
+
+            public bool Changed => _restoreFlags || _restoreFilter;
+
+            public string Note
+            {
+                get
+                {
+                    var parts = new List<string>();
+                    if (_restoreFlags && _hidden.Count > 0) parts.Add(string.Join("/", _hidden) + " hidden");
+                    if (_restoreFilter && !string.IsNullOrEmpty(_savedFilter)) parts.Add($"search '{_savedFilter}'");
+                    if (_restoreFlags && _collapsed) parts.Add("collapse on");
+                    return parts.Count == 0 ? null : "ignored Console window filter: " + string.Join(", ", parts);
+                }
+            }
+
+            public object Details => new
+            {
+                note = Note,
+                log_hidden = _restoreFlags && _hidden.Contains("log"),
+                warning_hidden = _restoreFlags && _hidden.Contains("warning"),
+                error_hidden = _restoreFlags && _hidden.Contains("error"),
+                search = _restoreFilter && !string.IsNullOrEmpty(_savedFilter) ? _savedFilter : null,
+                collapsed = _restoreFlags && _collapsed,
+            };
+
+            public void Dispose()
+            {
+                if (_restoreFlags)
+                {
+                    try { _consoleFlagsProperty.SetValue(null, _savedFlags); } catch { }
+                }
+                if (_restoreFilter)
+                {
+                    try { _setFilteringTextMethod.Invoke(null, new object[] { _savedFilter }); } catch { }
+                }
+            }
         }
 
         private const int ErrorMask =
@@ -278,6 +410,7 @@ namespace UnityCliConnector.Tools
                 _modeField == null || _messageField == null || _logEntryType == null)
                 return false;
 
+            var filterScope = EnterConsoleFilterOverride();
             try
             {
                 _startGettingEntriesMethod.Invoke(null, null);
@@ -297,6 +430,7 @@ namespace UnityCliConnector.Tools
             finally
             {
                 try { _endGettingEntriesMethod.Invoke(null, null); } catch { }
+                filterScope.Dispose();
             }
         }
 

@@ -1,7 +1,11 @@
+using System;
+using System.Linq;
+using System.Reflection;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
 using NUnit.Framework;
 using UnityCliConnector.Tools;
+using UnityEditor;
 using UnityEngine;
 using UnityEngine.TestTools;
 
@@ -37,6 +41,46 @@ namespace UnityCliConnector.Tests
             "FoW.Chain:Step3 () (at Assets/Chain.cs:4)\n" +
             "FoW.Chain:Step4 () (at Assets/Chain.cs:5)\n" +
             "FoW.Chain:Step5 () (at Assets/Chain.cs:6)";
+
+        // UnityEditor.ConsoleWindow+ConsoleFlags, read/written through LogEntries.consoleFlags.
+        private const int CollapseFlag = 1 << 0;
+        private const int LogLevelLogFlag = 1 << 7;
+        private const int LogLevelWarningFlag = 1 << 8;
+        private const int LogLevelErrorFlag = 1 << 9;
+        private const int LogLevelMask = LogLevelLogFlag | LogLevelWarningFlag | LogLevelErrorFlag;
+
+        private static readonly Type LogEntriesType =
+            typeof(EditorApplication).Assembly.GetType("UnityEditor.LogEntries");
+        private static readonly BindingFlags StaticAny =
+            BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic;
+        private static readonly PropertyInfo ConsoleFlagsProperty =
+            LogEntriesType?.GetProperty("consoleFlags", StaticAny);
+        private static readonly MethodInfo GetFilteringTextMethod =
+            LogEntriesType?.GetMethod("GetFilteringText", StaticAny);
+        private static readonly MethodInfo SetFilteringTextMethod =
+            LogEntriesType?.GetMethod("SetFilteringText", StaticAny);
+
+        private int _savedConsoleFlags;
+        private string _savedFilteringText;
+        private bool _savedConsoleFilter;
+
+        [SetUp]
+        public void SaveConsoleWindowFilter()
+        {
+            if (ConsoleFlagsProperty == null || GetFilteringTextMethod == null || SetFilteringTextMethod == null)
+                return;
+            _savedConsoleFlags = (int)ConsoleFlagsProperty.GetValue(null);
+            _savedFilteringText = (string)GetFilteringTextMethod.Invoke(null, null) ?? "";
+            _savedConsoleFilter = true;
+        }
+
+        [TearDown]
+        public void RestoreConsoleWindowFilter()
+        {
+            if (!_savedConsoleFilter) return;
+            ConsoleFlagsProperty.SetValue(null, _savedConsoleFlags);
+            SetFilteringTextMethod.Invoke(null, new object[] { _savedFilteringText });
+        }
 
         // The test runner gives SetUp/TearDown their own LogScope, so a flag set in SetUp does not
         // reach the scope that records the test body's logs; each test sets it itself.
@@ -176,6 +220,93 @@ namespace UnityCliConnector.Tests
 
             Assert.IsNotNull(response);
             StringAssert.Contains("stacktrace", response.message);
+        }
+
+        [Test]
+        public void HiddenLogAndWarningTogglesAndSearch_AreIgnoredForTheRead_AndRestored()
+        {
+            IgnoreFailingLogs();
+            RequireConsoleFilterBindings();
+            const string marker = Marker + "_window_filter";
+            const string search = "unitycli_filter_that_matches_nothing";
+            Debug.Log(marker);
+            Debug.LogWarning(marker + "_warn");
+            Debug.LogError(marker + "_err");
+
+            int hiddenFlags = (_savedConsoleFlags | LogLevelErrorFlag | CollapseFlag) &
+                              ~(LogLevelLogFlag | LogLevelWarningFlag);
+            SetConsoleWindowFilter(hiddenFlags, search);
+
+            var data = Run(new JObject
+            {
+                ["type"] = "error,warning,log",
+                ["lines"] = 200,
+                ["stacktrace"] = "none",
+            });
+
+            var entries = data["entries"].Values<string>().ToList();
+            Assert.That(entries, Has.Some.EqualTo(marker), "hidden log toggle must not hide the entry");
+            Assert.That(entries, Has.Some.EqualTo(marker + "_warn"), "hidden warning toggle must not hide the entry");
+            Assert.That(entries, Has.Some.EqualTo(marker + "_err"));
+
+            Assert.AreEqual(hiddenFlags, (int)ConsoleFlagsProperty.GetValue(null), "flags must be restored");
+            Assert.AreEqual(search, (string)GetFilteringTextMethod.Invoke(null, null), "search must be restored");
+
+            var reported = data["console_window_filter"];
+            Assert.IsNotNull(reported, "the reply should say which window filter was ignored");
+            Assert.IsTrue(reported["log_hidden"].Value<bool>());
+            Assert.IsTrue(reported["warning_hidden"].Value<bool>());
+            Assert.IsFalse(reported["error_hidden"].Value<bool>());
+            Assert.AreEqual(search, reported["search"].Value<string>());
+            Assert.IsTrue(reported["collapsed"].Value<bool>());
+            StringAssert.Contains("ignored Console window filter", reported["note"].Value<string>());
+            StringAssert.Contains("search", reported["note"].Value<string>());
+        }
+
+        [Test]
+        public void HiddenErrorToggle_DoesNotHideErrorsFromTheTool()
+        {
+            IgnoreFailingLogs();
+            RequireConsoleFilterBindings();
+            const string marker = Marker + "_window_hidden_error";
+            Debug.LogError(marker);
+
+            int hiddenFlags = (_savedConsoleFlags | LogLevelLogFlag | LogLevelWarningFlag) & ~LogLevelErrorFlag;
+            SetConsoleWindowFilter(hiddenFlags, "");
+
+            var data = Run(new JObject { ["type"] = "error", ["lines"] = 200, ["stacktrace"] = "none" });
+
+            Assert.That(data["entries"].Values<string>(), Has.Some.EqualTo(marker));
+            Assert.AreEqual(hiddenFlags, (int)ConsoleFlagsProperty.GetValue(null), "flags must be restored");
+            Assert.IsTrue(data["console_window_filter"]["error_hidden"].Value<bool>());
+        }
+
+        [Test]
+        public void VisibleConsoleFilter_AddsNoOverrideMetadata()
+        {
+            IgnoreFailingLogs();
+            RequireConsoleFilterBindings();
+
+            int visibleFlags = (_savedConsoleFlags | LogLevelMask) & ~CollapseFlag;
+            SetConsoleWindowFilter(visibleFlags, "");
+
+            var data = Run(new JObject { ["type"] = "error", ["lines"] = 1, ["stacktrace"] = "none" });
+
+            Assert.IsNull(data["console_window_filter"]);
+            Assert.AreEqual(visibleFlags, (int)ConsoleFlagsProperty.GetValue(null));
+        }
+
+        private static void RequireConsoleFilterBindings()
+        {
+            Assume.That(ConsoleFlagsProperty, Is.Not.Null, "LogEntries.consoleFlags is unavailable");
+            Assume.That(GetFilteringTextMethod, Is.Not.Null, "LogEntries.GetFilteringText is unavailable");
+            Assume.That(SetFilteringTextMethod, Is.Not.Null, "LogEntries.SetFilteringText is unavailable");
+        }
+
+        private static void SetConsoleWindowFilter(int flags, string filteringText)
+        {
+            ConsoleFlagsProperty.SetValue(null, flags);
+            SetFilteringTextMethod.Invoke(null, new object[] { filteringText });
         }
 
         private static void LogMarker(string tag, int times)
