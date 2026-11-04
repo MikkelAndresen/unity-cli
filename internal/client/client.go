@@ -28,6 +28,22 @@ type Instance struct {
 	CompileFinishedAt int64 `json:"compileFinishedAt,omitempty"`
 	// Modal is set while State is "modal": the dialog blocking Unity's main thread.
 	Modal *ModalDialog `json:"modal,omitempty"`
+	// Build is set while State is "building": the player build job holding Unity's main thread.
+	// It is published by the build's own heartbeat writer, which is what keeps the timestamp fresh
+	// while BuildPlayer has the main thread for minutes at a time.
+	Build *BuildJob `json:"build,omitempty"`
+}
+
+// BuildJob mirrors the connector's UnityCliConnector.BuildJobs.BuildHeartbeatSnapshot.
+type BuildJob struct {
+	ID                  string   `json:"id"`
+	Phase               string   `json:"phase"`
+	Profile             string   `json:"profile,omitempty"`
+	Target              string   `json:"target,omitempty"`
+	Output              string   `json:"output,omitempty"`
+	ElapsedSeconds      float64  `json:"elapsed_seconds"`
+	ProgressPercent     *float64 `json:"progress_percent"`
+	ProgressDescription string   `json:"progress_description,omitempty"`
 }
 
 // ModalDialog mirrors the connector's UnityCliConnector.Modal.ModalDialog.

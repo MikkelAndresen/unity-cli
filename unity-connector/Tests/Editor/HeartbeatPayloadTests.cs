@@ -1,6 +1,7 @@
 using Newtonsoft.Json.Linq;
 using NUnit.Framework;
 using UnityCliConnector;
+using UnityCliConnector.BuildJobs;
 
 namespace UnityCliConnector.Tests
 {
@@ -20,7 +21,7 @@ namespace UnityCliConnector.Tests
             foreach (var key in new[]
                      {
                          "state", "projectPath", "port", "pid", "unityVersion", "connectorVersion",
-                         "timestamp", "compileErrors", "compileFinishedAt", "modal",
+                         "timestamp", "compileErrors", "compileFinishedAt", "modal", "build",
                      })
             {
                 Assert.IsTrue(json.ContainsKey(key), $"heartbeat payload lost the '{key}' key the CLI reads");
@@ -30,6 +31,41 @@ namespace UnityCliConnector.Tests
             Assert.IsTrue(json["compileErrors"].Value<bool>());
             Assert.AreEqual(1_234_567_890_123L, json["compileFinishedAt"].Value<long>());
             Assert.That(json["timestamp"].Value<long>(), Is.Positive);
+        }
+
+        [Test]
+        public void BuildStatus_ReportsTheRunningBuildSoWaitersDoNotSeeAWedge()
+        {
+            // While BuildPlayer holds the main thread, "building" plus the job id is all the CLI has
+            // to tell a build apart from an editor that stopped answering.
+            var json = JObject.Parse(Newtonsoft.Json.JsonConvert.SerializeObject(
+                Heartbeat.BuildStatus("building", false, 0, null, new BuildHeartbeatSnapshot
+                {
+                    id = "build-20240101-000000-abc123",
+                    phase = "building",
+                    profile = "macOS_dev",
+                    target = "StandaloneOSX",
+                    output = "/tmp/App.app",
+                    elapsed_seconds = 41.5,
+                    progress_percent = 0.5,
+                    progress_description = "Compiling scripts",
+                })));
+
+            Assert.AreEqual("building", json["state"].Value<string>());
+            Assert.AreEqual("build-20240101-000000-abc123", json["build"]["id"].Value<string>());
+            Assert.AreEqual(41.5, json["build"]["elapsed_seconds"].Value<double>());
+            Assert.AreEqual(0.5, json["build"]["progress_percent"].Value<double>());
+            Assert.AreEqual("Compiling scripts", json["build"]["progress_description"].Value<string>());
+        }
+
+        [Test]
+        public void BuildStatus_OmitsBuildWhenNoBuildIsRunning()
+        {
+            var settings = new Newtonsoft.Json.JsonSerializerSettings { NullValueHandling = Newtonsoft.Json.NullValueHandling.Ignore };
+            var json = JObject.Parse(Newtonsoft.Json.JsonConvert.SerializeObject(
+                Heartbeat.BuildStatus("ready", false, 0, null), settings));
+
+            Assert.IsFalse(json.ContainsKey("build"), "an idle editor must not report a build");
         }
     }
 }

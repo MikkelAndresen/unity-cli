@@ -142,6 +142,18 @@ func Execute() error {
 			return client.Send(currentInst, command, params, 0)
 		}, resolve)
 		resp, err = testCmd(subArgs, testSend, currentInst.Port)
+	case "build":
+		// Polling a build must survive the build itself: the main thread is inside BuildPlayer for
+		// the whole run, so the wait runs on build_status (served off the main thread) with its own
+		// short request timeout rather than the global --timeout.
+		buildPollSend := sendWatchingModal(func(command string, params interface{}) (*client.CommandResponse, error) {
+			currentInst, err := resolve()
+			if err != nil {
+				return nil, err
+			}
+			return client.Send(currentInst, command, params, buildStatusRequestMs)
+		}, resolve)
+		resp, err = buildCmd(subArgs, send, buildPollSend, resolve, os.Stderr)
 	case "verify":
 		currentInst, resolveErr := resolve()
 		if resolveErr != nil {
@@ -453,6 +465,18 @@ Verify (compile + tests, brief output for agents):
   verify                          Compile, list errors in your code, run EditMode tests
   verify --no-tests               Stop after the compile
   verify --assembly <a,b>         Only these test assemblies (also --filter, --mode)
+
+Build (long-running; the editor stays observable while it runs):
+  build --profile <name> --output <path>      Start a player build job, watch progress, exit 0/1
+  build --target StandaloneOSX --output <p>   Build by BuildTarget instead of a BuildProfile
+  build --no-wait ...                         Return the job id right away
+  build status [id]                           Poll one job once (default: the newest)
+
+  Examples:
+    build --profile macOS_dev --output Builds/Mac/App.app
+    build --profile macOS --output Builds/Mac/App.app --development
+    build --target StandaloneLinux64 --output Builds/Linux/App --scenes Assets/Main.unity
+    build status
 
 Profiler:
   profiler hierarchy              Top-level profiler samples (last frame)
@@ -900,6 +924,70 @@ Examples:
 
 See also: 'unity-cli modal' — the in-editor equivalent, available once the connector loads.
 `)
+	case "build":
+		fmt.Print(`Usage: unity-cli build [--profile <name> | --target <BuildTarget>] --output <path> [options]
+       unity-cli build status [id]
+
+Starts a player build as a job. The connector validates the parameters, records the job, and returns
+its id; the build itself starts on a later editor update tick. BuildPipeline.BuildPlayer blocks
+Unity's main thread for the whole build no matter what, so the point of the job is that the editor
+stays observable while it runs:
+
+  - the heartbeat reports state "building" (with the job id and elapsed time) instead of "ready",
+    so waiters do not mistake a building editor for a wedged one;
+  - build_status answers on a thread that does not wait for the main thread, so 'unity-cli build
+    status' works during the build;
+  - the wait keeps polling through dropped connections and the domain reload a build can trigger,
+    instead of aborting on the first failed request.
+
+Job options:
+  --profile <name|path>   BuildProfile asset: a name (looked up under Assets/Settings/Build
+                          Profiles/<name>.asset, then by name anywhere) or an asset path.
+                          The profile's platform must be the editor's active build target.
+  --target <BuildTarget>  StandaloneOSX, StandaloneWindows64, StandaloneLinux64, iOS, Android, ...
+                          Refused up front when the platform module is not installed.
+  --output <path>         Required. Absolute, or relative to the project root. Not inside Assets/.
+  --scenes <a,b>          Comma-separated scene paths. Defaults to the profile's scenes, else the
+                          enabled scenes in Build Settings.
+  --development           BuildOptions.Development.
+  --no-wait               Return the job id and exit; poll it later with 'build status <id>'.
+
+Progress on stderr:
+  build job build-20240101-114213-9f0ac1 queued (macOS_dev -> /proj/Builds/Mac/App.app)
+  building 12s  Compiling PlayerAssemblies 23%
+  building 3m27s  Compiling PlayerAssemblies 61%
+  build succeeded in 5m02s — 132.4 MB, 0 error(s), 4 warning(s) -> /proj/Builds/Mac/App.app
+
+The percent comes from Unity's Progress window and is only shown when the build pumps the editor
+update loop; when it does not, the lines carry elapsed time only. The final JSON on stdout is the job
+record: phase, result, output path, size, duration, error/warning counts, and the first error
+messages from the BuildReport.
+
+Phases: queued, building, succeeded, failed, cancelled, interrupted. "interrupted" means the editor
+stopped reporting the job while it was building (domain reload or editor exit), so the outcome of
+that build is unknown.
+
+While one build is running, a second 'build' is refused at once from the heartbeat ("Unity is already
+building ..."); asking the connector instead would queue the request behind the running build and
+look like a hang. Validation that needs the editor (unknown build profile, scenes that no longer exist
+in the project, a target whose module is not installed) fails before the job starts.
+
+Exit codes:
+  0  the build succeeded, or a status poll of a job that has not failed
+  1  failed, cancelled, interrupted, or a validation error before the job started
+
+Job state lives in <project>/Temp/unity-cli/build-jobs.json, so it survives the domain reload a build
+can trigger. Quitting the editor clears Temp, and with it the job history.
+
+Examples:
+  unity-cli build --profile macOS_dev --output Builds/Mac/App.app
+  unity-cli build --profile macOS --output Builds/Mac/App.app --development
+  unity-cli build --target StandaloneOSX --output Builds/Mac/App.app --scenes Assets/Main.unity
+  unity-cli build --no-wait --profile macOS_dev --output Temp/App.app
+  unity-cli build status
+  unity-cli build status build-20240101-114213-9f0ac1
+  unity-cli status                 # shows: Unity (port 8090): building
+`)
 	case "list":
 		fmt.Print(`Usage: unity-cli list
 
@@ -914,7 +1002,8 @@ Example:
 Show the current Unity Editor state: port, project path, version, PID.
 Reports "not responding" if heartbeat is older than 3 seconds.
 State "modal" means a dialog blocks the editor; its text and buttons are
-printed (see "unity-cli modal --help").
+printed (see "unity-cli modal --help"). State "building" means a player build job holds the main
+thread; the job id, phase and elapsed time are printed with it (see "unity-cli build --help").
 
 When no heartbeat answers but the project's Temp/UnityLockfile (or a heartbeat that
 went silent) says an editor is open, status reports "editor_starting_or_blocked": the

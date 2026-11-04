@@ -34,6 +34,9 @@ func statusCmd(inst *client.Instance) error {
 	if isModal(status) {
 		fmt.Print(describeModal(status.Modal))
 	}
+	if status.Build != nil {
+		fmt.Print(describeBuild(status.Build))
+	}
 	return checkConnectorVersion(status, Version, flagIgnoreVersionMismatch)
 }
 
