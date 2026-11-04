@@ -1,0 +1,130 @@
+package cmd
+
+import (
+	"encoding/json"
+	"io"
+	"os"
+	"strings"
+	"testing"
+
+	"github.com/youngwoocho02/unity-cli/internal/client"
+)
+
+func TestConnectorErrorHint(t *testing.T) {
+	tests := []struct {
+		name string
+		resp *client.CommandResponse
+		want string
+	}{
+		{
+			name: "main thread never picked it up",
+			resp: &client.CommandResponse{Success: false,
+				Message: "exec was queued but the main thread did not pick it up within 108s",
+				Data:    json.RawMessage(`{"code":"main_thread_busy","command":"exec","started":false}`)},
+			want: "the command did not run and nothing changed",
+		},
+		{
+			name: "domain reload dropped it",
+			resp: &client.CommandResponse{Success: false,
+				Message: "exec never ran: Unity stopped answering before the main thread picked it up",
+				Data:    json.RawMessage(`{"code":"domain_reload","command":"exec","started":false}`)},
+			want: "the command did not reach a tool handler",
+		},
+		{
+			name: "the result could not be serialized",
+			resp: &client.CommandResponse{Success: false,
+				Message: "exec returned a value that could not be serialized",
+				Data:    json.RawMessage(`{"code":"serialization_failed","command":"exec"}`)},
+			want: "the command ran and its effects stand",
+		},
+		{
+			name: "an ordinary tool error gets no guess",
+			resp: &client.CommandResponse{Success: false, Message: "exec failed: CS0103",
+				Data: json.RawMessage(`{"compiling":true}`)},
+			want: "",
+		},
+		{
+			name: "a code the CLI does not know gets no guess",
+			resp: &client.CommandResponse{Success: false, Data: json.RawMessage(`{"code":"from_the_future"}`)},
+			want: "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := connectorErrorHint(tt.resp)
+			if tt.want == "" {
+				if got != "" {
+					t.Errorf("connectorErrorHint() = %q, want no hint", got)
+				}
+				return
+			}
+			if !strings.HasPrefix(got, tt.want) {
+				t.Errorf("connectorErrorHint() = %q, want it to start with %q", got, tt.want)
+			}
+		})
+	}
+}
+
+// The connector's own words are the report; the CLI adds only the next step, so an agent that reads
+// stderr gets both without re-deriving the cause from the code.
+func TestPrintResponseTo_FailedConnectorResponsePrintsTheNextStep(t *testing.T) {
+	errFile, err := os.CreateTemp(t.TempDir(), "stderr")
+	if err != nil {
+		t.Fatalf("temp stderr: %v", err)
+	}
+	previous := os.Stderr
+	os.Stderr = errFile
+	defer func() {
+		os.Stderr = previous
+		_ = errFile.Close()
+	}()
+
+	printResponseTo(io.Discard, &client.CommandResponse{
+		Success: false,
+		Message: "exec was queued but the main thread did not pick it up within 27s: editor busy (blocked by the running command test (42s))",
+		Data:    json.RawMessage(`{"code":"main_thread_busy","command":"exec","queue_depth":2}`),
+	})
+	_ = errFile.Sync()
+
+	body, err := os.ReadFile(errFile.Name())
+	if err != nil {
+		t.Fatalf("read stderr: %v", err)
+	}
+	out := string(body)
+
+	for _, want := range []string{
+		"Error: exec was queued but the main thread did not pick it up",
+		`Details: {"code":"main_thread_busy"`,
+		"next:      the command did not run and nothing changed",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("stderr missing %q:\n%s", want, out)
+		}
+	}
+}
+
+func TestPrintResponseTo_OrdinaryErrorKeepsItsShape(t *testing.T) {
+	errFile, err := os.CreateTemp(t.TempDir(), "stderr")
+	if err != nil {
+		t.Fatalf("temp stderr: %v", err)
+	}
+	previous := os.Stderr
+	os.Stderr = errFile
+	defer func() {
+		os.Stderr = previous
+		_ = errFile.Close()
+	}()
+
+	printResponseTo(io.Discard, &client.CommandResponse{Success: false, Message: "Unknown command: nope"})
+	_ = errFile.Sync()
+
+	body, _ := os.ReadFile(errFile.Name())
+	out := string(body)
+	if strings.Contains(out, "next:") {
+		t.Errorf("an unknown failure must not gain a guessed next step:\n%s", out)
+	}
+	if !strings.Contains(out, "Error: Unknown command: nope") {
+		t.Errorf("stderr = %q", out)
+	}
+}

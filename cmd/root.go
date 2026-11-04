@@ -254,6 +254,9 @@ func printResponseTo(w io.Writer, resp *client.CommandResponse) {
 		} else {
 			fmt.Fprintf(os.Stderr, "Error: %s\n", msg)
 		}
+		if hint := connectorErrorHint(resp); hint != "" {
+			fmt.Fprintf(os.Stderr, "  next:      %s\n", hint)
+		}
 		return
 	}
 
@@ -735,6 +738,10 @@ Global Options:
                       test, verify and 'editor refresh --compile' default to 1800000 (30 min);
                       an explicit 0 means no deadline. 'wait --timeout' and build polling keep
                       their own budgets.
+                      The remaining budget is sent to the connector, which answers a queued command
+                      before this deadline instead of leaving the connection silent: "... was queued
+                      but the main thread did not pick it up within Ns ... The command did not run".
+                      Per call, --params '{"queue_deadline_ms":300000}' overrides that wait.
   --ignore-version-mismatch
                       Run even when CLI and connector versions differ
   --meta              Print the response's meta (how the call was served) to stderr
@@ -747,6 +754,8 @@ Notes:
   - Custom tools: any [UnityCliTool] class is auto-discovered
   - A subcommand flag other than --params may be given once; repeating it is an error, not a silent overwrite
   - Run 'list' to see all available tools
+  - Every accepted command gets one answer: a queued command that the main thread never starts is
+    answered as main_thread_busy, and one still queued when Unity reloads as domain_reload (retry it)
 `)
 }
 

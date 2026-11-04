@@ -75,6 +75,10 @@ type ModalButton struct {
 type CommandRequest struct {
 	Command string      `json:"command"`
 	Params  interface{} `json:"params"`
+	// DeadlineMs is this request's remaining client budget. The connector uses it to answer a
+	// queued command before the client gives up (unity-connector RequestTracker.QueueWaitMsFor);
+	// 0 means the caller declared no deadline and the connector's own default applies.
+	DeadlineMs int `json:"deadline_ms,omitempty"`
 }
 
 // CommandResponse is the JSON body returned by Unity.
@@ -304,11 +308,6 @@ func SendContext(ctx context.Context, inst *Instance, command string, params int
 		params = map[string]interface{}{}
 	}
 
-	body, err := json.Marshal(CommandRequest{Command: command, Params: params})
-	if err != nil {
-		return nil, err
-	}
-
 	url := fmt.Sprintf("http://127.0.0.1:%d/command", inst.Port)
 	budget := time.Duration(timeoutMs) * time.Millisecond
 	if budget > 0 {
@@ -321,6 +320,17 @@ func SendContext(ctx context.Context, inst *Instance, command string, params int
 		if remaining := time.Until(deadline); remaining > 0 && (budget == 0 || remaining < budget) {
 			budget = remaining
 		}
+	}
+
+	// Told to the connector so it answers a queued command itself instead of the connection sitting
+	// unanswered until the client hangs up.
+	body, err := json.Marshal(CommandRequest{
+		Command:    command,
+		Params:     params,
+		DeadlineMs: int(budget / time.Millisecond),
+	})
+	if err != nil {
+		return nil, err
 	}
 
 	// The moment the request left, not now: crash artifacts are matched against it so that a dump from

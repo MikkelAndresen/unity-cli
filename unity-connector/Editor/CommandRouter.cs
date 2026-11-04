@@ -14,13 +14,24 @@ namespace UnityCliConnector
     /// </summary>
     public static class CommandRouter
     {
+        // Not reentrant, and the wait is asynchronous on purpose: a handler that blocks the main
+        // thread while waiting for this lock deadlocks the editor, because the release continuation
+        // needs the same pump. test_run holds it for an entire EditMode run.
         static readonly SemaphoreSlim s_Lock = new(1, 1);
 
-        public static async Task<object> Dispatch(string command, JObject parameters)
+        /// <summary>
+        /// <paramref name="ticket"/> is the request tracker's claim on this command, and it is taken
+        /// here — once the command lock is ours — because a request can be answered while it waits on
+        /// that lock (server-side deadline, domain reload) and running it afterwards would apply side
+        /// effects to a caller that was already told the command did not run.
+        /// Returns null when the request no longer wants an answer.
+        /// </summary>
+        public static async Task<object> Dispatch(string command, JObject parameters, RequestTicket ticket)
         {
             await s_Lock.WaitAsync();
             try
             {
+                if (!ShouldRun(ticket)) return null;
                 return await DispatchInternal(command, parameters);
             }
             finally
@@ -28,6 +39,8 @@ namespace UnityCliConnector
                 s_Lock.Release();
             }
         }
+
+        internal static bool ShouldRun(RequestTicket ticket) => ticket == null || ticket.TryBegin();
 
         static async Task<object> DispatchInternal(string command, JObject parameters)
         {

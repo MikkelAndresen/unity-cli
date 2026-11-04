@@ -5,10 +5,10 @@ using System.Net;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
-using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
 using UnityEditor;
 using UnityEngine;
+using UnityCliConnector.Modal;
 
 namespace UnityCliConnector
 {
@@ -18,6 +18,9 @@ namespace UnityCliConnector
     /// Uses ConcurrentQueue + EditorApplication.update for main-thread marshaling.
     /// Background editor throttling can still delay command execution.
     /// Survives domain reloads via InitializeOnLoad.
+    /// Every accepted request gets exactly one answer: the request thread answers it when the main
+    /// thread does not pick it up within its queue deadline, and the reload/quit path answers
+    /// whatever is still in flight before the listener stops. See RequestTracker.
     /// </summary>
     [InitializeOnLoad]
     public static class HttpServer
@@ -26,6 +29,16 @@ namespace UnityCliConnector
         const int MAX_PORT_ATTEMPTS = 10;
         const double AUTO_RESTART_INTERVAL = 1.0;
         const double FAILURE_LOG_INTERVAL = 5.0;
+
+        /// How long a reload or quit waits for in-flight answers to reach the client before it
+        /// closes the listener anyway. Bounded on purpose: the main thread is inside
+        /// beforeAssemblyReload here and Unity's reload clock keeps running.
+        const int PENDING_ANSWER_WAIT_MS = 1500;
+
+        /// A main-thread request that waited longer than this reports its wait in `meta`: without it a
+        /// slow pickup leaves no trace, and "slow" is indistinguishable from "about to be answered
+        /// late" after the fact.
+        const int SLOW_QUEUE_WAIT_MS = 1000;
 
         static HttpListener s_Listener;
         static CancellationTokenSource s_Cts;
@@ -36,6 +49,9 @@ namespace UnityCliConnector
         static double s_LastFailureLogTime;
         static bool s_Stopping;
         static bool s_RestartPending;
+        // Set as soon as a reload or quit starts: the main-thread queue is going away, so a request
+        // accepted after that point could never be answered. Read from the HTTP threads.
+        static volatile bool s_RefusingWork;
 
         static readonly ConcurrentQueue<WorkItem> s_Queue = new();
 
@@ -43,7 +59,7 @@ namespace UnityCliConnector
         {
             public string Command;
             public JObject Parameters;
-            public TaskCompletionSource<object> Tcs;
+            public RequestTicket Ticket;
         }
 
         static HttpServer()
@@ -56,7 +72,7 @@ namespace UnityCliConnector
             s_MainContext = SynchronizationContext.Current;
             Start();
             EditorApplication.quitting += Stop;
-            AssemblyReloadEvents.beforeAssemblyReload += StopListener;
+            AssemblyReloadEvents.beforeAssemblyReload += OnBeforeAssemblyReload;
             AssemblyReloadEvents.afterAssemblyReload += Start;
             EditorApplication.update += ProcessQueue;
         }
@@ -93,6 +109,7 @@ namespace UnityCliConnector
 
                 s_Listener = listener;
                 s_Port = port;
+                s_RefusingWork = false;
                 var cts = new CancellationTokenSource();
                 s_Cts = cts;
                 ClearRetry();
@@ -152,6 +169,7 @@ namespace UnityCliConnector
         {
             s_Stopping = true;
             s_RestartPending = false;
+            s_RefusingWork = true;
             ClearRetry();
 
             if (s_Listener == null) return;
@@ -172,9 +190,32 @@ namespace UnityCliConnector
             s_Listener = null;
         }
 
+        /// <summary>
+        /// Answers everything still in flight, then closes the listener. Abandoning a queued request
+        /// instead would leave the CLI with a dropped connection it can only guess at, and the
+        /// command would still run afterwards with nobody waiting for its result.
+        /// </summary>
+        static void OnBeforeAssemblyReload()
+        {
+            s_RefusingWork = true;
+            AnswerPending("domain reload in progress, retry", ErrorCodes.DomainReload);
+            RequestTracker.AwaitForAnswers(PENDING_ANSWER_WAIT_MS);
+            StopListener();
+        }
+
+        static void AnswerPending(string why, string code)
+        {
+            var answered = RequestTracker.AnswerAllPending(ticket => RequestTracker.BuildReloadError(ticket, why, code));
+            if (answered > 0)
+                Debug.Log($"[UnityCliConnector] Answered {answered} in-flight request(s): {why}");
+        }
+
         static void Stop()
         {
             var port = s_Port;
+            // No error code: the editor is gone, so "wait for it and retry" would be a lie.
+            AnswerPending("the editor is quitting", null);
+            RequestTracker.AwaitForAnswers(PENDING_ANSWER_WAIT_MS);
             StopListener();
             Heartbeat.MarkStopped();
             Debug.Log($"[UnityCliConnector] HTTP server stopped (was port {port})");
@@ -211,12 +252,14 @@ namespace UnityCliConnector
         {
             try
             {
-                var r = await CommandRouter.Dispatch(item.Command, item.Parameters);
-                item.Tcs.SetResult(r);
+                var r = await CommandRouter.Dispatch(item.Command, item.Parameters, item.Ticket);
+                // null means the request was answered while it waited for the command lock, so the
+                // handler was skipped; a tool's own answer is never null.
+                if (r != null) item.Ticket.TryAnswer(r);
             }
             catch (Exception ex)
             {
-                item.Tcs.SetResult(new ErrorResponse(ex.Message));
+                item.Ticket.TryAnswer(new ErrorResponse(ex.Message));
             }
         }
 
@@ -304,6 +347,8 @@ namespace UnityCliConnector
             }
 
             object result;
+            var command = "request";
+            var ticket = (RequestTicket)null;
 
             try
             {
@@ -318,7 +363,7 @@ namespace UnityCliConnector
                     var body = await reader.ReadToEndAsync();
                     var json = JObject.Parse(body);
 
-                    var command = json["command"]?.ToString();
+                    command = json["command"]?.ToString();
                     var parameters = json["params"] as JObject;
 
                     if (string.IsNullOrEmpty(command))
@@ -330,31 +375,112 @@ namespace UnityCliConnector
                     {
                         result = await CommandRouter.DispatchOffMainThread(command, parameters);
                     }
+                    else if (s_RefusingWork)
+                    {
+                        // Fail fast rather than queue into a domain that is on its way out; the
+                        // caller gets the same code it would get for a dropped request.
+                        result = RequestTracker.BuildRefusedError(command, "a reload or quit is already under way");
+                    }
                     else
                     {
-                        var tcs = new TaskCompletionSource<object>(TaskCreationOptions.RunContinuationsAsynchronously);
+                        ticket = RequestTracker.Track(new RequestTicket(command, QueueWaitMsFor(json, parameters)));
                         s_Queue.Enqueue(new WorkItem
                         {
                             Command = command,
                             Parameters = parameters,
-                            Tcs = tcs,
+                            Ticket = ticket,
                         });
                         ForceEditorUpdate();
-                        result = await tcs.Task;
+                        result = await AwaitAnswer(ticket);
+                        ReportSlowQueue(ticket, ref result);
                     }
                 }
             }
             catch (Exception ex)
             {
+                // A queued request that dies here (bad JSON, a crash while queueing) must still be
+                // answered, or its ticket would sit in the tracker until a reload names it.
                 result = new ErrorResponse($"Request error: {ex.Message}");
                 response.StatusCode = 500;
+                if (ticket != null) ticket.TryAnswer(result);
             }
 
-            var responseJson = JsonConvert.SerializeObject(result);
-            var buffer = Encoding.UTF8.GetBytes(responseJson);
-            response.ContentLength64 = buffer.Length;
-            await response.OutputStream.WriteAsync(buffer, 0, buffer.Length);
-            response.Close();
+            await WriteResponse(response, result, command);
+            if (ticket != null) RequestTracker.Complete(ticket);
+        }
+
+        /// <summary>
+        /// The queue deadline for this request: the client's own declared deadline, so the connector
+        /// answers before the caller gives up, with `queue_deadline_ms` as the per-call override.
+        /// </summary>
+        static int QueueWaitMsFor(JObject json, JObject parameters)
+        {
+            var clientDeadlineMs = json["deadline_ms"]?.Value<int>() ?? 0;
+            var overrideMs = parameters?["queue_deadline_ms"]?.Value<int>() ?? 0;
+            return RequestTracker.QueueWaitMsFor(clientDeadlineMs, overrideMs);
+        }
+
+        static async Task<object> AwaitAnswer(RequestTicket ticket)
+        {
+            // The deadline bounds the wait for the main thread to start the handler, never the
+            // handler's runtime: once a tool is running, answering early would report a result for a
+            // command that is still changing the editor, and the caller's client timeout already
+            // bounds how long it watches. If the deadline passes while the handler is waiting on the
+            // command lock, the request is answered as "did not run" and CommandRouter skips it.
+            var finished = await Task.WhenAny(ticket.Tcs.Task, Task.Delay(ticket.QueueWaitMs));
+            if (finished != ticket.Tcs.Task)
+                RequestTracker.TryAnswerWaiting(ticket, Diagnostics());
+
+            return await ticket.Tcs.Task;
+        }
+
+        /// <summary>What the editor is doing, as far as a non-main thread can tell.</summary>
+        static BusyDiagnostics Diagnostics()
+        {
+            var running = RequestTracker.Running;
+            return new BusyDiagnostics(
+                Heartbeat.LastState,
+                running?.Command,
+                // Time since that request was accepted, which for the request holding the command
+                // lock is how long the editor has been busy.
+                running?.WaitedMs ?? 0,
+                RequestTracker.PendingCount,
+                ModalWatchdog.Current?.title);
+        }
+
+        static void ReportSlowQueue(RequestTicket ticket, ref object result)
+        {
+            if (result is not SuccessResponse success) return;
+
+            var waited = ticket.WaitedMs;
+            if (waited < SLOW_QUEUE_WAIT_MS) return;
+
+            // Merged into the tool's own meta (exec reports its compile cache there) so a slow pickup
+            // stays visible in the answer, not only in the failure paths.
+            var meta = success.meta as JObject ?? new JObject();
+            meta["queue_wait_ms"] = waited;
+            meta["queue_depth"] = RequestTracker.PendingCount;
+            success.meta = meta;
+        }
+
+        static async Task WriteResponse(HttpListenerResponse response, object result, string command)
+        {
+            var buffer = Encoding.UTF8.GetBytes(ResponseJson.SerializeOrError(result, command));
+            try
+            {
+                response.ContentLength64 = buffer.Length;
+                await response.OutputStream.WriteAsync(buffer, 0, buffer.Length);
+            }
+            catch (Exception ex)
+            {
+                // The caller may already be gone (its own timeout, a killed shell). Nothing left to do.
+                System.Diagnostics.Debug.WriteLine(
+                    $"[UnityCliConnector] Could not write the response to {command}: {ex.Message}");
+            }
+            finally
+            {
+                try { response.Close(); } catch { }
+            }
         }
     }
 }
