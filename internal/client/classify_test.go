@@ -26,24 +26,24 @@ func freePort(t *testing.T) int {
 
 // stubProcessTable replaces the OS process table for one test, the way isProcessDead is replaced.
 // A nil table means "this CLI cannot read one at all".
-func stubProcessTable(t *testing.T, table map[int]string) {
+func stubProcessTable(t *testing.T, table map[int]ProcessEntry) {
 	t.Helper()
-	orig := processTable
-	processTable = func() map[int]string { return table }
-	t.Cleanup(func() { processTable = orig })
+	orig := ProcessTable
+	ProcessTable = func() map[int]ProcessEntry { return table }
+	t.Cleanup(func() { ProcessTable = orig })
 }
 
 // containerTable is the process table an agent-sandbox container sees when the editor runs on another
 // machine: plenty of processes, none of them Unity, and the connector's pid missing.
-func containerTable() map[int]string {
-	return map[int]string{1: "init", 42: "node", os.Getpid(): "go"}
+func containerTable() map[int]ProcessEntry {
+	return map[int]ProcessEntry{1: {Name: "init"}, 42: {Name: "node"}, os.Getpid(): {Name: "go"}}
 }
 
 func TestJudgePID(t *testing.T) {
 	tests := []struct {
 		name        string
 		pid         int
-		table       map[int]string
+		table       map[int]ProcessEntry
 		want        pidProof
 		wantNoteHas string
 	}{
@@ -64,35 +64,35 @@ func TestJudgePID(t *testing.T) {
 		{
 			name:        "pid runs Unity here",
 			pid:         4321,
-			table:       map[int]string{4321: "/Applications/Unity/Hub/Editor/6000.4.4f1/Unity.app/Contents/MacOS/Unity"},
+			table:       map[int]ProcessEntry{4321: {Name: "/Applications/Unity/Hub/Editor/6000.4.4f1/Unity.app/Contents/MacOS/Unity"}},
 			want:        pidAlive,
 			wantNoteHas: "is running",
 		},
 		{
 			name:        "windows spelling",
 			pid:         4321,
-			table:       map[int]string{4321: `C:\Program Files\Unity\Hub\Editor\Editor\Unity.exe`},
+			table:       map[int]ProcessEntry{4321: {Name: `C:\Program Files\Unity\Hub\Editor\Editor\Unity.exe`}},
 			want:        pidAlive,
 			wantNoteHas: "",
 		},
 		{
 			name:        "pid taken over by another program",
 			pid:         4321,
-			table:       map[int]string{4321: "nginx", 5555: "Unity"},
+			table:       map[int]ProcessEntry{4321: {Name: "nginx"}, 5555: {Name: "Unity"}},
 			want:        pidUnproven,
 			wantNoteHas: "not Unity",
 		},
 		{
 			name:        "row exists but the name is unreadable",
 			pid:         4321,
-			table:       map[int]string{4321: "", 5555: "Unity"},
+			table:       map[int]ProcessEntry{4321: {}, 5555: {Name: "Unity"}},
 			want:        pidUnproven,
 			wantNoteHas: "unreadable",
 		},
 		{
 			name:        "pid gone while other Unity processes are listed",
 			pid:         4321,
-			table:       map[int]string{5555: "Unity", 5556: "Unity"},
+			table:       map[int]ProcessEntry{5555: {Name: "Unity"}, 5556: {Name: "Unity"}},
 			want:        pidGone,
 			wantNoteHas: "still lists Unity as pid",
 		},
@@ -106,9 +106,25 @@ func TestJudgePID(t *testing.T) {
 		{
 			name:        "Unity Hub alone does not prove visibility",
 			pid:         4321,
-			table:       map[int]string{777: "Unity Hub", 778: "UnityShaderCompiler"},
+			table:       map[int]ProcessEntry{777: {Name: "Unity Hub"}, 778: {Name: "UnityShaderCompiler"}},
 			want:        pidUnproven,
 			wantNoteHas: "no Unity process is visible",
+		},
+		{
+			// A crashed editor's child stays in the table as state Z. That row is not a running
+			// editor, so the heartbeat it wrote names a process that is over.
+			name:        "heartbeat pid is a zombie Unity process",
+			pid:         4321,
+			table:       map[int]ProcessEntry{4321: {Name: "Unity", Zombie: true}, 5555: {Name: "Unity"}},
+			want:        pidGone,
+			wantNoteHas: "zombie",
+		},
+		{
+			name:        "a zombie Unity row does not prove the table is the editor's",
+			pid:         4321,
+			table:       map[int]ProcessEntry{5555: {Name: "Unity", Zombie: true}},
+			want:        pidUnproven,
+			wantNoteHas: "proves nothing",
 		},
 	}
 
@@ -139,7 +155,7 @@ func TestAssessSilence(t *testing.T) {
 		advanced    bool          // the connector beat again after the baseline
 		// lockfileAfterBeat writes Temp/UnityLockfile after the heartbeat, as an editor restart does.
 		lockfileAfterBeat bool
-		table             map[int]string
+		table             map[int]ProcessEntry
 		wantCrashed       bool
 		wantClean         bool
 		wantStale         bool
@@ -150,7 +166,7 @@ func TestAssessSilence(t *testing.T) {
 			beatAge:     beatAge,
 			pid:         65279,
 			artifactAge: 5 * time.Second,
-			table:       map[int]string{5555: "Unity"},
+			table:       map[int]ProcessEntry{5555: {Name: "Unity"}},
 			wantClean:   true,
 			wantStale:   true,
 		},
@@ -184,7 +200,7 @@ func TestAssessSilence(t *testing.T) {
 			state:       "ready",
 			beatAge:     4 * time.Second,
 			pid:         65279,
-			table:       map[int]string{5555: "Unity"},
+			table:       map[int]ProcessEntry{5555: {Name: "Unity"}},
 			wantCrashed: true,
 			wantStale:   true,
 		},
@@ -194,7 +210,7 @@ func TestAssessSilence(t *testing.T) {
 			beatAge:           beatAge,
 			pid:               65279,
 			lockfileAfterBeat: true,
-			table:             map[int]string{5555: "Unity"},
+			table:             map[int]ProcessEntry{5555: {Name: "Unity"}},
 			wantStale:         true,
 		},
 		{
@@ -204,7 +220,7 @@ func TestAssessSilence(t *testing.T) {
 			pid:         65279,
 			artifactAge: 500 * time.Millisecond,
 			advanced:    true,
-			table:       map[int]string{65279: "Unity"},
+			table:       map[int]ProcessEntry{65279: {Name: "Unity"}},
 		},
 		{
 			name:        "artifact from before the last beat belongs to an earlier crash",
@@ -370,7 +386,7 @@ func TestExplainDroppedConnection_DumpArrivesLate(t *testing.T) {
 // TestExplainDroppedConnection_LiveEditorPaysNoGrace: a pid this machine proves alive means the editor
 // is up, so the second reading is skipped and the answer comes back immediately.
 func TestExplainDroppedConnection_LiveEditorPaysNoGrace(t *testing.T) {
-	stubProcessTable(t, map[int]string{65279: "/Applications/Unity/Hub/Editor/6000.4.4f1/Unity.app/Contents/MacOS/Unity"})
+	stubProcessTable(t, map[int]ProcessEntry{65279: {Name: "/Applications/Unity/Hub/Editor/6000.4.4f1/Unity.app/Contents/MacOS/Unity"}})
 	origGrace := crashArtifactGrace
 	crashArtifactGrace = 2 * time.Second
 	t.Cleanup(func() { crashArtifactGrace = origGrace })
@@ -414,7 +430,7 @@ func TestExplainDroppedConnection_UnexplainedSilenceKeepsTheOldText(t *testing.T
 
 // TestExplainDroppedConnection_TimeoutIsNotACrash: a slow editor must never be called dead.
 func TestExplainDroppedConnection_TimeoutIsNotACrash(t *testing.T) {
-	stubProcessTable(t, map[int]string{5555: "Unity"})
+	stubProcessTable(t, map[int]ProcessEntry{5555: {Name: "Unity"}})
 	project := t.TempDir()
 	writeCrashFile(t, project, "mono_crash.1b6a4e0a.0.json", 5*time.Second, monoCrashFixture)
 	writeInstanceFiles(t, map[string]Instance{
@@ -459,5 +475,58 @@ func TestSend_DroppedConnectionIsClassified(t *testing.T) {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("message must contain %q, got:\n%s", want, err)
 		}
+	}
+}
+
+// TestParseProcStat pins the field split that makes the zombie check work: the name is in
+// parentheses and may contain both spaces and parentheses, and the state is the byte after the
+// last ')'.
+func TestParseProcStat(t *testing.T) {
+	tests := []struct {
+		name   string
+		line   string
+		want   ProcessEntry
+		wantOK bool
+	}{
+		{"running editor", "4242 (Unity) S 1 4242 4242 0 -1", ProcessEntry{Name: "Unity"}, true},
+		{"zombie editor", "4242 (Unity) Z 1 4242 4242 0 -1", ProcessEntry{Name: "Unity", Zombie: true}, true},
+		{"name with spaces and parens", "7 (a (b) c) R 1 7 7 0 -1", ProcessEntry{Name: "a (b) c"}, true},
+		{"truncated line", "4242 (Unity", ProcessEntry{}, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, ok := parseProcStat(tt.line)
+			if ok != tt.wantOK || got != tt.want {
+				t.Errorf("parseProcStat(%q) = %+v, %v; want %+v, %v", tt.line, got, ok, tt.want, tt.wantOK)
+			}
+		})
+	}
+}
+
+// TestParsePSLine pins the macOS fallback parser: ps indents its rows, comm is a full path that may
+// contain spaces, and the stat column's Z is the zombie marker.
+func TestParsePSLine(t *testing.T) {
+	tests := []struct {
+		name   string
+		line   string
+		pid    int
+		want   ProcessEntry
+		wantOK bool
+	}{
+		{"indented macOS row", "  4242 S    /Applications/Unity/Hub/Editor/6000.4.4f1/Unity.app/Contents/MacOS/Unity",
+			4242, ProcessEntry{Name: "/Applications/Unity/Hub/Editor/6000.4.4f1/Unity.app/Contents/MacOS/Unity"}, true},
+		{"zombie editor", "  4242 Z    /Applications/Unity/Hub/Editor/6000.4.4f1/Unity.app/Contents/MacOS/Unity",
+			4242, ProcessEntry{Name: "/Applications/Unity/Hub/Editor/6000.4.4f1/Unity.app/Contents/MacOS/Unity", Zombie: true}, true},
+		{"path with spaces", "  7 S      /Applications/My Tools/Unity", 7, ProcessEntry{Name: "/Applications/My Tools/Unity"}, true},
+		{"empty line", "", 0, ProcessEntry{}, false},
+		{"missing comm", "  7 S", 0, ProcessEntry{}, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			pid, entry, ok := parsePSLine(tt.line)
+			if ok != tt.wantOK || pid != tt.pid || entry != tt.want {
+				t.Errorf("parsePSLine(%q) = %d, %+v, %v; want %d, %+v, %v", tt.line, pid, entry, ok, tt.pid, tt.want, tt.wantOK)
+			}
+		})
 	}
 }

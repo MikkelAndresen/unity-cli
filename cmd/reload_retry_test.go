@@ -471,3 +471,85 @@ func TestDiscoverStatusInstance_PicksFreshestHeartbeatForProject(t *testing.T) {
 		t.Fatalf("status resolved port %d, want the freshest heartbeat on 8091", got.Port)
 	}
 }
+
+// TestSendAfterReload_DoesNotRetryWhenTheBeatDidNotAdvance: the retry target must be a newer beat.
+// The same record (or an unchanged timestamp) is not evidence that the editor moved, so the
+// original error stands instead of sending the command again.
+func TestSendAfterReload_DoesNotRetryWhenTheBeatDidNotAdvance(t *testing.T) {
+	project := t.TempDir()
+	oldSrv, oldHits := droppingServer(t)
+	oldPort := serverPort(t, oldSrv)
+	beatAt := time.Now()
+	writeHeartbeatSet(t, map[string]client.Instance{
+		"only.json": heartbeat(project, oldPort, 0, "reloading", beatAt),
+	})
+	old := &client.Instance{State: "reloading", ProjectPath: project, Port: oldPort, PID: 0, Timestamp: beatAt.UnixMilli()}
+	resolve := func() (*client.Instance, error) { return old, nil }
+
+	_, err := sendAfterReload(context.Background(), resolve, newVersionGate("exec"), "exec", map[string]interface{}{"code": "return 1;"}, 2000)
+	if err == nil {
+		t.Fatal("expected the original failure")
+	}
+	if strings.Contains(err.Error(), "retry:") {
+		t.Errorf("an unchanged beat must not trigger a retry:\n%s", err)
+	}
+	if got := atomic.LoadInt32(oldHits); got != 1 {
+		t.Errorf("old-port server got %d hits, want 1", got)
+	}
+}
+
+// TestSendAfterReload_RespectsAnExplicitPortPin: --port selects the instance, so a reload that
+// moved the editor to another port must not silently redirect the retry there.
+func TestSendAfterReload_RespectsAnExplicitPortPin(t *testing.T) {
+	origPort := flagPort
+	t.Cleanup(func() { flagPort = origPort })
+
+	project := t.TempDir()
+	oldPort := freeLocalPort(t)
+	newSrv, newHits := answeringServer(t)
+	newPort := serverPort(t, newSrv)
+	writeHeartbeatSet(t, map[string]client.Instance{
+		"new.json": heartbeat(project, newPort, 0, "ready", time.Now()),
+	})
+	inst := &client.Instance{State: "ready", ProjectPath: project, Port: oldPort, PID: 0, Timestamp: time.Now().Add(-5 * time.Second).UnixMilli()}
+	resolve := func() (*client.Instance, error) { return inst, nil }
+	flagPort = oldPort
+
+	err := func() error {
+		_, err := sendAfterReload(context.Background(), resolve, newVersionGate("exec"), "console", nil, 2000)
+		return err
+	}()
+	if err == nil {
+		t.Fatal("expected the original connection failure")
+	}
+	if got := atomic.LoadInt32(newHits); got != 0 {
+		t.Errorf("new-port server got %d hits, want none: --port pinned the old instance", got)
+	}
+}
+
+// TestSendAfterReload_RetryFailureKeepsTheOriginalDiagnosis: when the retry fails too, the operator
+// must still see why the first attempt died.
+func TestSendAfterReload_RetryFailureKeepsTheOriginalDiagnosis(t *testing.T) {
+	project := t.TempDir()
+	oldPort := freeLocalPort(t)
+	newSrv, newHits := droppingServer(t)
+	newPort := serverPort(t, newSrv)
+	writeHeartbeatSet(t, map[string]client.Instance{
+		"new.json": heartbeat(project, newPort, 0, "ready", time.Now()),
+	})
+	inst := &client.Instance{State: "ready", ProjectPath: project, Port: oldPort, PID: 0, Timestamp: time.Now().Add(-5 * time.Second).UnixMilli()}
+	resolve := func() (*client.Instance, error) { return inst, nil }
+
+	_, err := sendAfterReload(context.Background(), resolve, newVersionGate("exec"), "exec", map[string]interface{}{"code": "return 1;"}, 2000)
+	if err == nil {
+		t.Fatal("expected the retry to fail")
+	}
+	for _, want := range []string{"cannot connect to Unity at port " + fmt.Sprint(oldPort), "did not answer the retry"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error must contain %q, got:\n%s", want, err)
+		}
+	}
+	if got := atomic.LoadInt32(newHits); got != 1 {
+		t.Errorf("new-port server got %d hits, want 1", got)
+	}
+}

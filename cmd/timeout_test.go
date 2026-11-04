@@ -2,7 +2,7 @@ package cmd
 
 import (
 	"context"
-	"errors"
+	"encoding/json"
 	"io"
 	"net"
 	"net/http"
@@ -85,11 +85,14 @@ func TestWaitForAliveContext_UsesTheSharedDeadline(t *testing.T) {
 }
 
 // TestWaitAndSendShareOneBudget is the double-budget regression: waiting for a fresh heartbeat
-// must leave less than the full budget for the request, so the pair cannot take 2x.
+// must leave less than the full budget for the request, so the pair cannot take 2x. It asserts on
+// the budget the connector is told (deadline_ms), not on wall-clock margins: a loaded host makes
+// the wait longer, which only makes the reported budget smaller.
 func TestWaitAndSendShareOneBudget(t *testing.T) {
 	fastPolling(t)
-	_, port := slowHTTP(t, 200*time.Millisecond)
-	freshAt := time.Now().Add(250 * time.Millisecond)
+	_, port, deadlines := slowHTTP(t, 100*time.Millisecond)
+	const budget = 10 * time.Second
+	freshAt := time.Now().Add(time.Second)
 	old := time.Now().Add(-time.Second)
 	resolve := func() (*client.Instance, error) {
 		stamp := old
@@ -99,70 +102,43 @@ func TestWaitAndSendShareOneBudget(t *testing.T) {
 		return &client.Instance{State: "ready", ProjectPath: t.TempDir(), Port: port, Timestamp: stamp.UnixMilli()}, nil
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), budget)
 	defer cancel()
-	start := time.Now()
-	inst, err := waitForAliveContext(ctx, resolve, remainingTimeoutMs(ctx, 300))
+	inst, err := waitForAliveContext(ctx, resolve, remainingTimeoutMs(ctx, 10000))
 	if err != nil {
 		t.Fatalf("waitForAliveContext: %v", err)
 	}
-	_, err = client.SendContext(ctx, inst, "exec", nil, remainingTimeoutMs(ctx, 0))
-	elapsed := time.Since(start)
-
-	var timeout *client.RequestTimeoutError
-	if !errors.As(err, &timeout) {
-		t.Fatalf("expected the one budget to expire during the request, got %T: %v", err, err)
+	if _, err = client.SendContext(ctx, inst, "exec", nil, remainingTimeoutMs(ctx, 0)); err != nil {
+		t.Fatalf("send: %v", err)
 	}
-	if elapsed > 450*time.Millisecond {
-		t.Errorf("wait + send spent two budgets: %v (budget 300ms)", elapsed)
+
+	received := <-deadlines
+	// The wait spent about a second of the ten, so the request must be told a budget that is
+	// visibly smaller than the whole invocation. The old double-budget path sent the full 10000.
+	if received <= 0 || received > 9500 {
+		t.Errorf("deadline_ms = %d, want the ~9000ms left after the wait (budget 10000ms)", received)
 	}
 }
 
-// TestCompileWaitsHonourTheInvocationDeadline is the regression for a short --timeout on verify or
-// editor refresh --compile: both poll for a compile with their own 5-minute deadline, so they must
-// also stop when the invocation context expires.
-func TestCompileWaitsHonourTheInvocationDeadline(t *testing.T) {
+// TestCompileWaitHonoursTheInvocationDeadline is the regression for a short --timeout on verify or
+// editor refresh --compile: the compile wait has its own 5-minute deadline, so it must also stop
+// when the invocation context expires. Both commands share this wait.
+func TestCompileWaitHonoursTheInvocationDeadline(t *testing.T) {
 	compileTestBudgets(t)
 	resolve := func() (*client.Instance, error) {
 		return &client.Instance{State: "compiling", CompileFinishedAt: 1_000}, nil
 	}
 
-	tests := []struct {
-		name string
-		wait func(ctx context.Context) error
-	}{
-		{
-			name: "verify",
-			wait: func(ctx context.Context) error {
-				_, timedOut, err := waitForReadyTo(ctx, resolve, io.Discard, "verify")
-				if err == nil && !timedOut {
-					return errors.New("returned without a timeout")
-				}
-				return err
-			},
-		},
-		{
-			name: "editor refresh --compile",
-			wait: func(ctx context.Context) error {
-				_, err := waitForCompileTo(ctx, resolve, io.Discard, "editor refresh --compile", compileBaseline{FinishedAt: 1_000})
-				return err
-			},
-		},
+	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	_, err := waitForCompileTo(ctx, resolve, io.Discard, "editor refresh --compile", compileBaseline{FinishedAt: 1_000})
+	elapsed := time.Since(start)
+	if err == nil || !strings.Contains(err.Error(), "--timeout") {
+		t.Fatalf("expected the invocation deadline to end the wait, got %v", err)
 	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			ctx, cancel := context.WithTimeout(context.Background(), 40*time.Millisecond)
-			defer cancel()
-			start := time.Now()
-			err := tt.wait(ctx)
-			elapsed := time.Since(start)
-			if err == nil || !strings.Contains(err.Error(), "--timeout") {
-				t.Fatalf("expected the invocation deadline to end the wait, got %v", err)
-			}
-			if elapsed > 250*time.Millisecond {
-				t.Errorf("the compile wait ignored the invocation deadline: %v", elapsed)
-			}
-		})
+	if elapsed > 250*time.Millisecond {
+		t.Errorf("the compile wait ignored the invocation deadline: %v", elapsed)
 	}
 }
 
@@ -192,9 +168,16 @@ func TestTimeoutMessagesUseTheBudgetFormatter(t *testing.T) {
 	}
 }
 
-func slowHTTP(t *testing.T, delay time.Duration) (*httptest.Server, int) {
+// slowHTTP answers after delay and reports each request's deadline_ms.
+func slowHTTP(t *testing.T, delay time.Duration) (*httptest.Server, int, <-chan int) {
 	t.Helper()
+	deadlines := make(chan int, 8)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req client.CommandRequest
+		if body, err := io.ReadAll(r.Body); err == nil {
+			_ = json.Unmarshal(body, &req)
+		}
+		deadlines <- req.DeadlineMs
 		select {
 		case <-r.Context().Done():
 		case <-time.After(delay):
@@ -202,5 +185,5 @@ func slowHTTP(t *testing.T, delay time.Duration) (*httptest.Server, int) {
 		}
 	}))
 	t.Cleanup(server.Close)
-	return server, server.Listener.Addr().(*net.TCPAddr).Port
+	return server, server.Listener.Addr().(*net.TCPAddr).Port, deadlines
 }

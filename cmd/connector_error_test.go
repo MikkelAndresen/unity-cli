@@ -1,9 +1,9 @@
 package cmd
 
 import (
+	"bytes"
 	"encoding/json"
 	"io"
-	"os"
 	"strings"
 	"testing"
 
@@ -83,29 +83,13 @@ func TestConnectorErrorHint(t *testing.T) {
 // The connector's own words are the report; the CLI adds only the next step, so an agent that reads
 // stderr gets both without re-deriving the cause from the code.
 func TestPrintResponseTo_FailedConnectorResponsePrintsTheNextStep(t *testing.T) {
-	errFile, err := os.CreateTemp(t.TempDir(), "stderr")
-	if err != nil {
-		t.Fatalf("temp stderr: %v", err)
-	}
-	previous := os.Stderr
-	os.Stderr = errFile
-	defer func() {
-		os.Stderr = previous
-		_ = errFile.Close()
-	}()
-
-	printResponseTo(io.Discard, &client.CommandResponse{
+	var errOut bytes.Buffer
+	printResponseTo(io.Discard, &errOut, &client.CommandResponse{
 		Success: false,
 		Message: "exec was queued but the main thread did not pick it up within 27s: editor busy (blocked by the running command test (42s))",
 		Data:    json.RawMessage(`{"code":"main_thread_busy","command":"exec","queue_depth":2}`),
 	})
-	_ = errFile.Sync()
-
-	body, err := os.ReadFile(errFile.Name())
-	if err != nil {
-		t.Fatalf("read stderr: %v", err)
-	}
-	out := string(body)
+	out := errOut.String()
 
 	for _, want := range []string{
 		"Error: exec was queued but the main thread did not pick it up",
@@ -119,22 +103,9 @@ func TestPrintResponseTo_FailedConnectorResponsePrintsTheNextStep(t *testing.T) 
 }
 
 func TestPrintResponseTo_OrdinaryErrorKeepsItsShape(t *testing.T) {
-	errFile, err := os.CreateTemp(t.TempDir(), "stderr")
-	if err != nil {
-		t.Fatalf("temp stderr: %v", err)
-	}
-	previous := os.Stderr
-	os.Stderr = errFile
-	defer func() {
-		os.Stderr = previous
-		_ = errFile.Close()
-	}()
-
-	printResponseTo(io.Discard, &client.CommandResponse{Success: false, Message: "Unknown command: nope"})
-	_ = errFile.Sync()
-
-	body, _ := os.ReadFile(errFile.Name())
-	out := string(body)
+	var errOut bytes.Buffer
+	printResponseTo(io.Discard, &errOut, &client.CommandResponse{Success: false, Message: "Unknown command: nope"})
+	out := errOut.String()
 	if strings.Contains(out, "next:") {
 		t.Errorf("an unknown failure must not gain a guessed next step:\n%s", out)
 	}

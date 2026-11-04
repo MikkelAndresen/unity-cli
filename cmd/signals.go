@@ -18,10 +18,30 @@ var signalExitCode atomic.Int32
 // or 0 when no signal was caught.
 func SignalExitCode() int { return int(signalExitCode.Load()) }
 
+// stdoutWrites counts response writes in flight. The signal fallback waits for it to reach zero
+// before its hard exit, so a signal cannot truncate a report that was already on its way to a slow
+// pipe. A command that holds the process open some other way is still cut off by the grace.
+var stdoutWrites atomic.Int32
+
+func beginStdoutWrite() { stdoutWrites.Add(1) }
+func endStdoutWrite()   { stdoutWrites.Add(-1) }
+
+// signalWriteGrace bounds how long the fallback waits for an in-flight response write.
+var signalWriteGrace = 5 * time.Second
+
+// waitForStdoutWrites blocks until no response write is in flight, or the grace expires.
+func waitForStdoutWrites(grace time.Duration) {
+	deadline := time.Now().Add(grace)
+	for stdoutWrites.Load() != 0 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
 // installSignalCancellation makes SIGINT/SIGTERM/SIGALRM/SIGHUP cancel in-flight requests instead
 // of being swallowed by the Go runtime, and guarantees the process leaves with 128+signo even when
-// the command is between requests (a test or build poll sleep). The fallback timer only matters
-// for those sleeps: a command that observes the canceled context returns long before it.
+// the command is between requests (a test or build poll sleep). The fallback only matters for those
+// sleeps and for a response write that has not reached a slow reader yet: a command that observes
+// the canceled context returns long before it.
 func installSignalCancellation() (context.Context, context.CancelFunc) {
 	ctx, cancel := context.WithCancel(context.Background())
 	signals := make(chan os.Signal, 1)
@@ -33,7 +53,7 @@ func installSignalCancellation() (context.Context, context.CancelFunc) {
 		signalExitCode.Store(int32(code))
 		fmt.Fprintf(os.Stderr, "unity-cli: interrupted by %s\n", sig)
 		cancel()
-		time.Sleep(250 * time.Millisecond)
+		waitForStdoutWrites(signalWriteGrace)
 		os.Exit(code)
 	}()
 

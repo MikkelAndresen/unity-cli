@@ -219,7 +219,7 @@ func TestWaitForAlive_FollowsResolverPortChange(t *testing.T) {
 		}, nil
 	}
 
-	inst, err := waitForAlive(resolve, 100)
+	inst, err := waitForAliveContext(context.Background(), resolve, 100)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -253,7 +253,7 @@ func TestWaitForAlive_DoesNotReturnWhileTheConnectorIsStarting(t *testing.T) {
 		}, nil
 	}
 
-	inst, err := waitForAlive(resolve, 200)
+	inst, err := waitForAliveContext(context.Background(), resolve, 200)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}

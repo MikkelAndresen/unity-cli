@@ -55,6 +55,9 @@ func editorCmd(ctx context.Context, args []string, send sendFn, resolve instance
 			params["compile"] = mode
 			return editorRefreshCompile(ctx, send, resolve, params, keepConsole, os.Stderr)
 		}
+		if keepConsole {
+			return nil, fmt.Errorf("editor refresh --keep-console only applies with --compile (it keeps a previous compile's errors out of the compile report)")
+		}
 		return send("refresh_unity", params)
 
 	default:
@@ -102,6 +105,14 @@ func editorRefreshCompile(ctx context.Context, send sendFn, resolve instanceReso
 	}
 	if !resp.Success {
 		return resp, nil
+	}
+	// An older connector only compiles when compile == "request", so it would answer a clean request
+	// with a refresh that rebuilt nothing (and the report would say "nothing to compile"). The reply
+	// advertises whether the mode exists; without that flag, refuse instead of pretending.
+	if mode, _ := params["compile"].(string); mode == "clean" && !reportFieldBool(resp.Data, "clean_compile_supported") {
+		resp.Success = false
+		resp.Message = `this connector does not support "editor refresh --compile clean"; update the com.youngwoocho02.unity-cli-connector package in Unity, or use --compile`
+		return resp, fmt.Errorf("%s", resp.Message)
 	}
 
 	// The reply carries the connector's own compile clock at request time, which is the only
@@ -348,8 +359,9 @@ func isConnectionFailure(err error) bool {
 		return false
 	}
 	msg := err.Error()
+	eof := msg == "EOF" || strings.HasSuffix(msg, ": EOF") || strings.Contains(msg, "unexpected EOF")
 	return strings.Contains(msg, "cannot connect to Unity") || strings.Contains(msg, "connection refused") ||
-		strings.Contains(msg, "EOF") || strings.Contains(msg, "connection reset")
+		eof || strings.Contains(msg, "connection reset")
 }
 
 // compileReportNotes explains any part of the result the numbers alone cannot: a compile that was
@@ -432,6 +444,11 @@ func attachCompileReport(resp *client.CommandResponse, outcome compileOutcome, s
 				data["stale_line"] = findings.Provenance.StaleLine
 			}
 		}
+	}
+	// error_count is the untruncated total while errors[] stops at compileReportMaxDiags; say so,
+	// or a report with 40 errors and 20 lines reads as an incomplete list with no reason.
+	if findings.Total > len(findings.Diags) {
+		notes = append(notes, fmt.Sprintf("%d error(s) in total; errors[] lists the first %d", findings.Total, len(findings.Diags)))
 	}
 	if len(notes) > 0 {
 		data["notes"] = notes

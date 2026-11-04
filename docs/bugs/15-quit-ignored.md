@@ -184,3 +184,15 @@ stub PID was 0), so it only exercised the timeout; it now returns the waited-on 
 stale timer resets. The C# findings (play-mode `--save` reply fields, the unverified
 `EditorApplication.Exit` veto assumption, and the missing Windows process-name guard) are not
 changed here.
+
+## Review follow-up (round 2, Go half)
+
+- Windows `--force` now runs the same process-name guard as unix: `verifyUnityProcess` asks
+  `tasklist` for the pid's image name and refuses anything that is not Unity, so a recycled pid is
+  never terminated. The name test itself is shared (`isUnityProcessName`) and covered on any OS.
+- `editor restart --clean` now checks `LockfileHeld` after the editor is stopped and refuses to
+  delete `Library/`/`Temp/` while `Temp/UnityLockfile` is still held, which is what that helper's
+  doc always required. It was previously dead code outside its unit test.
+- The unreachable `if !resp.Success { os.Exit(1) }` after a quit/restart reply is gone; a refused
+  lifecycle command now returns normally so the deferred signal teardown runs, and a future non-zero
+  reply still cannot exit 0.

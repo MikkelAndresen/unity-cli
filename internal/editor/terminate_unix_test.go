@@ -47,3 +47,25 @@ func TestVerifyUnityProcess_AcceptsUnityBinary(t *testing.T) {
 		}
 	}
 }
+
+// TestIsUnityProcessName pins the check both platform guards share: the unix comm path and a
+// Windows tasklist row must agree, and an unrelated process (even one whose path contains "unity"
+// only as part of another word) must not be terminated.
+func TestIsUnityProcessName(t *testing.T) {
+	tests := []struct {
+		line string
+		want bool
+	}{
+		{"/Applications/Unity/Hub/Editor/6000.4.4f1/Unity.app/Contents/MacOS/Unity", true},
+		{`"Unity.exe","65279","Console","1","1,234 K"`, true},
+		{`C:\\Program Files\\Unity\\Hub\\Editor\\Unity.exe`, true},
+		{"nginx", false},
+		{"python3", false},
+		{"", false},
+	}
+	for _, tt := range tests {
+		if got := isUnityProcessName(tt.line); got != tt.want {
+			t.Errorf("isUnityProcessName(%q) = %v, want %v", tt.line, got, tt.want)
+		}
+	}
+}

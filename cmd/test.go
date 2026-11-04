@@ -103,9 +103,10 @@ func pollTestResults(ctx context.Context, port int) (*client.CommandResponse, er
 	}
 
 	resultsPath := filepath.Join(home, ".unity-cli", "status", fmt.Sprintf("test-results-%d.json", port))
-	deadline := time.Now().Add(10 * time.Minute)
 
-	for time.Now().Before(deadline) {
+	// The invocation context is the only bound: an explicit --timeout 0 means no deadline, which is
+	// what the help text promises, so there is no second 10-minute limit here.
+	for {
 		select {
 		case <-ctx.Done():
 			if ctx.Err() == context.DeadlineExceeded {
@@ -134,6 +135,4 @@ func pollTestResults(ctx context.Context, port int) (*client.CommandResponse, er
 			return nil, modalBlockedError(inst, "test --mode PlayMode", true)
 		}
 	}
-
-	return nil, fmt.Errorf("timed out waiting for test results (10m)")
 }

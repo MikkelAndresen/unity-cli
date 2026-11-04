@@ -417,10 +417,36 @@ func selectButton(windows []dialogWindow, want, windowNeedle string) (dialogWind
 	}
 
 	if len(hits) > 1 {
-		var b strings.Builder
-		fmt.Fprintf(&b, "%q matches %d windows — name one with --window \"<title>\":", want, len(hits))
+		// Count windows, not button hits: one window can carry two loosely matching buttons, and
+		// listing it twice as if it were two windows sends the user looking for a --window choice
+		// that does not exist.
+		type windowButtons struct {
+			win     dialogWindow
+			buttons []string
+		}
+		var grouped []windowButtons
 		for _, h := range hits {
-			fmt.Fprintf(&b, "\n  pid %d: %q (%s)", h.win.PID, h.win.Title, strings.Join(h.win.Buttons, ", "))
+			found := false
+			for i := range grouped {
+				if grouped[i].win.PID == h.win.PID && grouped[i].win.Title == h.win.Title {
+					grouped[i].buttons = append(grouped[i].buttons, h.button)
+					found = true
+					break
+				}
+			}
+			if !found {
+				grouped = append(grouped, windowButtons{win: h.win, buttons: []string{h.button}})
+			}
+		}
+		var b strings.Builder
+		if len(grouped) == 1 {
+			fmt.Fprintf(&b, "%q matches %d buttons on window %q (%s) — use the exact button title:", want,
+				len(grouped[0].buttons), grouped[0].win.Title, strings.Join(grouped[0].buttons, ", "))
+		} else {
+			fmt.Fprintf(&b, "%q matches %d windows — name one with --window \"<title>\":", want, len(grouped))
+			for _, g := range grouped {
+				fmt.Fprintf(&b, "\n  pid %d: %q (%s)", g.win.PID, g.win.Title, strings.Join(g.win.Buttons, ", "))
+			}
 		}
 		return dialogWindow{}, "", "", fmt.Errorf("%s", b.String())
 	}
@@ -474,9 +500,17 @@ func parseClickResult(out string, pid int, window, button string) (*dialogAction
 	}
 }
 
+// osascriptRunner is the one place that executes AppleScript. Tests replace it to record the
+// list->click handoff on a machine with no osascript.
+var osascriptRunner = runOsascriptProcess
+
 // runOsascript runs one embedded AppleScript with argv, mapping permission failures to an
 // explanation of what to grant, since that is the failure an agent cannot fix from here.
 func runOsascript(script string, argv ...string) (string, error) {
+	return osascriptRunner(script, argv...)
+}
+
+func runOsascriptProcess(script string, argv ...string) (string, error) {
 	if _, err := os.Stat(osascriptPath); err != nil {
 		return "", fmt.Errorf("%s not found: dialogs needs the macOS host's AppleScript interpreter", osascriptPath)
 	}
@@ -534,7 +568,9 @@ func accessibilityPermissionError(stderr string) error {
 // "" means list every Unity process's windows.
 func projectNeedle(project string) string {
 	if project == "" {
-		if inst, err := client.DiscoverInstance("", 0); err == nil {
+		// Read the heartbeat without the instance scan: listing windows is read-only, and the scan
+		// prunes dead-pid files. The newest beat also names the project the newest editor is using.
+		if inst := client.NewestHeartbeat("", 0); inst != nil {
 			project = inst.ProjectPath
 		}
 	}

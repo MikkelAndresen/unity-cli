@@ -24,7 +24,8 @@ var playModePollInterval = 500 * time.Millisecond
 
 // editorRestedStates are the heartbeat states in which the domain change is over and the editor can
 // answer again. "starting" is deliberately absent: the listener is up but no update tick has run.
-var editorRestedStates = []string{"ready", "playing", "paused", "modal"}
+// "modal" is absent too: waitForEditorState stops on it with the dialog's name instead.
+var editorRestedStates = []string{"ready", "playing", "paused"}
 
 // answerLostToReload reports whether a call ended without the connector's verdict while its effect
 // may still have been applied: the connector said a reload interrupted a command that had already
@@ -125,7 +126,12 @@ func stateAfterReloadNote(ctx context.Context, resolve instanceResolver) string 
 	budget := cappedBudget(ctx, reloadStateWait)
 	inst, rested, err := waitForEditorState(ctx, resolve, editorRestedStates, budget, "state check")
 	if err != nil {
-		// A modal dialog or an interrupt: that report is the caller's business, not this note's.
+		// A modal dialog blocks the editor and nothing here can answer it, but naming it is exactly
+		// what the caller needs next; an interrupt stays the caller's own error.
+		if inst != nil && isModal(inst) {
+			return fmt.Sprintf("  state:     %s Answer it with: unity-cli modal answer --button \"<title>\"\n",
+				firstLine(describeModal(inst.Modal)))
+		}
 		return ""
 	}
 	if inst == nil {

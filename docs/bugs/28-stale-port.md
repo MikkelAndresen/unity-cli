@@ -320,3 +320,13 @@ directly. The refresh itself reported `compile_succeeded: true`, `stale_after_co
 
 C# check: `verify --assembly UnityCliConnector.Tests.Editor` — compile ok, 331/332 tests passed (the
 skipped one is the opt-in real-dialog modal test).
+
+## Review follow-up
+
+- The retry target now comes from the same newest-record helper as `NewestHeartbeat`
+  (`newestMatching` over the prune-free instance list); the untestable pid tie-break is gone, and
+  both the newer-beat and unchanged-timestamp branches have tests.
+- An explicit `--port` pins the target: if the heartbeat moved to another port, the CLI reports the
+  original failure instead of silently retrying against an instance the caller did not select.
+- When the retry itself fails, the error keeps the first failure reachable, so the original reload
+  diagnosis is not replaced by a bare second refusal.

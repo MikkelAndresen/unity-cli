@@ -722,7 +722,7 @@ unity-cli test --allow-stale
 
 Requires the Unity Test Framework package. Tests are blocked by default when any open scene has unsaved changes. Use `--auto-save-scenes` to save them first, or `--allow-dirty-scenes` to run anyway. They are also blocked when a project assembly under test is older than its sources — a stale DLL runs old code and looks exactly like a real result. Rebuild with `unity-cli editor refresh --compile`, or pass `--allow-stale` deliberately. PlayMode tests trigger a domain reload — the CLI polls for results automatically.
 
-Tests run for minutes, so `test`'s invocation budget defaults to 30 minutes instead of the global 120 s. `--timeout <ms>` overrides it, and `--timeout 0` means no deadline; a run that exceeds the budget is reported as a client deadline, not as a lost editor.
+Tests run for minutes, so `test`'s invocation budget defaults to 30 minutes instead of the global 120 s. `--timeout <ms>` overrides it, and `--timeout 0` means no deadline (PlayMode result polling included); a run that exceeds the budget is reported as a client deadline, not as a lost editor.
 
 ### Verify
 
@@ -944,15 +944,18 @@ AppleScript and System Events (Accessibility), so it works with no connector and
 It runs only on macOS; on any other system it says so and tells you to run it on the host, because
 an agent sandbox is granted no Accessibility permission.
 
-When no heartbeat answers but the project's `Temp/UnityLockfile` says an editor is open, every
-command names which situation it is instead of saying "no Unity instance found":
+When no heartbeat answers, every command names which situation it is instead of saying "no Unity
+instance found", using the heartbeat records and the project's `Temp/UnityLockfile`:
 
 - `editor_starting_or_blocked` — the lockfile exists but no heartbeat newer than it, so the connector
   never loaded this session. The editor is still importing/compiling, or a startup dialog (license,
-  safe mode, "project already open", package resolution) is waiting.
+  safe mode, "project already open", package resolution) is waiting. A lockfile older than 2 hours
+  with no heartbeat from this session says instead that the editor probably crashed rather than
+  still starting.
 - `editor_unresponsive` — a heartbeat written this session exists but went silent. The connector
   did load, then stopped answering: the main thread is likely blocked by a long exec/build/import, a
-  modal dialog is open, or the editor hung.
+  modal dialog is open, or the editor hung. This one does not need the lockfile; when the lockfile
+  is gone the report says the editor has probably exited and to relaunch it.
 
 ```
 editor_starting_or_blocked: Unity appears open for /Users/me/Work/MyGame (Temp/UnityLockfile, age 42s)
@@ -970,9 +973,9 @@ open, or the editor hung.
 ```
 
 `Temp/UnityLockfile` is written once when Unity opens the project, so its age is the length of the
-session, not evidence of a crash. The CLI only hints "probably crashed" from an old lockfile when no
-heartbeat from that session exists; once a heartbeat postdates the lockfile, a silence is reported as
-`editor_unresponsive` instead.
+session, not evidence of a crash. The CLI only says "probably crashed" from a lockfile older than
+2 hours when no heartbeat from that session exists; once a heartbeat postdates the lockfile, a
+silence is reported as `editor_unresponsive` instead.
 
 Windows are narrowed to the requested project by matching the project folder name in the window
 title; when nothing matches, every Unity window is listed, because startup dialogs rarely name the
@@ -1047,9 +1050,15 @@ The CLI also checks Unity's state automatically before sending any command. If U
 
 ```bash
 unity-cli status
-# Output: Unity (port 8090): crashed (last heartbeat 30s ago)
+# The report goes to stderr; stdout stays empty for this case.
+# crashed: the Unity editor died for /Users/me/Work/MyGame (heartbeat last seen 30s ago, pid 65279) with no "stopped" marker.
+#   Heartbeat: /Users/me/.unity-cli/instances/1f0c….json (state "ready", pid 65279, last beat 30s ago)
+#   Process:   pid 65279 is not in this machine's process table, which still lists Unity as pid 12345
 #   Crash log: /Users/me/Work/MyGame/mono_crash.1b6a4e0a.0.json (mono_crash, written 25s ago)
 #              signal 11 (SIGSEGV); System.NullReferenceException: Object reference not set to an instance of an object
+#   Next:      Unity has to be relaunched by the user — no CLI call brings it back. Editor.log rotates when it does, so read the crash log above first.
+# Error: crashed (port 8090, pid 65279): <one line saying what proved the crash>
+# (exit 1)
 ```
 
 A hard crash, a domain reload and a dropped socket all look the same over HTTP: `EOF`. Before reporting
@@ -1133,7 +1142,7 @@ the wait exceeded a second.
 |------|-------------|---------|
 | `--port <N>` | Select Unity instance by active heartbeat port | auto |
 | `--project <path>` | Select Unity instance by project path | latest |
-| `--timeout <ms>` | One budget per invocation, shared by discovery, waiting for a fresh heartbeat, and the request. The remaining budget is sent to the Connector as `deadline_ms`, so it answers a queued command before this deadline does — see [Queued Commands and Server-Side Deadlines](#queued-commands-and-server-side-deadlines). A client deadline is reported as `timed out ... (the editor may still be running it)`, not as a connection failure. `test`, `verify` and `editor refresh --compile` default to 1800000 (30 min); an explicit `0` means no deadline (the Connector still answers a queued command after its 60 s default). `wait --timeout` and build polling keep their own budgets. For `editor quit`/`restart` it is also the wait-to-exit and startup budget. | 120000 |
+| `--timeout <ms>` | One budget per invocation, shared by discovery, waiting for a fresh heartbeat, and the request. The remaining budget is sent to the Connector as `deadline_ms`, so it answers a queued command before this deadline does — see [Queued Commands and Server-Side Deadlines](#queued-commands-and-server-side-deadlines). A client deadline is reported as `timed out ... (the editor may still be running it)`, not as a connection failure. `test`, `verify` and `editor refresh --compile` default to 1800000 (30 min); an explicit `0` means no deadline (the Connector still answers a queued command after its 60 s default). That is a compatibility break from older releases, where `--timeout 0` made the heartbeat wait fail at once; a script that relied on the old meaning must pass a small positive value. `wait --timeout` and build polling keep their own budgets. For `editor quit`/`restart` it is also the wait-to-exit and startup budget. | 120000 |
 | `--ignore-version-mismatch` | Suppress the version-drift warning (and the refusal for a connector older than 0.7.0) | false |
 | `--meta` | Print the response's `meta` (how the call was served, e.g. `exec`'s compile cache state) to stderr | false |
 
@@ -1152,7 +1161,8 @@ CLI and connector versions do not have to match exactly. A patch difference in t
 is accepted silently. A different minor or major version is accepted with one warning on stderr that
 names both versions, the CLI binary and the fix; diagnostic commands (`status`, `console`,
 `compile_diagnostics`, `compile_status`, `api`, `burst_status`, `modal`, `tools`, `tool_describe`,
-`wait`, `dialogs`, `list`) never fail on it. The CLI refuses only a connector older than 0.7.0, the
+`wait`, `dialogs`, `list`) never fail on it. (`status` and `dialogs` answer before the gate runs at
+all, and `help`/`version`/`update` likewise.) The CLI refuses only a connector older than 0.7.0, the
 oldest protocol it speaks.
 `status` always prints both versions and the compatibility verdict.
 

@@ -111,8 +111,9 @@ func TestAssessConnectorVersion(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			got := assessConnectorVersion(&client.Instance{ConnectorVersion: tt.connector}, tt.cli)
-			if got.Compatible != tt.compatible {
-				t.Errorf("Compatible = %v, want %v (verdict %q)", got.Compatible, tt.compatible, got.Verdict)
+			// A compatible verdict is exactly "no refusal"; there is no separate flag to drift from it.
+			if compatible := got.Refusal == nil; compatible != tt.compatible {
+				t.Errorf("compatible = %v, want %v (verdict %q)", compatible, tt.compatible, got.Verdict)
 			}
 			if (got.Refusal != nil) != tt.refusal {
 				t.Errorf("Refusal = %v, want %v", got.Refusal, tt.refusal)
@@ -140,34 +141,32 @@ func TestAssessConnectorVersion(t *testing.T) {
 	}
 }
 
-func TestVersionGate_CommandExemptions(t *testing.T) {
+// TestVersionGate_ExemptCommandsStillAnswer exercises the behaviour of every exempt entry rather
+// than restating the map: each one must keep answering a connector that the minimum floor refuses.
+func TestVersionGate_ExemptCommandsStillAnswer(t *testing.T) {
 	origVersion := Version
 	Version = "0.8.0"
 	t.Cleanup(func() { Version = origVersion })
 
-	exempt := []string{
-		"status", "console", "compile_diagnostics", "compile_status", "api", "burst_status", "modal",
-		"tools", "tool_describe", "wait", "dialogs", "list", "help", "version", "update",
-	}
-	for _, command := range exempt {
+	for command := range versionExemptCommands {
 		t.Run(command, func(t *testing.T) {
-			g := newVersionGate(command)
-			if !g.exempt {
-				t.Fatalf("%q must be exempt from the version gate", command)
-			}
-			if err := g.check(&client.Instance{ConnectorVersion: "0.1.0"}); err != nil {
+			if err := newVersionGate(command).check(&client.Instance{ConnectorVersion: "0.1.0"}); err != nil {
 				t.Fatalf("%q must not be refused, got %v", command, err)
 			}
 		})
 	}
+}
+
+// TestVersionGate_StateChangingCommandsAreRefused is the other half of the rule: the commands that
+// drive the editor are gated, so a connector below the minimum cannot be driven blind.
+func TestVersionGate_StateChangingCommandsAreRefused(t *testing.T) {
+	origVersion := Version
+	Version = "0.8.0"
+	t.Cleanup(func() { Version = origVersion })
 
 	for _, command := range []string{"exec", "editor", "test", "build", "verify"} {
 		t.Run(command, func(t *testing.T) {
-			g := newVersionGate(command)
-			if g.exempt {
-				t.Fatalf("%q must not be exempt from the version gate", command)
-			}
-			if err := g.check(&client.Instance{ConnectorVersion: "0.1.0"}); err == nil {
+			if err := newVersionGate(command).check(&client.Instance{ConnectorVersion: "0.1.0"}); err == nil {
 				t.Fatalf("%q must be refused for a connector below the minimum", command)
 			}
 		})

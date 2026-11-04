@@ -307,10 +307,6 @@ func RequestNotDelivered(err error) bool {
 	return errors.Is(err, syscall.ECONNREFUSED)
 }
 
-func Send(inst *Instance, command string, params interface{}, timeoutMs int) (*CommandResponse, error) {
-	return SendContext(context.Background(), inst, command, params, timeoutMs)
-}
-
 // RequestTimeoutError is a client-side deadline expiring. It is deliberately not a connection
 // failure: the editor is healthy and may still be running the command, so saying "cannot connect"
 // sends the caller into a reconnect loop instead of waiting for the result.
@@ -340,8 +336,11 @@ func ceilDuration(d, step time.Duration) time.Duration {
 	return ((d + step - 1) / step) * step
 }
 
-// Timeout reports the deadline as a timeout for callers that type-assert net.Error.
-func (e *RequestTimeoutError) Timeout() bool { return true }
+// Send is SendContext without a caller context, for callers that manage their own HTTP timeout
+// (the quit/restart path, whose request budget is not the invocation deadline).
+func Send(inst *Instance, command string, params interface{}, timeoutMs int) (*CommandResponse, error) {
+	return SendContext(context.Background(), inst, command, params, timeoutMs)
+}
 
 // SendContext posts one command, bounded by timeoutMs and by the caller's context. A context
 // deadline shared by discovery, wait-for-alive and this request is what keeps one invocation from

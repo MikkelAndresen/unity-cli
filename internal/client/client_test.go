@@ -498,3 +498,50 @@ func TestRequestNotDelivered(t *testing.T) {
 		t.Error("EOF after a connection was established must not count as not delivered")
 	}
 }
+
+// TestReconnectInstance_NewerBeatWinsWhateverThePID: the retry target is the newest record, not the
+// one whose pid happens to match the old heartbeat; a pid tie-break would hide a real port move.
+func TestReconnectInstance_NewerBeatWinsWhateverThePID(t *testing.T) {
+	home := writeInstanceFiles(t, map[string]Instance{
+		"old.json": {
+			State:       "ready",
+			ProjectPath: "/projects/current",
+			Port:        8090,
+			PID:         100,
+			Timestamp:   1000,
+		},
+		"new.json": {
+			State:       "ready",
+			ProjectPath: "/projects/current",
+			Port:        8091,
+			PID:         999,
+			Timestamp:   2000,
+		},
+	})
+	t.Setenv("HOME", home)
+
+	got := ReconnectInstance(&Instance{State: "ready", ProjectPath: "/projects/current", Port: 8090, PID: 100, Timestamp: 1000})
+	if got == nil || got.Port != 8091 || got.PID != 999 {
+		t.Fatalf("ReconnectInstance = %+v, want the newer 8091 heartbeat", got)
+	}
+}
+
+// TestReconnectInstance_EqualTimestampKeepsTheFirstRecord pins the branch the retry relies on: an
+// unchanged beat is not evidence of a move, so no newer record appears.
+func TestReconnectInstance_EqualTimestampKeepsTheFirstRecord(t *testing.T) {
+	home := writeInstanceFiles(t, map[string]Instance{
+		"only.json": {
+			State:       "ready",
+			ProjectPath: "/projects/current",
+			Port:        8090,
+			PID:         100,
+			Timestamp:   1000,
+		},
+	})
+	t.Setenv("HOME", home)
+
+	got := ReconnectInstance(&Instance{State: "ready", ProjectPath: "/projects/current", Port: 8090, PID: 100, Timestamp: 1000})
+	if got == nil || got.Timestamp != 1000 || got.Port != 8090 {
+		t.Fatalf("ReconnectInstance = %+v, want the unchanged record", got)
+	}
+}

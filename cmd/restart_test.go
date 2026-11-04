@@ -438,3 +438,37 @@ func TestRestartCmd_MissingExecutableRefusesBeforeQuittingOrCleaning(t *testing.
 		t.Fatalf("expected executable-not-found error, got %v", err)
 	}
 }
+
+// TestRestartCmd_CleanRefusesWhileALockfileIsHeld: a second editor (or the stopped one before it
+// finished exiting) still holding Temp/UnityLockfile means Library/ and Temp/ are in use.
+func TestRestartCmd_CleanRefusesWhileALockfileIsHeld(t *testing.T) {
+	var stderr bytes.Buffer
+	deps := restartTestDeps(t, &stderr)
+	project := t.TempDir()
+	deps.discover = func(string, int) (*client.Instance, error) {
+		return &client.Instance{State: "ready", ProjectPath: project, PID: 100, UnityVersion: "6000.1.0f1"}, nil
+	}
+	deps.readVersion = func(string) (string, error) { return "6000.1.0f1", nil }
+	deps.findExecutable = func(string, string) (string, error) { return "/Unity/Editor/Unity", nil }
+	deps.send = func(*client.Instance, string, interface{}, int) (*client.CommandResponse, error) {
+		return &client.CommandResponse{Success: true}, nil
+	}
+	deps.waitForExit = func(editor.WaitForExitOptions) error { return nil }
+	deps.lockfileHeld = func(string) (bool, error) { return true, nil }
+	deps.cleanProject = func(string) ([]string, error) {
+		t.Fatal("--clean must not delete Library/ while a lockfile is held")
+		return nil, nil
+	}
+	deps.launch = func(string, string) (int, error) {
+		t.Fatal("launch must not run after refusing to clean")
+		return 0, nil
+	}
+
+	_, err := restartCmd([]string{"--clean"}, deps)
+	if err == nil || !strings.Contains(err.Error(), "UnityLockfile") {
+		t.Fatalf("expected the lockfile refusal, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "refusing to delete") {
+		t.Errorf("error should say what it refused to do:\n%v", err)
+	}
+}

@@ -33,6 +33,7 @@ type restartDeps struct {
 	canManage       func(pid int) error
 	terminate       func(pid int) error
 	cleanProject    func(string) ([]string, error)
+	lockfileHeld    func(string) (bool, error)
 	validateProject func(string) error
 	readVersion     func(string) (string, error)
 	findExecutable  func(version, override string) (string, error)
@@ -55,6 +56,7 @@ func newRestartDeps(timeoutSet bool) restartDeps {
 		canManage:       editor.CanManageProcess,
 		terminate:       editor.Terminate,
 		cleanProject:    editor.CleanProject,
+		lockfileHeld:    editor.LockfileHeld,
 		validateProject: editor.ValidateProject,
 		readVersion:     editor.ReadProjectVersion,
 		findExecutable:  editor.FindEditorExecutable,
@@ -144,6 +146,17 @@ func restartCmd(args []string, deps restartDeps) (*client.CommandResponse, error
 	}
 
 	if clean {
+		// The editor was stopped above, so a lockfile still held means another process (a second
+		// editor, or the stopped one before it finished exiting) has the project open. Deleting
+		// Library/ and Temp/ under it would corrupt that session.
+		held, lockErr := deps.lockfileHeld(target.projectPath)
+		if lockErr != nil {
+			return nil, lockErr
+		}
+		if held {
+			return nil, fmt.Errorf("another Unity editor still holds %s/Temp/UnityLockfile; refusing to delete Library/ and Temp/ while it is open",
+				target.projectPath)
+		}
 		restartLog(deps.stderr, "Cleaning generated folders...\n")
 		removed, err := deps.cleanProject(target.projectPath)
 		if err != nil {

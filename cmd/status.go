@@ -30,7 +30,7 @@ func statusCmd(inst *client.Instance) error {
 		printVersionSummary(os.Stderr, status)
 		if verdict.Crashed {
 			// A dead editor is not a state an agent can wait out, so it leaves as a failed exit.
-			return fmt.Errorf("%s", crashLine(status, verdict))
+			return fmt.Errorf("%s", crashLine(status))
 		}
 		return nil
 	}
@@ -116,9 +116,12 @@ const minConnectorVersion = "0.7.0"
 
 // versionExemptCommands are read-only or recovery commands: they must keep answering even when the
 // connector speaks a different protocol, because they are how an operator diagnoses and repairs the
-// mismatch. Gating them only turns a version drift into an unusable session (#11).
+// mismatch. Gating them only turns a version drift into an unusable session (#11). Only commands
+// that actually reach the gate are listed: status, dialogs, help, version and update return before
+// newVersionGate exists, so an entry for them would describe a decision that is never made.
+// tool_describe is a connector tool, not a CLI subcommand, but the default dispatch sends it like
+// one; it stays listed because it is part of the same diagnosis.
 var versionExemptCommands = map[string]struct{}{
-	"status":              {},
 	"console":             {},
 	"compile_diagnostics": {},
 	"compile_status":      {},
@@ -128,20 +131,15 @@ var versionExemptCommands = map[string]struct{}{
 	"tools":               {},
 	"tool_describe":       {},
 	"wait":                {},
-	"dialogs":             {},
 	"list":                {},
-	"help":                {},
-	"version":             {},
-	"update":              {},
 }
 
 type connectorCompatibility struct {
-	CLI        string
-	Connector  string
-	Compatible bool
-	Verdict    string
-	Warning    string
-	Refusal    error
+	CLI       string
+	Connector string
+	Verdict   string
+	Warning   string
+	Refusal   error
 }
 
 type connectorRefusal struct {
@@ -169,12 +167,10 @@ func assessConnectorVersion(inst *client.Instance, cliVersion string) connectorC
 
 	cli, cliOK := parseVersion(v.CLI)
 	if v.CLI == "dev" || !cliOK {
-		v.Compatible = true
 		v.Verdict = "development CLI; compatibility not checked"
 		return v
 	}
 	if v.Connector == "" {
-		v.Compatible = true
 		v.Verdict = "unknown connector version; update the connector package"
 		v.Warning = versionWarning(v.CLI, "", "the connector reports no version")
 		return v
@@ -182,25 +178,21 @@ func assessConnectorVersion(inst *client.Instance, cliVersion string) connectorC
 
 	connector, connectorOK := parseVersion(v.Connector)
 	if !connectorOK {
-		v.Compatible = true
 		v.Verdict = fmt.Sprintf("unrecognised connector version %q; update the connector package", v.Connector)
 		v.Warning = versionWarning(v.CLI, v.Connector, "the connector version is not a version number")
 		return v
 	}
 	min, _ := parseVersion(minConnectorVersion)
 	if versionLess(connector, min) {
-		v.Compatible = false
 		v.Verdict = fmt.Sprintf("connector %s is older than the minimum %s; update the connector package", v.Connector, minConnectorVersion)
 		v.Refusal = &connectorRefusal{message: fmt.Sprintf("connector %s is older than the minimum %s supported by unity-cli %s (%s). Update the com.youngwoocho02.unity-cli-connector package in Unity, or rerun with --ignore-version-mismatch", v.Connector, minConnectorVersion, v.CLI, executablePath())}
 		return v
 	}
 	if connector.major == cli.major && connector.minor == cli.minor {
-		v.Compatible = true
 		v.Verdict = fmt.Sprintf("compatible (same major.minor %d.%d)", cli.major, cli.minor)
 		return v
 	}
 
-	v.Compatible = true
 	field := "minor"
 	if connector.major != cli.major {
 		field = "major"
@@ -310,13 +302,9 @@ func resolveKeepingEvidence(project string, port int) instanceResolver {
 	}
 }
 
-// waitForAlive resolves the current target instance, then polls until a newer heartbeat appears.
-// This keeps following the same project even if Unity rebinds to a new port during reload.
-func waitForAlive(resolve instanceResolver, timeoutMs int) (*client.Instance, error) {
-	return waitForAliveContext(context.Background(), resolve, timeoutMs)
-}
-
-// waitForAliveContext is the same wait, bounded by ctx as well as timeoutMs: the caller's one
+// waitForAliveContext resolves the current target instance, then polls until a newer heartbeat
+// appears, following the same project even if Unity rebinds to a new port during a reload. It is
+// bounded by ctx as well as timeoutMs: the caller's one
 // invocation deadline has to cover discovery and waiting too, or a slow start spends the budget
 // twice. A non-positive timeoutMs means "until ctx is canceled".
 func waitForAliveContext(ctx context.Context, resolve instanceResolver, timeoutMs int) (*client.Instance, error) {
@@ -401,46 +389,13 @@ func compileWaitError(cause error) error {
 // is the case the wait exists to ride out. The artifact scan is skipped until the beat has been silent
 // long enough for `wait` to give up anyway, so the common live case never pays for it.
 func crashedWhileWaiting(inst *client.Instance) error {
-	if inst == nil || heartbeatAge(inst) <= waitSilentHeartbeat {
+	if inst == nil || client.HeartbeatAge(inst) <= waitSilentHeartbeat {
 		return nil
 	}
 	if verdict := assessCrash(inst); verdict.Crashed {
 		return crashedError(inst, verdict, nil)
 	}
 	return nil
-}
-
-// waitForReadyTo polls until the heartbeat state becomes "ready" again after a compile request,
-// writing progress to logw. command names the waiting command if a modal dialog blocks the editor.
-// It cannot tell a compile that finished from an editor that was already ready; callers that need
-// that proof use waitForCompileTo.
-func waitForReadyTo(ctx context.Context, resolve instanceResolver, logw io.Writer, command string) (hasErrors, timedOut bool, err error) {
-	_, _ = fmt.Fprintf(logw, "Waiting for compilation...\n")
-
-	deadline := time.Now().Add(compileWaitTimeout)
-	for time.Now().Before(deadline) {
-		if err := pollOrCancel(ctx); err != nil {
-			return false, false, compileWaitError(err)
-		}
-		status, err := resolve()
-		if err != nil {
-			continue
-		}
-		if isModal(status) {
-			return false, false, modalBlockedError(status, command, true)
-		}
-		if status.State == "ready" {
-			if status.CompileErrors {
-				_, _ = fmt.Fprintf(logw, "Compilation finished with errors.\n")
-			} else {
-				_, _ = fmt.Fprintf(logw, "Compilation complete.\n")
-			}
-			return status.CompileErrors, false, nil
-		}
-	}
-
-	_, _ = fmt.Fprintf(logw, "Timed out waiting for compilation (%s).\n", compileWaitTimeout)
-	return false, true, nil
 }
 
 // Compile wait budgets. Variables so tests can shrink them.

@@ -205,3 +205,13 @@ warning deduplication, and `--ignore-version-mismatch` suppression.
   message (a failure), not 2 (the editor could not answer). The same mapping applies if the refusal
   arrives mid-run from a send.
 - `README.ko.md` was not updated in this stack; Korean docs are deferred.
+
+## Review follow-up (round 2)
+
+- `versionExemptCommands` no longer lists commands that never reach the gate (`status`, `dialogs`,
+  `help`, `version`, `update`). `tool_describe` stays: it is a connector tool that the CLI's default
+  dispatch sends like a command, and it is part of the same diagnosis. The
+  `connectorCompatibility.Compatible` field is gone: "compatible" is exactly "no refusal", so the
+  two can no longer drift apart.
+- The exemption test now exercises every entry's behaviour (it must answer a refused connector)
+  instead of restating the map, and a separate test pins the state-changing commands as gated.

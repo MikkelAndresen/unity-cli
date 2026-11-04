@@ -114,9 +114,14 @@ func fetchLatestRelease() (*ghRelease, error) {
 	return &release, nil
 }
 
-// findAsset finds the release asset matching the current OS and architecture.
+// findAsset finds the release asset matching this binary's OS and architecture.
 func findAsset(assets []ghAsset) *ghAsset {
-	suffix := fmt.Sprintf("%s-%s", runtime.GOOS, runtime.GOARCH)
+	return findAssetFor(assets, runtime.GOOS, runtime.GOARCH)
+}
+
+// findAssetFor is the lookup with the platform passed in, so its test does not depend on the host's.
+func findAssetFor(assets []ghAsset, goos, goarch string) *ghAsset {
+	suffix := fmt.Sprintf("%s-%s", goos, goarch)
 	for i, a := range assets {
 		if strings.Contains(a.Name, suffix) {
 			return &assets[i]

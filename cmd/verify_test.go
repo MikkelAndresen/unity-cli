@@ -93,8 +93,12 @@ func (f *fakeEditor) send(command string, params interface{}) (*client.CommandRe
 			return &client.CommandResponse{Success: false, Message: "Unknown command: compile_diagnostics"}, nil
 		}
 		list := f.diagnostics[p["source_tree_only"] == true]
+		total, listed := len(list), list
+		if limit, ok := p["limit"].(int); ok && limit > 0 && len(listed) > limit {
+			listed = listed[:limit]
+		}
 		reply := map[string]interface{}{
-			"compiling": f.diagnosticsCompiling, "total": len(list), "diagnostics": list,
+			"compiling": f.diagnosticsCompiling, "total": total, "diagnostics": listed,
 		}
 		prov := f.provenance
 		if len(f.provenanceSeq) > 0 {
@@ -342,6 +346,54 @@ func TestVerify_StaleAssemblyRefusesToRunTests(t *testing.T) {
 	}
 	if !strings.Contains(out, staleLine) || !strings.Contains(out, "tests: refused (1 stale assembly(s))") {
 		t.Errorf("output = %q, want the stale assembly and the refusal", out)
+	}
+}
+
+// TestVerify_StaleAssemblyOutsideTheAssemblyFilterDoesNotRefuse: verify must apply the same rule as
+// `test --assembly`, which only scans the requested assemblies.
+func TestVerify_StaleAssemblyOutsideTheAssemblyFilterDoesNotRefuse(t *testing.T) {
+	f := &fakeEditor{t: t, diagnostics: clean(), tests: passing(1), testsSuccess: true,
+		provenance: map[string]interface{}{
+			"provenance_line":      provLine,
+			"stale_assembly_count": 1,
+			"stale_assembly_line":  "stale assembly: Other.dll (built 12:01:00) is older than Assets/Other.cs (12:04:00)",
+			"stale_assemblies": []interface{}{map[string]interface{}{
+				"name": "Other", "newest_source": "Assets/Other.cs",
+			}},
+		}}
+	code, out := f.run("--assembly", "Foo.Tests")
+	if code != verifyOK {
+		t.Fatalf("exit = %d, want 0; output:\n%s", code, out)
+	}
+	if !f.called("run_tests") {
+		t.Errorf("tests did not run: %v", f.calls)
+	}
+	if !strings.Contains(out, "outside --assembly") {
+		t.Errorf("output = %q, want a note that the stale assembly is outside the filter", out)
+	}
+}
+
+// TestVerify_StaleAssemblyInsideTheAssemblyFilterRefuses is the other half: the assembly the tests
+// would load is stale, so verify still refuses.
+func TestVerify_StaleAssemblyInsideTheAssemblyFilterRefuses(t *testing.T) {
+	f := &fakeEditor{t: t, diagnostics: clean(),
+		provenance: map[string]interface{}{
+			"provenance_line":      provLine,
+			"stale_assembly_count": 1,
+			"stale_assembly_line":  "stale assembly: Foo.Tests.dll is older than its sources",
+			"stale_assemblies": []interface{}{map[string]interface{}{
+				"name": "Foo.Tests", "newest_source": "Assets/FooTests.cs",
+			}},
+		}}
+	code, out := f.run("--assembly", "Foo.Tests")
+	if code != verifyFailed {
+		t.Fatalf("exit = %d, want 1; output:\n%s", code, out)
+	}
+	if f.called("run_tests") {
+		t.Errorf("tests ran against a stale assembly: %v", f.calls)
+	}
+	if !strings.Contains(out, "tests: refused (1 stale assembly(s))") {
+		t.Errorf("output = %q, want the refusal", out)
 	}
 }
 
@@ -710,5 +762,41 @@ func TestVerifyExit_ConnectorRefusalIsFailure(t *testing.T) {
 	}
 	if code := verifyExit(&out, fmt.Errorf("no Unity instances")); code != verifyNoReply {
 		t.Errorf("exit = %d, want 2 for a missing editor", code)
+	}
+}
+
+// TestVerify_NoCompileObservedIsSaidOutLoud: an editor that was already ready is not proof that the
+// requested compile ran, so verify reports that the verdict is the editor's current state instead of
+// silently treating "ready" as "compiled".
+func TestVerify_NoCompileObservedIsSaidOutLoud(t *testing.T) {
+	compileTestBudgets(t)
+	base := int64(1_000)
+	f := &fakeEditor{t: t, diagnostics: clean(), tests: passing(1), testsSuccess: true,
+		echoFinished: &base, finishedAt: base}
+
+	code, out := f.run()
+	if code != verifyOK {
+		t.Fatalf("exit = %d, want 0; output:\n%s", code, out)
+	}
+	if !strings.Contains(out, "no script compilation was observed") {
+		t.Errorf("output = %q, want the note that no compile was seen", out)
+	}
+}
+
+// TestVerify_TruncatedDiagnosticsSaySo: error_count is the true total while errors[] is capped, so
+// the report must not look like the complete list.
+func TestVerify_TruncatedDiagnosticsSaySo(t *testing.T) {
+	errs := []interface{}{
+		map[string]interface{}{"file": "Assets/A.cs", "line": 1, "col": 1, "message": "e1"},
+		map[string]interface{}{"file": "Assets/B.cs", "line": 1, "col": 1, "message": "e2"},
+		map[string]interface{}{"file": "Assets/C.cs", "line": 1, "col": 1, "message": "e3"},
+	}
+	f := &fakeEditor{t: t, compileErrors: true, diagnostics: map[bool][]interface{}{true: errs, false: errs}}
+	code, out := f.run("--max", "2")
+	if code != verifyFailed {
+		t.Fatalf("exit = %d, want 1", code)
+	}
+	if !strings.Contains(out, "compile: 3 error(s)") || strings.Count(out, "Assets/") != 2 {
+		t.Errorf("output = %q, want the true total and two listed errors", out)
 	}
 }

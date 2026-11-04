@@ -182,3 +182,10 @@ single `\n` (the result itself is empty), errors still go only to stderr, and
   from #32 and was not changed.
 - An empty-string result still prints one newline, so `tail -1` is blank for that
   specific result; there is no non-empty final line to print.
+
+## Review follow-up
+
+- `printResponseTo` takes the error/meta writer as a parameter as well, so a test can assert the
+  result and the error/meta lines separately. `meta` no longer goes straight to `os.Stderr` from a
+  function whose result writer is injectable, and the two connector-error tests now use a buffer
+  instead of swapping the global.

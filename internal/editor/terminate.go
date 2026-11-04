@@ -3,6 +3,7 @@ package editor
 import (
 	"fmt"
 	"os"
+	"strings"
 )
 
 // CanManageProcess reports whether this process can identify pid as a Unity
@@ -31,4 +32,11 @@ func Terminate(pid int) error {
 		return err
 	}
 	return terminateProcess(proc)
+}
+
+// isUnityProcessName reads a process listing line (ps comm on unix, a tasklist row on Windows) and
+// reports whether it names the Unity editor. Shared so the two platform guards cannot disagree
+// about what may be terminated.
+func isUnityProcessName(line string) bool {
+	return strings.Contains(strings.ToLower(line), "unity")
 }

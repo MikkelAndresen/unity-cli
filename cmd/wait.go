@@ -153,7 +153,7 @@ func waitCmd(ctx context.Context, args []string, send sendFn, resolve instanceRe
 	if err != nil {
 		return noReply("editor: %v", err)
 	}
-	if age := heartbeatAge(baseline); age > staleHeartbeatAge {
+	if age := client.HeartbeatAge(baseline); age > staleHeartbeatAge {
 		report := stalledEditorReport(baseline, age, assessCrash(baseline))
 		return noReply("%s", report)
 	}
@@ -193,7 +193,7 @@ func waitCmd(ctx context.Context, args []string, send sendFn, resolve instanceRe
 		// has its own writer, so long silence means the editor wedged or restarted: no amount of
 		// --timeout will make it answer. A domain reload also stops the update-driven writes for its
 		// whole duration, so silence there is only a reason to stop if the editor died in it.
-		if age := heartbeatAge(status); age > waitSilentHeartbeat {
+		if age := client.HeartbeatAge(status); age > waitSilentHeartbeat {
 			verdict := assessCrash(status)
 			if status.State != "reloading" || verdict.Crashed {
 				return noReply("%s", stalledEditorReport(status, age, verdict))
@@ -266,14 +266,6 @@ func waitCmd(ctx context.Context, args []string, send sendFn, resolve instanceRe
 		case <-time.After(statusPollInterval):
 		}
 	}
-}
-
-// heartbeatAge is how old the instance's last heartbeat is. A missing timestamp counts as ancient.
-func heartbeatAge(inst *client.Instance) time.Duration {
-	if inst == nil || inst.Timestamp == 0 {
-		return time.Hour
-	}
-	return time.Since(time.UnixMilli(inst.Timestamp))
 }
 
 // staleHeartbeatAge is the cut-off statusCmd uses before calling an editor unresponsive. The client

@@ -154,12 +154,33 @@ func verifyCmd(ctx context.Context, args []string, send, testSend sendFn, resolv
 	if !resp.Success {
 		return noReply("editor: %s", resp.Message)
 	}
-	hasErrors, timedOut, err := waitForReadyTo(ctx, resolve, io.Discard, "verify")
+	// The refresh reply carries the connector's compile clock at request time; waiting for that clock
+	// to advance is proof a compile finished, unlike waiting for the state to read "ready" (which an
+	// editor that had not started compiling also says).
+	baseline := compileBaseline{}
+	if v, ok := reportFieldInt(resp.Data, "compile_finished_at"); ok {
+		baseline.FinishedAt, baseline.Tracked = v, true
+	}
+	if current, rerr := resolve(); rerr == nil && current != nil {
+		if !baseline.Tracked {
+			baseline.FinishedAt = current.CompileFinishedAt
+		}
+		baseline.PID = current.PID
+	}
+	outcome, err := waitForCompileTo(ctx, resolve, io.Discard, "verify", baseline)
 	if err != nil {
 		return noReply("compile: %v", err)
 	}
-	if timedOut {
-		return noReply("compile: still compiling after 5 minutes")
+	if outcome.TimedOut {
+		return noReply("compile: still compiling after %s", compileWaitTimeout)
+	}
+	hasErrors := outcome.HasErrors
+	if outcome.NothingToCompile {
+		note := "no script compilation was observed after the refresh; the compile verdict is the editor's current state"
+		r.Notes = append(r.Notes, note)
+		if !asJSON {
+			_, _ = fmt.Fprintf(out, "  (%s)\n", note)
+		}
 	}
 
 	findings, err := verifyDiagnostics(send, max, hasErrors, verifyDiagnosticsWait)
@@ -177,10 +198,19 @@ func verifyCmd(ctx context.Context, args []string, send, testSend sendFn, resolv
 		return finish(verifyFailed)
 	}
 
-	if findings.Provenance != nil && findings.Provenance.StaleAssemblyCount > 0 {
+	staleCount := staleAssembliesUnderTest(findings.Provenance, flags["assembly"])
+	if findings.Provenance != nil && findings.Provenance.StaleAssemblyCount > staleCount && staleCount == 0 {
+		r.Notes = append(r.Notes, fmt.Sprintf("%d stale assembly(ies) are outside --assembly; the tests will not load them",
+			findings.Provenance.StaleAssemblyCount))
+		if !asJSON {
+			_, _ = fmt.Fprintf(out, "  (%d stale assembly(ies) are outside --assembly; the tests will not load them)\n",
+				findings.Provenance.StaleAssemblyCount)
+		}
+	}
+	if staleCount > 0 {
 		line := findings.Provenance.StaleAssemblyLine
-		if line == "" {
-			line = fmt.Sprintf("%d project assembly(ies) are older than their sources", findings.Provenance.StaleAssemblyCount)
+		if line == "" || staleCount != findings.Provenance.StaleAssemblyCount {
+			line = fmt.Sprintf("%d project assembly(ies) under test are older than their sources", staleCount)
 		}
 		if !allowStale {
 			if asJSON {
@@ -188,7 +218,7 @@ func verifyCmd(ctx context.Context, args []string, send, testSend sendFn, resolv
 			} else {
 				_, _ = fmt.Fprintln(out, line)
 				_, _ = fmt.Fprintf(out, "tests: refused (%d stale assembly(s)) — run unity-cli editor refresh --compile, or pass --allow-stale to run them anyway\n",
-					findings.Provenance.StaleAssemblyCount)
+					staleCount)
 			}
 			return finish(verifyFailed)
 		}
@@ -479,6 +509,32 @@ func printTests(out io.Writer, total, passed, failed, skipped int, failures []st
 	for _, f := range failures {
 		_, _ = fmt.Fprintf(out, "  %s\n", f)
 	}
+}
+
+// staleAssembliesUnderTest narrows the provenance's stale assemblies to the ones the test run will
+// load. `test --assembly Foo.Tests` scans only Foo.Tests, so verify must not refuse because an
+// unrelated assembly is stale. Without a filter every stale assembly counts; a truncated list
+// cannot prove the requested ones are clean, so it keeps the full count.
+func staleAssembliesUnderTest(prov *compileProvenance, assembly string) int {
+	if prov == nil {
+		return 0
+	}
+	wanted := map[string]struct{}{}
+	for _, name := range strings.Split(assembly, ",") {
+		if name = strings.TrimSpace(name); name != "" {
+			wanted[name] = struct{}{}
+		}
+	}
+	if len(wanted) == 0 || prov.StaleAssembliesTruncated {
+		return prov.StaleAssemblyCount
+	}
+	count := 0
+	for _, stale := range prov.StaleAssemblies {
+		if _, ok := wanted[stale.Name]; ok {
+			count++
+		}
+	}
+	return count
 }
 
 func firstLines(items []string, max int) []string {
