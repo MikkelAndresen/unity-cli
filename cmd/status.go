@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -121,6 +122,8 @@ var versionExemptCommands = map[string]struct{}{
 	"console":             {},
 	"compile_diagnostics": {},
 	"compile_status":      {},
+	"api":                 {},
+	"burst_status":        {},
 	"modal":               {},
 	"tools":               {},
 	"tool_describe":       {},
@@ -139,6 +142,17 @@ type connectorCompatibility struct {
 	Verdict    string
 	Warning    string
 	Refusal    error
+}
+
+type connectorRefusal struct {
+	message string
+}
+
+func (e *connectorRefusal) Error() string { return e.message }
+
+func isConnectorRefusal(err error) bool {
+	var refusal *connectorRefusal
+	return errors.As(err, &refusal)
 }
 
 type semanticVersion struct {
@@ -177,7 +191,7 @@ func assessConnectorVersion(inst *client.Instance, cliVersion string) connectorC
 	if versionLess(connector, min) {
 		v.Compatible = false
 		v.Verdict = fmt.Sprintf("connector %s is older than the minimum %s; update the connector package", v.Connector, minConnectorVersion)
-		v.Refusal = fmt.Errorf("connector %s is older than the minimum %s supported by unity-cli %s (%s). Update the com.youngwoocho02.unity-cli-connector package in Unity, or rerun with --ignore-version-mismatch", v.Connector, minConnectorVersion, v.CLI, executablePath())
+		v.Refusal = &connectorRefusal{message: fmt.Sprintf("connector %s is older than the minimum %s supported by unity-cli %s (%s). Update the com.youngwoocho02.unity-cli-connector package in Unity, or rerun with --ignore-version-mismatch", v.Connector, minConnectorVersion, v.CLI, executablePath())}
 		return v
 	}
 	if connector.major == cli.major && connector.minor == cli.minor {

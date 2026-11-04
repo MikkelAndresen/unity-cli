@@ -963,6 +963,7 @@ Notes:
   - Multiple Unity instances: use --port or --project to select
   - Custom tools: any [UnityCliTool] class is auto-discovered
   - A subcommand flag other than --params may be given once; repeating it is an error, not a silent overwrite
+  - Only exec, build and custom tools read --params; test, verify, editor and wait take their own flags
   - Run 'list' to see all available tools
   - Every accepted command gets one answer: a queued command that the main thread never starts is
     answered as main_thread_busy, one still queued when Unity reloads as domain_reload (retry it),

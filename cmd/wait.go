@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"os"
 	"strconv"
 	"time"
 
@@ -81,7 +82,7 @@ func isStartingState(state string) bool {
 func waitCmd(ctx context.Context, args []string, send sendFn, resolve instanceResolver, out io.Writer) int {
 	flags, err := parseSubFlags(args)
 	if err != nil {
-		_, _ = fmt.Fprintf(out, "wait: %v\n", err)
+		_, _ = fmt.Fprintf(os.Stderr, "wait: %v\n", err)
 		return waitTimedOut
 	}
 	_, wantCompile := flags["compile"]

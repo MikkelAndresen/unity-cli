@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -87,7 +88,7 @@ const defaultBurstWaitSeconds = 60
 func verifyCmd(ctx context.Context, args []string, send, testSend sendFn, resolve instanceResolver, port int, out io.Writer) int {
 	flags, err := parseSubFlags(args)
 	if err != nil {
-		_, _ = fmt.Fprintln(out, err)
+		_, _ = fmt.Fprintln(os.Stderr, err)
 		return verifyFailed
 	}
 	_, noTests := flags["no-tests"]
@@ -130,6 +131,11 @@ func verifyCmd(ctx context.Context, args []string, send, testSend sendFn, resolv
 	}
 	noReply := func(format string, a ...interface{}) int {
 		r.Error = fmt.Sprintf(format, a...)
+		for _, arg := range a {
+			if err, ok := arg.(error); ok && isConnectorRefusal(err) {
+				return finish(verifyFailed)
+			}
+		}
 		return finish(verifyNoReply)
 	}
 
@@ -512,8 +518,12 @@ func versionBefore(version string, major, minor int) bool {
 }
 
 // verifyExit maps an error that stopped verify (or wait) before it could ask the editor anything
-// (no instance, editor not alive, version mismatch, a dialog) to exit code 2.
+// (no instance, editor not alive, a dialog) to exit code 2. A connector below the minimum protocol
+// is a refusal, not a missing answer, so verify reports it as a failure (1) instead.
 func verifyExit(out io.Writer, err error) int {
 	_, _ = fmt.Fprintln(out, err.Error())
+	if isConnectorRefusal(err) {
+		return verifyFailed
+	}
 	return verifyNoReply
 }

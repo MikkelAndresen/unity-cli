@@ -997,12 +997,14 @@ unity-cli list
 
 ### Passing Parameters
 
-Every command accepts `--params '<json object>'` as an alternative to individual flags. The CLI
-sends the resulting object to the connector as the tool's parameters.
+`exec`, `build`, and custom tools called by name accept `--params '<json object>'` as an
+alternative to individual flags. The CLI sends the resulting object to the connector as the tool's
+parameters. Built-in commands with their own flags (`test`, `verify`, `editor`, `wait`) build their
+parameters from those flags and do not read `--params`.
 
 ```bash
-# Equivalent to: unity-cli test --assembly MyGame.Tests.Editor
-unity-cli test --params '{"assembly":"MyGame.Tests.Editor"}'
+# exec with JSON parameters
+unity-cli exec --params '{"code":"return 42;"}'
 
 # Repeated --params objects are merged in order, so later keys win
 unity-cli exec --params '{"code":"return 42;"}' --params '{"await_timeout":1000}'
@@ -1149,8 +1151,9 @@ unity-cli --ignore-version-mismatch exec 'return 1 + 1;'
 CLI and connector versions do not have to match exactly. A patch difference in the same major.minor
 is accepted silently. A different minor or major version is accepted with one warning on stderr that
 names both versions, the CLI binary and the fix; diagnostic commands (`status`, `console`,
-`compile_diagnostics`, `compile_status`, `modal`, `tools`, `tool_describe`, `wait`, `dialogs`, `list`)
-never fail on it. The CLI refuses only a connector older than 0.7.0, the oldest protocol it speaks.
+`compile_diagnostics`, `compile_status`, `api`, `burst_status`, `modal`, `tools`, `tool_describe`,
+`wait`, `dialogs`, `list`) never fail on it. The CLI refuses only a connector older than 0.7.0, the
+oldest protocol it speaks.
 `status` always prints both versions and the compatibility verdict.
 
 Use `--help` on any command for detailed usage:

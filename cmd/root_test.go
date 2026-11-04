@@ -271,9 +271,10 @@ func TestBuildParams_InvalidJSONNamesTheOccurrence(t *testing.T) {
 	tests := []struct {
 		name string
 		args []string
+		want string
 	}{
-		{"first params", []string{"--params", `{`}},
-		{"second params", []string{"--params", `{"ok":1}`, "--params", `{`}},
+		{"first params", []string{"--params", `{`}, "invalid JSON in --params #1"},
+		{"second params", []string{"--params", `{"ok":1}`, "--params", `{`}, "invalid JSON in --params #2"},
 	}
 
 	for _, tt := range tests {
@@ -282,8 +283,8 @@ func TestBuildParams_InvalidJSONNamesTheOccurrence(t *testing.T) {
 			if err == nil {
 				t.Fatal("expected invalid JSON error")
 			}
-			if !strings.Contains(err.Error(), "invalid JSON in --params") {
-				t.Errorf("error should mention --params, got: %v", err)
+			if !strings.Contains(err.Error(), tt.want) {
+				t.Errorf("error should contain %q, got: %v", tt.want, err)
 			}
 		})
 	}

@@ -146,7 +146,7 @@ func TestVersionGate_CommandExemptions(t *testing.T) {
 	t.Cleanup(func() { Version = origVersion })
 
 	exempt := []string{
-		"status", "console", "compile_diagnostics", "compile_status", "modal",
+		"status", "console", "compile_diagnostics", "compile_status", "api", "burst_status", "modal",
 		"tools", "tool_describe", "wait", "dialogs", "list", "help", "version", "update",
 	}
 	for _, command := range exempt {

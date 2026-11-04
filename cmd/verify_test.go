@@ -672,3 +672,43 @@ func TestVersionBefore(t *testing.T) {
 		}
 	}
 }
+
+func TestVerify_UsageErrorGoesToStderr(t *testing.T) {
+	var out bytes.Buffer
+	var code int
+	errOut := captureStderr(t, func() {
+		code = verifyCmd(context.Background(), []string{"--filter", "a", "--filter", "b"}, nil, nil, nil, 0, &out)
+	})
+	if code != verifyFailed {
+		t.Fatalf("exit = %d, want 1", code)
+	}
+	if out.Len() != 0 {
+		t.Errorf("stdout = %q, want empty so --json consumers keep a parseable stream", out.String())
+	}
+	if !strings.Contains(errOut, "duplicate flag --filter") {
+		t.Errorf("stderr = %q, want the usage error", errOut)
+	}
+}
+
+func TestVerify_ConnectorVersionRefusalIsExitOne(t *testing.T) {
+	refusal := &connectorRefusal{message: "connector 0.6.0 is older than the minimum 0.7.0"}
+	send := func(string, interface{}) (*client.CommandResponse, error) { return nil, refusal }
+	var out bytes.Buffer
+	code := verifyCmd(context.Background(), nil, send, send, nil, 0, &out)
+	if code != verifyFailed {
+		t.Fatalf("exit = %d, want 1", code)
+	}
+	if !strings.Contains(out.String(), "older than the minimum") {
+		t.Errorf("output = %q, want the refusal message", out.String())
+	}
+}
+
+func TestVerifyExit_ConnectorRefusalIsFailure(t *testing.T) {
+	var out bytes.Buffer
+	if code := verifyExit(&out, &connectorRefusal{message: "connector 0.6.0 is too old"}); code != verifyFailed {
+		t.Errorf("exit = %d, want 1", code)
+	}
+	if code := verifyExit(&out, fmt.Errorf("no Unity instances")); code != verifyNoReply {
+		t.Errorf("exit = %d, want 2 for a missing editor", code)
+	}
+}
