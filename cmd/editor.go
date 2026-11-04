@@ -21,7 +21,7 @@ const compileReportMaxDiags = 20
 // resolve is needed for compile polling so it can follow the current project instance.
 func editorCmd(args []string, send sendFn, resolve instanceResolver) (*client.CommandResponse, error) {
 	if len(args) == 0 {
-		return nil, fmt.Errorf("usage: unity-cli editor <play|stop|pause|refresh>")
+		return nil, fmt.Errorf("usage: unity-cli editor <play|stop|pause|refresh|quit|restart>")
 	}
 
 	action := args[0]
@@ -60,7 +60,7 @@ func editorCmd(args []string, send sendFn, resolve instanceResolver) (*client.Co
 		return send("refresh_unity", params)
 
 	default:
-		return nil, fmt.Errorf("unknown editor action: %s\nAvailable: play, stop, pause, refresh", action)
+		return nil, fmt.Errorf("unknown editor action: %s\nAvailable: play, stop, pause, refresh, quit, restart", action)
 	}
 }
 

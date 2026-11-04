@@ -150,7 +150,7 @@ and states that the command did not run. A request still queued when Unity reloa
 
 | Command | Description |
 |---------|-------------|
-| `editor` | Play/stop/pause/refresh the Unity Editor |
+| `editor` | Play/stop/pause/refresh/quit/restart the Unity Editor |
 | `input` | Inject new-Input-System keyboard/mouse/gamepad/touch state in Play mode and pump the player loop |
 | `console` | Read, filter, and clear console logs (newest 50 entries, capped stack traces) |
 | `exec` | Run arbitrary C# code inside Unity (`--skip_compile_check` bypasses the compile gate) |
@@ -212,6 +212,77 @@ compile failed or timed out, and the report is printed either way. `--compile` c
 first so an error left over from an earlier compile is not reported as this one's; `--keep-console`
 skips the clear. Connectors without the compile-finished clock fall back to the heartbeat's
 `compileErrors` flag and say so in `notes`.
+
+### Quit
+
+```bash
+# Quit and wait until Unity has actually exited (unsaved scene changes are discarded)
+unity-cli editor quit
+
+# Save open scenes and assets first
+unity-cli editor quit --save
+
+# Say explicitly that unsaved scene changes are discarded
+unity-cli editor quit --discard
+
+# Terminate Unity if it ignores the quit or a modal dialog blocks it
+unity-cli editor quit --save --force
+```
+
+Use `editor quit` rather than `exec "EditorApplication.Exit(0)"`. Calling `Exit`
+from inside a command handler shares the command's fate: the reply and the shutdown
+race, and an exit vetoed by `EditorApplication.wantsToQuit` has no way to report
+itself. `editor quit` sends `quit_editor`, which answers first and schedules the
+exit for a later editor tick. It then waits until the heartbeat reports `stopped`
+or the process is gone, and fails if neither happens within 60 seconds
+(`--timeout` overrides it).
+
+Without `--save`, dirty scenes are discarded; the reply lists them under
+`discardedScenes`. `--save` saves each dirty scene synchronously and refuses to
+quit while an untitled scene has unsaved changes, because saving it would open a
+file dialog the CLI cannot answer. `--discard` is the explicit form of the
+default. The reply also lists any visible `EditorApplication.wantsToQuit`
+subscribers, and the connector logs an error naming them if Unity is still alive
+after the scheduled `Exit` - that is what a veto looks like from outside.
+
+With `--force`, an editor that does not exit in time, or that is parked on a
+modal dialog, is terminated (SIGTERM on macOS/Linux, `TerminateProcess` on
+Windows). Unsaved changes are lost. The CLI only signals a PID whose process
+name contains `Unity`. When the CLI runs in a container that cannot see the host
+editor's PID, `--force` fails and Unity has to be stopped from the host. The final
+JSON reports `method`: `graceful` or `terminate`, and `editor` carries the
+connector's scene/veto report.
+
+### Restart
+
+```bash
+# Quit, relaunch, and wait until Unity is ready
+unity-cli editor restart
+
+# Save open scenes and assets before quitting
+unity-cli editor restart --save
+
+# Delete Library/ and Temp/ before relaunching (forces a full reimport)
+unity-cli editor restart --clean
+
+# Launch a specific Unity editor binary
+unity-cli editor restart --editor-path /Applications/Unity/Hub/Editor/6000.1.0f1/Unity.app/Contents/MacOS/Unity
+```
+
+`editor restart` resolves the project before stopping the editor (from the running
+instance, `--project`, or the current directory), quits it, optionally removes
+`Library/` and `Temp/`, relaunches it, and waits until the new editor reports
+`ready`. Progress and removed paths go to stderr; the final JSON contains the
+project path, old and new PIDs, cleaned paths, and elapsed time.
+
+The default wait budget is 5 minutes, or 15 minutes with `--clean`; `--timeout`
+overrides both that and the 60-second quit wait. Restart stops Unity the same way
+as `editor quit`, and accepts the same `--save`/`--discard`/`--force` flags.
+Without `--force` it never kills the process, so if a modal dialog blocks
+quitting, answer it first. Restart must run where it can signal and launch Unity;
+from a container it refuses before quitting the editor, because it would otherwise
+leave the editor stopped with no way to relaunch it. If startup stalls, a dialog
+may be waiting in the editor window (safe mode, restore backup, or version upgrade).
 
 ### Input Injection (Play mode)
 
@@ -997,7 +1068,7 @@ the wait exceeded a second.
 |------|-------------|---------|
 | `--port <N>` | Select Unity instance by active heartbeat port | auto |
 | `--project <path>` | Select Unity instance by project path | latest |
-| `--timeout <ms>` | One budget per invocation, shared by discovery, waiting for a fresh heartbeat, and the request. The remaining budget is sent to the Connector as `deadline_ms`, so it answers a queued command before this deadline does — see [Queued Commands and Server-Side Deadlines](#queued-commands-and-server-side-deadlines). A client deadline is reported as `timed out ... (the editor may still be running it)`, not as a connection failure. `test`, `verify` and `editor refresh --compile` default to 1800000 (30 min); an explicit `0` means no deadline (the Connector still answers a queued command after its 60 s default). `wait --timeout` and build polling keep their own budgets. | 120000 |
+| `--timeout <ms>` | One budget per invocation, shared by discovery, waiting for a fresh heartbeat, and the request. The remaining budget is sent to the Connector as `deadline_ms`, so it answers a queued command before this deadline does — see [Queued Commands and Server-Side Deadlines](#queued-commands-and-server-side-deadlines). A client deadline is reported as `timed out ... (the editor may still be running it)`, not as a connection failure. `test`, `verify` and `editor refresh --compile` default to 1800000 (30 min); an explicit `0` means no deadline (the Connector still answers a queued command after its 60 s default). `wait --timeout` and build polling keep their own budgets. For `editor quit`/`restart` it is also the wait-to-exit and startup budget. | 120000 |
 | `--ignore-version-mismatch` | Suppress the version-drift warning (and the refusal for a connector older than 0.7.0) | false |
 | `--meta` | Print the response's `meta` (how the call was served, e.g. `exec`'s compile cache state) to stderr | false |
 

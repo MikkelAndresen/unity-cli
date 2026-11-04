@@ -8,6 +8,8 @@ CLI tool to control Unity Editor from the command line.
 cmd/                  # Go CLI — thin passthrough layer
   root.go             # Entry point, flag/arg parsing, default passthrough
   editor.go           # editor command (waitForReady polling)
+  quit.go             # editor quit: quit_editor, wait for exit, optional SIGTERM fallback
+  restart.go          # editor restart: stop, optional clean, relaunch, wait for ready
   test.go             # test command (PlayMode result polling)
   build.go            # build command (job start, build_status polling, progress lines)
   verify.go           # verify command (compile + compile_diagnostics + tests, brief output)
@@ -21,6 +23,8 @@ cmd/                  # Go CLI — thin passthrough layer
   version_check.go    # periodic update notice (12h interval)
 internal/client/      # Unity HTTP client, instance discovery, Temp/UnityLockfile evidence,
                       # crash artifacts (mono_crash/Editor-prev.log) and why a dropped connection died
+internal/editor/      # editor lifecycle: heartbeat files, exit waiting, process termination,
+                      # editor executable discovery, launch, project clean/version checks
 unity-connector/      # C# Unity Editor package (UPM)
   Editor/
     Core/             # Shared utilities (Response, ParamCoercion, ToolParams, StringCaseUtility, StackTraceFilter, CompileProvenance,
