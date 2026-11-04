@@ -212,6 +212,10 @@ func Execute() error {
 type sendFn func(command string, params interface{}) (*client.CommandResponse, error)
 
 func printResponse(resp *client.CommandResponse) {
+	printResponseTo(os.Stdout, resp)
+}
+
+func printResponseTo(w io.Writer, resp *client.CommandResponse) {
 	defer func() {
 		if line := metaLine(resp.Meta, flagMeta); line != "" {
 			fmt.Fprint(os.Stderr, line)
@@ -236,16 +240,18 @@ func printResponse(resp *client.CommandResponse) {
 		if json.Unmarshal(resp.Data, &pretty) == nil {
 			// If data is a plain string, print it raw (preserves newlines for tree output etc.)
 			if s, ok := pretty.(string); ok {
-				fmt.Println(s)
+				// A result that already ends in a newline must not gain a second one: a
+				// caller using '2>&1 | tail -1' would otherwise get a blank final line (#32).
+				fmt.Fprint(w, oneTrailingNewline(s))
 			} else {
 				b, _ := json.MarshalIndent(pretty, "", "  ")
-				fmt.Println(string(b))
+				fmt.Fprint(w, oneTrailingNewline(string(b)))
 			}
 		} else {
-			fmt.Println(string(resp.Data))
+			fmt.Fprint(w, oneTrailingNewline(string(resp.Data)))
 		}
 	} else if resp.Message != "" {
-		fmt.Println(resp.Message)
+		fmt.Fprint(w, oneTrailingNewline(resp.Message))
 	}
 }
 

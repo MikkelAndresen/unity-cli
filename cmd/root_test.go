@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"bytes"
 	"encoding/json"
 	"reflect"
 	"strings"
@@ -56,6 +57,36 @@ func TestMetaLine(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			if got := metaLine(tt.meta, tt.enabled); got != tt.want {
 				t.Errorf("metaLine(%s, %v) = %q, want %q", string(tt.meta), tt.enabled, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestPrintResponseToEndsWithExactlyOneNewline(t *testing.T) {
+	tests := []struct {
+		name string
+		resp *client.CommandResponse
+		want string
+	}{
+		{"plain string", &client.CommandResponse{Success: true, Data: json.RawMessage(`"hello"`)}, "hello\n"},
+		{"multi-line string without trailing newline", &client.CommandResponse{Success: true, Data: json.RawMessage(`"line1\nline2"`)}, "line1\nline2\n"},
+		// The final line must be the result, not a blank line left by Println (#32).
+		{"multi-line string with trailing newline", &client.CommandResponse{Success: true, Data: json.RawMessage(`"line1\nline2\n"`)}, "line1\nline2\n"},
+		{"string with several trailing newlines", &client.CommandResponse{Success: true, Data: json.RawMessage(`"line1\n\n\n"`)}, "line1\n"},
+		{"number", &client.CommandResponse{Success: true, Data: json.RawMessage(`42`)}, "42\n"},
+		{"object is indented", &client.CommandResponse{Success: true, Data: json.RawMessage(`{"a":1}`)}, "{\n  \"a\": 1\n}\n"},
+		{"null with message", &client.CommandResponse{Success: true, Data: json.RawMessage(`null`), Message: "OK"}, "OK\n"},
+		{"message with trailing newline", &client.CommandResponse{Success: true, Message: "done\n"}, "done\n"},
+		{"null without message", &client.CommandResponse{Success: true, Data: json.RawMessage(`null`)}, ""},
+		{"empty string result", &client.CommandResponse{Success: true, Data: json.RawMessage(`""`)}, "\n"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var out bytes.Buffer
+			printResponseTo(&out, tt.resp)
+			if got := out.String(); got != tt.want {
+				t.Errorf("printResponseTo() = %q, want %q", got, tt.want)
 			}
 		})
 	}
