@@ -135,6 +135,11 @@ namespace UnityCliConnector
         internal static long LastCompileStartedAtMs() =>
             s_Record.started_at_ms > 0 ? s_Record.started_at_ms : s_Record.finished_at_ms;
 
+        /// True when LastCompileStartedAtMs had to fall back to the finish clock, so a message naming
+        /// it must not claim that time is a start.
+        internal static bool LastCompileClockFromFinish() =>
+            s_Record.started_at_ms <= 0 && s_Record.finished_at_ms > 0;
+
         internal static object BuildPayloadFrom(Record record, SourceScan scan, long nowMs,
             AssemblyStaleness.ScanResult assemblies = null)
         {

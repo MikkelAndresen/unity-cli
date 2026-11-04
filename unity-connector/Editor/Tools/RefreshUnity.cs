@@ -54,6 +54,10 @@ namespace UnityCliConnector.Tools
                 : ImportAssetOptions.ForceSynchronousImport);
 
             bool clean = string.Equals(compile, "clean", StringComparison.OrdinalIgnoreCase);
+            // CleanBuildCache only exists from 2021.1; on an older editor this used to fall back to a
+            // plain request, which a caller could mistake for the clean rebuild it asked for.
+            if (clean && !CleanCompileSupported())
+                return new ErrorResponse("compile:\"clean\" needs Unity 2021.1 or newer; request a normal compile instead.");
             if (string.Equals(compile, "request", StringComparison.OrdinalIgnoreCase) || clean)
             {
                 Heartbeat.MarkCompileRequested();
@@ -76,7 +80,7 @@ namespace UnityCliConnector.Tools
                 refresh_triggered = true,
                 compile_requested = compileRequested,
                 // The CLI may ask for one CleanBuildCache retry after a compile left a stale DLL.
-                clean_compile_supported = true,
+                clean_compile_supported = CleanCompileSupported(),
                 compile_finished_at = compileFinishedBefore,
                 force = force,
                 warning = warning,
@@ -88,6 +92,15 @@ namespace UnityCliConnector.Tools
                 stale_assembly_covered_count = stale.CoveredCount,
                 stale_assembly_covered_line = AssemblyStaleness.FormatCoveredLine(stale),
             });
+        }
+
+        private static bool CleanCompileSupported()
+        {
+#if UNITY_2021_1_OR_NEWER
+            return true;
+#else
+            return false;
+#endif
         }
 
         private static List<string> GetDirtyOpenScenes()

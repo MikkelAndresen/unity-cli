@@ -75,9 +75,20 @@ namespace UnityCliConnector
 				// fact that this compile rebuilt something.
 				Save();
 				CompileProvenance.NoteAssemblyCompiled(path);
+				if (!HasErrors(messages))
+					AssemblyStaleness.NoteAssemblyCompiled(path);
 			};
 			CompilationPipeline.compilationFinished += _ => NoteCompileFinished(false);
 			AssemblyReloadEvents.afterAssemblyReload += () => NoteCompileFinished(true);
+		}
+
+		private static bool HasErrors(CompilerMessage[] messages)
+		{
+			if (messages == null) return false;
+			foreach (var message in messages)
+				if (message.type == CompilerMessageType.Error)
+					return true;
+			return false;
 		}
 
 		private static void NoteCompileStarted()

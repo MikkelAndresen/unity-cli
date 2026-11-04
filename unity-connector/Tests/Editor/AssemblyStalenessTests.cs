@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using Newtonsoft.Json.Linq;
 using NUnit.Framework;
 using UnityCliConnector;
 
@@ -136,9 +137,77 @@ namespace UnityCliConnector.Tests
 
             Assert.AreEqual(0, result.StaleCount);
             Assert.AreEqual(1, result.CoveredCount);
+            Assert.IsTrue(result.CoveredSample.Unverified, "without a content record the compile clock is all there is");
             Assert.IsNull(AssemblyStaleness.FormatLine(result), "a covered assembly must not read as a refusal");
-            StringAssert.Contains("not stale: Game.dll (built ", AssemblyStaleness.FormatCoveredLine(result));
+            StringAssert.Contains("not stale (unverified, no content record): Game.dll (built ", AssemblyStaleness.FormatCoveredLine(result));
             StringAssert.Contains("read that source and kept the DLL", AssemblyStaleness.FormatCoveredLine(result));
+        }
+
+        [Test]
+        public void Evaluate_SourceWithTheRecordedContent_IsCoveredEvenWithoutACompileClock()
+        {
+            var source = Write("Game/Player.cs", BaseMs + 1_000);
+            var dll = Write("Library/ScriptAssemblies/Game.dll", BaseMs);
+            var records = Records("Game", dll, source);
+
+            // A touch moves the mtime but not the content, so the DLL still holds this source even
+            // though this editor session has not run a compile yet.
+            var result = AssemblyStaleness.Evaluate(new[] { Input("Game", dll, source) }, _tmp, 5_000,
+                0, records);
+
+            Assert.AreEqual(0, result.StaleCount);
+            Assert.AreEqual(1, result.CoveredCount);
+            Assert.IsFalse(result.CoveredSample.Unverified);
+            StringAssert.Contains("content matches", AssemblyStaleness.FormatCoveredLine(result));
+        }
+
+        [Test]
+        public void Evaluate_ContentChangedBeforeTheCompileStarted_IsStillStale()
+        {
+            var source = Write("Game/Player.cs", BaseMs + 1_000, "before\n");
+            var dll = Write("Library/ScriptAssemblies/Game.dll", BaseMs);
+            var records = Records("Game", dll, source);
+            File.WriteAllText(source, "after\n");
+            File.SetLastWriteTimeUtc(source, DateTimeOffset.FromUnixTimeMilliseconds(BaseMs + 1_000).UtcDateTime);
+
+            // #29: edit, then a compile Unity says succeeded without rewriting the DLL. The source
+            // predates the compile start, so the clock alone would call this covered.
+            var result = AssemblyStaleness.Evaluate(new[] { Input("Game", dll, source) }, _tmp, 5_000,
+                BaseMs + 2_000, records);
+
+            Assert.AreEqual(1, result.StaleCount,
+                "the content differs from what the successful compile recorded, so the DLL is old");
+            Assert.AreEqual(0, result.CoveredCount);
+        }
+
+        [Test]
+        public void Evaluate_SourceAddedAfterTheRecord_IsStale()
+        {
+            var compiled = Write("Game/Player.cs", BaseMs);
+            var added = Write("Game/Added.cs", BaseMs + 1_000);
+            var dll = Write("Library/ScriptAssemblies/Game.dll", BaseMs);
+            var records = Records("Game", dll, compiled);
+
+            var result = AssemblyStaleness.Evaluate(new[] { Input("Game", dll, compiled, added) }, _tmp, 5_000,
+                BaseMs + 2_000, records);
+
+            Assert.AreEqual(1, result.StaleCount,
+                "a source the recorded compile never saw cannot be covered by its clock");
+            Assert.AreEqual(0, result.CoveredCount);
+        }
+
+        [Test]
+        public void Evaluate_CoveredClockFromFinish_SaysFinishedNotStarted()
+        {
+            var source = Write("Game/Player.cs", BaseMs + 1_000);
+            var dll = Write("Library/ScriptAssemblies/Game.dll", BaseMs);
+
+            var result = AssemblyStaleness.Evaluate(new[] { Input("Game", dll, source) }, _tmp, 5_000,
+                coveredSinceMs: BaseMs + 2_000, coveredClockIsFinish: true);
+
+            var line = AssemblyStaleness.FormatCoveredLine(result);
+            StringAssert.Contains("compile that finished", line);
+            StringAssert.DoesNotContain("compile that started", line);
         }
 
         [Test]
@@ -165,6 +234,21 @@ namespace UnityCliConnector.Tests
 
             Assert.AreEqual(1, result.StaleCount, "a compile cannot decide an absent DLL is up to date");
             Assert.AreEqual(0, result.CoveredCount);
+        }
+
+        [Test]
+        public void RunTests_AnIncompleteScanRefusesInsteadOfRunningTheOldDll()
+        {
+            var block = AssemblyStaleness.BlockIfStaleOrIncomplete(
+                new AssemblyStaleness.ScanResult { Complete = false, ScanMs = 200 });
+
+            Assert.IsInstanceOf<ErrorResponse>(block);
+            var response = (ErrorResponse)block;
+            var data = JObject.FromObject(response.data);
+            Assert.AreEqual("stale-assembly-scan-incomplete", data["blocked"].Value<string>());
+            StringAssert.Contains("Pass --allow-stale", response.message);
+            Assert.IsNull(AssemblyStaleness.BlockIfStaleOrIncomplete(
+                new AssemblyStaleness.ScanResult { Complete = true }), "a complete clean scan must let tests run");
         }
 
         [Test]
@@ -246,11 +330,27 @@ namespace UnityCliConnector.Tests
         AssemblyStaleness.AssemblyInput Input(string name, string dll, params string[] sources) =>
             new AssemblyStaleness.AssemblyInput { Name = name, OutputPath = dll, Sources = sources };
 
-        string Write(string relative, long wroteUtcMs)
+        Dictionary<string, AssemblyStaleness.AssemblyContentRecord> Records(string name, string dll,
+            params string[] sources)
+        {
+            var hashes = new Dictionary<string, string>();
+            foreach (var source in sources)
+                hashes[source] = AssemblyStaleness.ComputeFileHash(source);
+            return new Dictionary<string, AssemblyStaleness.AssemblyContentRecord>
+            {
+                [AssemblyStaleness.ContentRecordKey(name, dll)] = new AssemblyStaleness.AssemblyContentRecord
+                {
+                    Dll = dll,
+                    Sources = hashes,
+                }
+            };
+        }
+
+        string Write(string relative, long wroteUtcMs, string contents = "// written by AssemblyStalenessTests\n")
         {
             var path = Path.Combine(_tmp, relative);
             Directory.CreateDirectory(Path.GetDirectoryName(path));
-            File.WriteAllText(path, "// written by AssemblyStalenessTests\n");
+            File.WriteAllText(path, contents);
             File.SetLastWriteTimeUtc(path, DateTimeOffset.FromUnixTimeMilliseconds(wroteUtcMs).UtcDateTime);
             return path;
         }
