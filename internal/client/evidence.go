@@ -38,6 +38,20 @@ type EditorEvidence struct {
 	SessionHeartbeat *Instance
 }
 
+// sessionStartedAfterBeat reports whether Temp/UnityLockfile is newer than the heartbeat, which
+// makes the heartbeat the record of a previous editor session. Unity rewrites the lockfile when it
+// opens a project, so this is a restart in progress, not a crash of the editor that is starting.
+func sessionStartedAfterBeat(inst *Instance) bool {
+	if inst == nil || inst.ProjectPath == "" || inst.Timestamp <= 0 {
+		return false
+	}
+	info, err := os.Stat(filepath.Join(expandHome(inst.ProjectPath), "Temp", unityLockfileName))
+	if err != nil {
+		return false
+	}
+	return info.ModTime().After(time.UnixMilli(inst.Timestamp))
+}
+
 // Found reports whether anything on disk suggests an open editor.
 func (e *EditorEvidence) Found() bool {
 	return e != nil && (e.LockfilePath != "" || e.StaleHeartbeat != nil)

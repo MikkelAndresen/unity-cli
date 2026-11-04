@@ -302,6 +302,34 @@ func TestScanInstances_KeepsZeroPID(t *testing.T) {
 	}
 }
 
+// TestDiscoverInstanceKeepingEvidence_KeepsTheDeletedHeartbeat pins the ordering: the crash record
+// is read before ScanInstances deletes the dead-pid file, so a caller can still report the crash.
+func TestDiscoverInstanceKeepingEvidence_KeepsTheDeletedHeartbeat(t *testing.T) {
+	stubIsProcessDead(t, map[int]bool{100: true})
+
+	home := writeInstanceFiles(t, map[string]Instance{
+		"dead.json": {
+			State:       "ready",
+			ProjectPath: "/projects/dead",
+			Port:        8090,
+			PID:         100,
+			Timestamp:   1000,
+		},
+	})
+
+	inst, beat, err := DiscoverInstanceKeepingEvidence("", 0)
+	if err == nil || inst != nil {
+		t.Fatalf("expected no live instance, got %+v, %v", inst, err)
+	}
+	if beat == nil || beat.PID != 100 {
+		t.Fatalf("expected the heartbeat read before the scan, got %+v", beat)
+	}
+	deadPath := filepath.Join(home, ".unity-cli", "instances", "dead.json")
+	if _, statErr := os.Stat(deadPath); !os.IsNotExist(statErr) {
+		t.Error("the scan should have deleted the dead-pid file")
+	}
+}
+
 // TestDiscoverInstance_ProjectPathMatchesSlashVariants verifies --project can
 // match Windows-style backslashes against Unity's forward-slash projectPath.
 func TestDiscoverInstance_ProjectPathMatchesSlashVariants(t *testing.T) {

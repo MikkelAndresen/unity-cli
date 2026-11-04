@@ -160,6 +160,57 @@ func TestAnnotateNoEditor_PrefersCrash(t *testing.T) {
 	}
 }
 
+// TestDiscoverStatusInstance_CrashHeartbeatSurvivesTheScan drives the port-less status entry point with
+// the pre-scan heartbeat the real discovery returns, proving the fallback does not re-read a file the
+// scan has already deleted.
+func TestDiscoverStatusInstance_CrashHeartbeatSurvivesTheScan(t *testing.T) {
+	project := t.TempDir()
+	writeCrashFileIn(t, project, "mono_crash.1b6a4e0a.0.json", 20*time.Second, monoCrashSample)
+	beat := &client.Instance{
+		State:       "ready",
+		ProjectPath: project,
+		Port:        8090,
+		PID:         65279,
+		Timestamp:   time.Now().Add(-30 * time.Second).UnixMilli(),
+	}
+
+	orig := discoverInstanceKeepingEvidence
+	discoverInstanceKeepingEvidence = func(string, int) (*client.Instance, *client.Instance, error) {
+		return nil, beat, errors.New("no Unity instances running")
+	}
+	t.Cleanup(func() { discoverInstanceKeepingEvidence = orig })
+
+	got, err := discoverStatusInstance(project, 0)
+	if err != nil {
+		t.Fatalf("expected the crashed heartbeat, got %v", err)
+	}
+	if got != beat {
+		t.Fatalf("got %+v, want the heartbeat read before the scan", got)
+	}
+}
+
+// TestAnnotateNoEditorWith_PrefersCrashAfterTheScan: commands outside status discover first, and the
+// scan can already have deleted the heartbeat; the pre-scan record must still win over startup evidence.
+func TestAnnotateNoEditorWith_PrefersCrashAfterTheScan(t *testing.T) {
+	project := t.TempDir()
+	writeCrashFileIn(t, project, "mono_crash.1b6a4e0a.0.json", 20*time.Second, monoCrashSample)
+	beat := &client.Instance{
+		State:       "ready",
+		ProjectPath: project,
+		Port:        8090,
+		PID:         65279,
+		Timestamp:   time.Now().Add(-30 * time.Second).UnixMilli(),
+	}
+
+	err := annotateNoEditorWith(beat, errors.New("no Unity instances running"), project, 0)
+	if err == nil || !strings.Contains(err.Error(), crashState) {
+		t.Fatalf("expected the crash report from the pre-scan heartbeat, got %v", err)
+	}
+	if strings.Contains(err.Error(), editorStartingState) {
+		t.Errorf("must not fall back to %s:\n%s", editorStartingState, err)
+	}
+}
+
 // TestAnnotateNoEditor_WithoutDumpKeepsEvidence: the starting-or-blocked answer must survive untouched.
 func TestAnnotateNoEditor_WithoutDumpKeepsEvidence(t *testing.T) {
 	dir := openUnityProjectDir(t, 45*time.Second)
@@ -230,7 +281,7 @@ func TestStatusCmd_QuietHeartbeatKeepsExitZero(t *testing.T) {
 // the disk says is dead ends it with the crash report instead of a 120 s timeout.
 func TestWaitForAlive_StopsOnACrashVerdict(t *testing.T) {
 	project := crashedProjectFixture(t, "ready", 30*time.Second, 20*time.Second)
-	resolve := func() (*client.Instance, error) { return client.NewestHeartbeat(project, 8090), nil }
+	resolve := resolveKeepingEvidence(project, 8090)
 
 	start := time.Now()
 	_, err := waitForAlive(resolve, 30000)
@@ -242,6 +293,28 @@ func TestWaitForAlive_StopsOnACrashVerdict(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), crashState) || !strings.Contains(err.Error(), "mono_crash.1b6a4e0a.0.json") {
 		t.Errorf("unexpected error:\n%v", err)
+	}
+}
+
+// TestWaitForAlive_CrashSurvivesTheDeletedHeartbeat: the scan can delete the dead-pid file while the
+// wait is polling; the resolver must keep the record read before it, or the wait runs to its timeout.
+func TestWaitForAlive_CrashSurvivesTheDeletedHeartbeat(t *testing.T) {
+	project := crashedProjectFixture(t, "ready", 30*time.Second, 20*time.Second)
+	beat := client.NewestHeartbeat(project, 8090)
+
+	orig := discoverInstanceKeepingEvidence
+	discoverInstanceKeepingEvidence = func(string, int) (*client.Instance, *client.Instance, error) {
+		return nil, beat, errors.New("no Unity instances running")
+	}
+	t.Cleanup(func() { discoverInstanceKeepingEvidence = orig })
+
+	start := time.Now()
+	_, err := waitForAlive(resolveKeepingEvidence(project, 8090), 30000)
+	if err == nil || !strings.Contains(err.Error(), crashState) {
+		t.Fatalf("expected the crash report, got %v after %v", err, time.Since(start))
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Errorf("expected an immediate verdict, took %v", elapsed)
 	}
 }
 

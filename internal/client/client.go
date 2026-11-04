@@ -271,6 +271,15 @@ func DiscoverInstance(project string, port int) (*Instance, error) {
 	return newestMatching(alive, func(Instance) bool { return true }), nil
 }
 
+// DiscoverInstanceKeepingEvidence is DiscoverInstance plus the newest heartbeat read before the
+// instance scan. ScanInstances deletes dead-pid files, which is exactly the record a crash verdict
+// needs, so callers that report a crash must read it first.
+func DiscoverInstanceKeepingEvidence(project string, port int) (*Instance, *Instance, error) {
+	beat := NewestHeartbeat(project, port)
+	inst, err := DiscoverInstance(project, port)
+	return inst, beat, err
+}
+
 // newestMatching returns the newest heartbeat matching keep, or nil when none does. Readiness is
 // decided by the caller; a stale file with a newer write must not hide the heartbeat that replaced it.
 func newestMatching(instances []Instance, keep func(Instance) bool) *Instance {
@@ -384,7 +393,7 @@ func SendContext(ctx context.Context, inst *Instance, command string, params int
 		if ctx.Err() == context.DeadlineExceeded || isTimeoutError(err) {
 			return nil, &RequestTimeoutError{Command: command, Budget: budget}
 		}
-		return nil, explainDroppedConnection(command, inst, start, err)
+		return nil, explainDroppedConnection(inst, start, err)
 	}
 	defer resp.Body.Close()
 

@@ -25,12 +25,11 @@ const (
 // Crash artifact bounds. A project that has collected dumps from many crashes, or a mono report of
 // a few hundred KB, must not turn one failed request into a wall of text.
 const (
-	crashArtifactLimit   = 3
-	crashDetailChars     = 200
-	crashJSONReadLimit   = 512 << 10
-	crashLogTailLimit    = 16 << 10
-	crashScanLineLimit   = 200
-	crashProjectScanDirs = 2
+	crashArtifactLimit = 3
+	crashDetailChars   = 200
+	crashJSONReadLimit = 512 << 10
+	crashLogTailLimit  = 16 << 10
+	crashScanLineLimit = 200
 )
 
 // MonoCrashGlob matches Mono's crash dump. Unity writes it into the process' working directory,
@@ -124,9 +123,6 @@ func projectCrashDirs(project string) []string {
 	dirs := []string{project}
 	if logs := filepath.Join(project, "Logs"); dirExists(logs) {
 		dirs = append(dirs, logs)
-	}
-	if len(dirs) > crashProjectScanDirs {
-		dirs = dirs[:crashProjectScanDirs]
 	}
 	return dirs
 }
@@ -558,6 +554,12 @@ func AssessSilence(inst *Instance, since time.Time, baselineBeat int64) SilenceV
 	if v.Clean {
 		return v
 	}
+	if sessionStartedAfterBeat(inst) {
+		// The editor was restarted after this heartbeat was written, so this record describes the
+		// previous process. Its vanished pid and any dump it left behind say nothing about the editor
+		// that is starting now; the caller falls back to the lockfile's startup evidence.
+		return v
+	}
 
 	v.Artifacts = FindCrashArtifacts(inst.ProjectPath, since, crashArtifactLimit)
 	switch {
@@ -683,7 +685,7 @@ func (f *ConnectionFailure) reloadText() string {
 // explainDroppedConnection classifies a failed request before it is reported, so that a hard crash,
 // a domain reload and a dropped socket do not all come back as the same bare EOF. It reads only files
 // the connector already wrote, so it costs nothing when the editor is fine.
-func explainDroppedConnection(command string, inst *Instance, start time.Time, transport error) error {
+func explainDroppedConnection(inst *Instance, start time.Time, transport error) error {
 	base := fmt.Errorf("cannot connect to Unity at port %d: %w", inst.Port, transport)
 	if !droppedConnection(transport) {
 		return base

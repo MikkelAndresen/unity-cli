@@ -69,19 +69,23 @@ func staleHeartbeatReport(status *client.Instance, age time.Duration, ev *client
 	return b.String()
 }
 
+// discoverInstanceKeepingEvidence is a variable so tests can exercise the case where the instance
+// scan removed the dead-pid heartbeat before the crash verdict ran.
+var discoverInstanceKeepingEvidence = client.DiscoverInstanceKeepingEvidence
+
 func discoverStatusInstance(project string, port int) (*client.Instance, error) {
 	if port > 0 {
 		return readStatus(port)
 	}
-	inst, err := client.DiscoverInstance(project, 0)
+	inst, beat, err := discoverInstanceKeepingEvidence(project, 0)
 	if err == nil {
 		return inst, nil
 	}
-	// The instance scan deletes heartbeats whose pid is gone, which is what a crash leaves behind. When
-	// the file on disk still reads as one, that is the answer `status` owes the caller, so it is read
-	// past the scan. Anything else keeps the original "no Unity instances" failure.
-	if raw := client.NewestHeartbeat(project, 0); raw != nil && assessCrash(raw).Crashed {
-		return raw, nil
+	// The instance scan deletes heartbeats whose pid is gone, which is what a crash leaves behind. beat
+	// was read before that scan; when it reads as a crash, that is the answer `status` owes the caller.
+	// Anything else keeps the original "no Unity instances" failure.
+	if beat != nil && assessCrash(beat).Crashed {
+		return beat, nil
 	}
 	return nil, err
 }
@@ -278,6 +282,18 @@ func (g *versionGate) check(inst *client.Instance) error {
 	g.warned[key] = true
 	fmt.Fprintln(os.Stderr, v.Warning)
 	return nil
+}
+
+// resolveKeepingEvidence is the wait-loop resolver: like DiscoverInstance, but it keeps the
+// heartbeat the instance scan deletes, so a crash during the wait still reaches crashedWhileWaiting.
+func resolveKeepingEvidence(project string, port int) instanceResolver {
+	return func() (*client.Instance, error) {
+		inst, beat, err := discoverInstanceKeepingEvidence(project, port)
+		if err != nil && beat != nil {
+			return beat, nil
+		}
+		return inst, err
+	}
 }
 
 // waitForAlive resolves the current target instance, then polls until a newer heartbeat appears.

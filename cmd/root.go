@@ -137,9 +137,9 @@ func Execute() error {
 		defer cancel()
 	}
 
-	inst, err := client.DiscoverInstance(flagProject, flagPort)
+	inst, beat, err := discoverInstanceKeepingEvidence(flagProject, flagPort)
 	if err != nil {
-		return noEditor(annotateNoEditor(err, flagProject, flagPort))
+		return noEditor(annotateNoEditorWith(beat, err, flagProject, flagPort))
 	}
 	if err := ctx.Err(); err != nil {
 		return noEditor(invocationDeadlineError(category, effectiveTimeout, err))
@@ -157,6 +157,14 @@ func Execute() error {
 		return client.DiscoverInstance(targetProject, 0)
 	}
 
+	// Wait loops must keep the heartbeat the scan deletes: that file is how a crash during the wait
+	// reaches crashedWhileWaiting instead of looking like an editor that simply has not answered yet.
+	guardProject := targetProject
+	if flagPort > 0 {
+		guardProject = ""
+	}
+	resolveForWait := resolveKeepingEvidence(guardProject, flagPort)
+
 	var alive *client.Instance
 	if category == waitCategory && isStartingState(inst.State) {
 		// wait's own --timeout is the budget for startup, and waitCmd polls "starting" itself.
@@ -164,7 +172,7 @@ func Execute() error {
 		// `wait --timeout 2` could sit for two minutes before its own clock even started.
 		alive = inst
 	} else {
-		alive, err = waitForAliveContext(ctx, resolve, remainingTimeoutMs(ctx, effectiveTimeout))
+		alive, err = waitForAliveContext(ctx, resolveForWait, remainingTimeoutMs(ctx, effectiveTimeout))
 		if err != nil {
 			return noEditor(annotateNoEditor(err, targetProject, flagPort))
 		}
@@ -217,7 +225,7 @@ func Execute() error {
 		}, resolve)
 		exitNow(verifyCmd(ctx, subArgs, send, testSend, resolve, currentInst.Port, os.Stdout))
 	case waitCategory:
-		exitNow(waitCmd(ctx, subArgs, send, resolve, os.Stdout))
+		exitNow(waitCmd(ctx, subArgs, send, resolveForWait, os.Stdout))
 	case "exec":
 		// --await_timeout already widened the one invocation budget above, so the client never
 		// gives up before the connector's own timed_out marker.

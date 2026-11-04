@@ -137,10 +137,12 @@ func TestAssessSilence(t *testing.T) {
 		pid         int
 		artifactAge time.Duration // >0 writes a mono_crash that old
 		advanced    bool          // the connector beat again after the baseline
-		table       map[int]string
-		wantCrashed bool
-		wantClean   bool
-		wantStale   bool
+		// lockfileAfterBeat writes Temp/UnityLockfile after the heartbeat, as an editor restart does.
+		lockfileAfterBeat bool
+		table             map[int]string
+		wantCrashed       bool
+		wantClean         bool
+		wantStale         bool
 	}{
 		{
 			name:        "clean shutdown is never a crash, artifact or not",
@@ -187,6 +189,24 @@ func TestAssessSilence(t *testing.T) {
 			wantStale:   true,
 		},
 		{
+			name:              "pid gone but a newer lockfile is a restart in progress",
+			state:             "ready",
+			beatAge:           beatAge,
+			pid:               65279,
+			lockfileAfterBeat: true,
+			table:             map[int]string{5555: "Unity"},
+			wantStale:         true,
+		},
+		{
+			name:        "heartbeat advanced past the baseline: alive even with an old dump",
+			state:       "ready",
+			beatAge:     1 * time.Second,
+			pid:         65279,
+			artifactAge: 500 * time.Millisecond,
+			advanced:    true,
+			table:       map[int]string{65279: "Unity"},
+		},
+		{
 			name:        "artifact from before the last beat belongs to an earlier crash",
 			state:       "ready",
 			beatAge:     beatAge,
@@ -212,6 +232,15 @@ func TestAssessSilence(t *testing.T) {
 			beat := time.Now().Add(-tc.beatAge)
 			if tc.artifactAge > 0 {
 				writeCrashFile(t, project, "mono_crash.1b6a4e0a.0.json", tc.artifactAge, monoCrashFixture)
+			}
+			if tc.lockfileAfterBeat {
+				temp := filepath.Join(project, "Temp")
+				if err := os.MkdirAll(temp, 0755); err != nil {
+					t.Fatalf("failed to create Temp: %v", err)
+				}
+				if err := os.WriteFile(filepath.Join(temp, unityLockfileName), nil, 0644); err != nil {
+					t.Fatalf("failed to write lockfile: %v", err)
+				}
 			}
 			baseline := beat
 			if tc.advanced {
@@ -246,7 +275,7 @@ func TestExplainDroppedConnection_Crash(t *testing.T) {
 	})
 
 	inst := NewestHeartbeat(project, 0)
-	err := explainDroppedConnection("exec", inst, time.Now().Add(-25*time.Second), io.EOF)
+	err := explainDroppedConnection(inst, time.Now().Add(-25*time.Second), io.EOF)
 
 	var failure *ConnectionFailure
 	if !errors.As(err, &failure) {
@@ -281,7 +310,7 @@ func TestExplainDroppedConnection_Reload(t *testing.T) {
 	})
 
 	inst := &Instance{State: "ready", ProjectPath: project, Port: 8090, PID: 65279, Timestamp: time.Now().Add(-10 * time.Second).UnixMilli()}
-	err := explainDroppedConnection("test", inst, time.Now().Add(-5*time.Second), io.EOF)
+	err := explainDroppedConnection(inst, time.Now().Add(-5*time.Second), io.EOF)
 
 	var failure *ConnectionFailure
 	if !errors.As(err, &failure) {
@@ -324,7 +353,7 @@ func TestExplainDroppedConnection_DumpArrivesLate(t *testing.T) {
 		dump <- path
 	}()
 
-	err := explainDroppedConnection("exec", inst, time.Now().Add(-time.Second), io.EOF)
+	err := explainDroppedConnection(inst, time.Now().Add(-time.Second), io.EOF)
 	dumpPath := <-dump
 	if dumpPath == "" {
 		t.Fatal("the goroutine failed to write the dump fixture")
@@ -352,7 +381,7 @@ func TestExplainDroppedConnection_LiveEditorPaysNoGrace(t *testing.T) {
 	})
 
 	start := time.Now()
-	err := explainDroppedConnection("exec", NewestHeartbeat(project, 0), start, io.EOF)
+	err := explainDroppedConnection(NewestHeartbeat(project, 0), start, io.EOF)
 	if elapsed := time.Since(start); elapsed > time.Second {
 		t.Errorf("a live editor must not pay the crash-dump grace, took %v", elapsed)
 	}
@@ -371,7 +400,7 @@ func TestExplainDroppedConnection_UnexplainedSilenceKeepsTheOldText(t *testing.T
 	})
 
 	inst := NewestHeartbeat(project, 0)
-	err := explainDroppedConnection("exec", inst, time.Now().Add(-25*time.Second), io.EOF)
+	err := explainDroppedConnection(inst, time.Now().Add(-25*time.Second), io.EOF)
 
 	var failure *ConnectionFailure
 	if errors.As(err, &failure) {
@@ -393,7 +422,7 @@ func TestExplainDroppedConnection_TimeoutIsNotACrash(t *testing.T) {
 	})
 
 	inst := NewestHeartbeat(project, 0)
-	err := explainDroppedConnection("exec", inst, time.Now().Add(-time.Minute),
+	err := explainDroppedConnection(inst, time.Now().Add(-time.Minute),
 		&timeoutLikeError{msg: "Post \"http://127.0.0.1:8090/command\": context deadline exceeded"})
 	if strings.Contains(err.Error(), "crash") {
 		t.Errorf("a timeout must not be reported as a crash: %s", err)

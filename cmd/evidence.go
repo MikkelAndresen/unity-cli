@@ -37,6 +37,13 @@ const staleLockfileAge = 2 * time.Hour
 // A crash is checked first because it outranks the starting-or-blocked reading: both have a silent
 // heartbeat, and only one of them is worth waiting for.
 func annotateNoEditor(err error, project string, port int) error {
+	return annotateNoEditorWith(client.NewestHeartbeat(project, port), err, project, port)
+}
+
+// annotateNoEditorWith is annotateNoEditor for a caller that already discovered an instance: beat is
+// the heartbeat read before that discovery, whose scan deletes the dead-pid file the crash verdict
+// needs. It is nil when there was none to read.
+func annotateNoEditorWith(beat *client.Instance, err error, project string, port int) error {
 	if err == nil {
 		return nil
 	}
@@ -44,9 +51,9 @@ func annotateNoEditor(err error, project string, port int) error {
 	if errors.As(err, &already) {
 		return err
 	}
-	if inst := client.NewestHeartbeat(project, port); inst != nil {
-		if verdict := assessCrash(inst); verdict.Crashed {
-			return crashedError(inst, verdict, err)
+	if beat != nil {
+		if verdict := assessCrash(beat); verdict.Crashed {
+			return crashedError(beat, verdict, err)
 		}
 	}
 	ev := client.FindEditorEvidence(project, port)
