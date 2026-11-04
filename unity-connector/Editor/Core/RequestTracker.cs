@@ -193,20 +193,37 @@ namespace UnityCliConnector
                 new RequestFailureInfo(ErrorCodes.MainThreadBusy, ticket, diag, started: false));
         }
 
-        public static ErrorResponse BuildReloadError(RequestTicket ticket, string why, string code = ErrorCodes.DomainReload)
+        /// <summary>
+        /// The answer for a request the domain is about to stop serving. What it may promise depends
+        /// on the ticket's stage: a queued request never ran, so repeating it is safe, while a
+        /// running one has already touched the editor and only its return value is recoverable —
+        /// nothing, because the continuation died with the domain.
+        /// </summary>
+        public static ErrorResponse BuildReloadError(RequestTicket ticket, string why, bool quitting = false)
         {
             var started = ticket.Stage == RequestStage.Running;
-            var diag = new BusyDiagnostics("reloading", Running?.Command, Running?.WaitedMs ?? 0,
+            var diag = new BusyDiagnostics(quitting ? "stopped" : "reloading", Running?.Command, Running?.WaitedMs ?? 0,
                 PendingCount, null);
 
-            var message = started
-                ? $"{ticket.Command} was running when Unity stopped answering ({why}); it may have partially run. "
-                  + "Check the editor state before retrying."
-                : $"{ticket.Command} never ran: Unity stopped answering before the main thread picked it up "
-                  + $"({why}, waited {FormatSeconds(ticket.WaitedMs)}). Retry it once Unity answers again.";
+            if (started)
+            {
+                // `started` is provable (the handler was entered), so the message says the command
+                // ran without claiming it finished, and names where the value went.
+                var message = $"{ticket.Command} had already started when Unity stopped answering ({why}); "
+                  + "its effects may have been applied, but its return value was lost. "
+                  + "Check the editor's state before repeating it — the change may already be in."
+                  + (quitting ? "" : " Unity answers again once the reload is over.");
 
-            return new ErrorResponse(message,
-                new RequestFailureInfo(code, ticket, diag, started));
+                // No code for a quit: the editor is gone, so nothing the CLI could wait for.
+                var code = quitting ? null : ErrorCodes.ReloadDuringCommand;
+                return new ErrorResponse(message, new RequestFailureInfo(code, ticket, diag, true));
+            }
+
+            var neverRan = $"{ticket.Command} never ran: Unity stopped answering before the main thread picked it up "
+                + $"({why}, waited {FormatSeconds(ticket.WaitedMs)}). Retry it once Unity answers again.";
+
+            return new ErrorResponse(neverRan,
+                new RequestFailureInfo(quitting ? null : ErrorCodes.DomainReload, ticket, diag, false));
         }
 
         /// <summary>

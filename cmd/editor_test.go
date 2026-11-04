@@ -1,7 +1,9 @@
 package cmd
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"strings"
 	"testing"
@@ -11,23 +13,28 @@ import (
 )
 
 func TestEditorCmd_Play(t *testing.T) {
+	shrinkPlayModeWait(t)
 	send, params := mockSend("manage_editor", t)
-	resolve := func() (*client.Instance, error) { return nil, nil }
-	if _, err := editorCmd([]string{"play"}, send, resolve); err != nil {
+	resp, err := editorCmd(context.Background(), []string{"play"}, send, stateResolver("playing"))
+	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if (*params)["action"] != "play" {
 		t.Errorf("expected action=play, got %v", (*params)["action"])
 	}
-	if (*params)["wait_for_completion"] != false {
-		t.Errorf("expected wait_for_completion=false, got %v", (*params)["wait_for_completion"])
+	if wait := (*params)["wait_for_completion"]; wait != nil && wait != false {
+		t.Errorf("expected no wait_for_completion request, got %v", wait)
+	}
+	report := playModeReportOf(t, resp)
+	if !report.Confirmed || report.EditorState != "playing" {
+		t.Errorf("expected confirmation of the playing state, got %+v", report)
 	}
 }
 
 func TestEditorCmd_PlayWait(t *testing.T) {
+	shrinkPlayModeWait(t)
 	send, params := mockSend("manage_editor", t)
-	resolve := func() (*client.Instance, error) { return nil, nil }
-	if _, err := editorCmd([]string{"play", "--wait"}, send, resolve); err != nil {
+	if _, err := editorCmd(context.Background(), []string{"play", "--wait"}, send, stateResolver("playing")); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if (*params)["wait_for_completion"] != true {
@@ -36,20 +43,129 @@ func TestEditorCmd_PlayWait(t *testing.T) {
 }
 
 func TestEditorCmd_Stop(t *testing.T) {
+	shrinkPlayModeWait(t)
 	send, params := mockSend("manage_editor", t)
-	resolve := func() (*client.Instance, error) { return nil, nil }
-	if _, err := editorCmd([]string{"stop"}, send, resolve); err != nil {
+	resp, err := editorCmd(context.Background(), []string{"stop"}, send, stateResolver("playing", "ready"))
+	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if (*params)["action"] != "stop" {
 		t.Errorf("expected action=stop, got %v", (*params)["action"])
+	}
+	report := playModeReportOf(t, resp)
+	if !report.Confirmed || report.EditorState != "ready" {
+		t.Errorf("expected the editor to be confirmed back in Edit mode, got %+v", report)
+	}
+}
+
+// The whole point of #10: leaving Play mode reloads the domain in most projects, and the command
+// that asked for it loses its answer to that reload. The heartbeat decides the exit code.
+func TestEditorCmd_StopAnswerLostToReloadStillConfirms(t *testing.T) {
+	shrinkPlayModeWait(t)
+	send := func(command string, params interface{}) (*client.CommandResponse, error) {
+		return &client.CommandResponse{
+			Success: false,
+			Message: "manage_editor had already started when Unity stopped answering",
+			Data:    json.RawMessage(`{"code":"reload_during_command","started":true}`),
+		}, nil
+	}
+	resp, err := editorCmd(context.Background(), []string{"stop"}, send, stateResolver("reloading", "ready"))
+	if err != nil {
+		t.Fatalf("a play-mode change that reached its state must exit 0, got %v", err)
+	}
+	if !resp.Success {
+		t.Errorf("expected success, got %+v", resp)
+	}
+	report := playModeReportOf(t, resp)
+	if !report.AnswerLost || !report.Confirmed {
+		t.Errorf("expected a lost answer confirmed by the heartbeat, got %+v", report)
+	}
+	if !strings.Contains(resp.Message, "Edit mode") {
+		t.Errorf("message must say what state the editor is in now, got %q", resp.Message)
+	}
+}
+
+func TestEditorCmd_PlayConnectionDroppedByReload(t *testing.T) {
+	shrinkPlayModeWait(t)
+	send := func(command string, params interface{}) (*client.CommandResponse, error) {
+		return nil, &client.ConnectionFailure{
+			Class:     client.FailureReload,
+			Transport: errors.New("EOF"),
+		}
+	}
+	resp, err := editorCmd(context.Background(), []string{"play"}, send, stateResolver("reloading", "playing"))
+	if err != nil {
+		t.Fatalf("expected the state check to settle the call, got %v", err)
+	}
+	report := playModeReportOf(t, resp)
+	if !report.AnswerLost || !report.Confirmed {
+		t.Errorf("expected a dropped answer confirmed by the heartbeat, got %+v", report)
+	}
+}
+
+func TestEditorCmd_StopNeverReachesEditMode(t *testing.T) {
+	shrinkPlayModeWait(t)
+	send, _ := mockSend("manage_editor", t)
+	resp, err := editorCmd(context.Background(), []string{"stop"}, send, stateResolver("playing"))
+	if err == nil {
+		t.Fatal("staying in Play mode must fail the command")
+	}
+	if resp == nil || resp.Success {
+		t.Fatalf("expected a failed report, got %+v", resp)
+	}
+	report := playModeReportOf(t, resp)
+	if report.Confirmed || report.WantedState != "Edit mode" {
+		t.Errorf("expected an unconfirmed report, got %+v", report)
+	}
+}
+
+func TestEditorCmd_NoWaitReturnsImmediately(t *testing.T) {
+	resolves := 0
+	send, _ := mockSend("manage_editor", t)
+	resolve := func() (*client.Instance, error) {
+		resolves++
+		return &client.Instance{State: "reloading"}, nil
+	}
+	if _, err := editorCmd(context.Background(), []string{"stop", "--no-wait"}, send, resolve); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if resolves != 0 {
+		t.Errorf("--no-wait must not poll the heartbeat, got %d reads", resolves)
+	}
+}
+
+// A refusal that says the command never ran must be reported as the connector worded it; waiting for
+// a state it never asked for would hide the "retry it" answer behind a timeout.
+func TestEditorCmd_BusyRefusalIsNotWaitedOut(t *testing.T) {
+	shrinkPlayModeWait(t)
+	send := func(command string, params interface{}) (*client.CommandResponse, error) {
+		return &client.CommandResponse{
+			Success: false,
+			Message: "manage_editor was queued but the main thread did not pick it up",
+			Data:    json.RawMessage(`{"code":"main_thread_busy","started":false}`),
+		}, nil
+	}
+	resolves := 0
+	resolve := func() (*client.Instance, error) {
+		resolves++
+		return &client.Instance{State: "playing"}, nil
+	}
+	resp, err := editorCmd(context.Background(), []string{"stop"}, send, resolve)
+	if err != nil {
+		t.Fatalf("the connector answered, so there is no transport error: %v", err)
+	}
+	if resp.Success {
+		t.Errorf("expected the refusal to stand, got %+v", resp)
+	}
+	if resolves != 0 {
+		t.Errorf("a command that never ran must not be waited out, got %d heartbeat reads", resolves)
 	}
 }
 
 func TestEditorCmd_Pause(t *testing.T) {
 	send, params := mockSend("manage_editor", t)
 	resolve := func() (*client.Instance, error) { return nil, nil }
-	if _, err := editorCmd([]string{"pause"}, send, resolve); err != nil {
+	if _, err := editorCmd(context.Background(), []string{"pause"}, send, resolve); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if (*params)["action"] != "pause" {
@@ -57,10 +173,43 @@ func TestEditorCmd_Pause(t *testing.T) {
 	}
 }
 
+// shrinkPlayModeWait takes the play-mode confirmation wait off the test clock.
+func shrinkPlayModeWait(t *testing.T) {
+	t.Helper()
+	timeout, poll := playModeConfirmTimeout, playModePollInterval
+	playModeConfirmTimeout = 60 * time.Millisecond
+	playModePollInterval = time.Millisecond
+	t.Cleanup(func() { playModeConfirmTimeout, playModePollInterval = timeout, poll })
+}
+
+// stateResolver hands back one heartbeat state per read, repeating the last one.
+func stateResolver(states ...string) instanceResolver {
+	read := 0
+	return func() (*client.Instance, error) {
+		state := states[read]
+		if read < len(states)-1 {
+			read++
+		}
+		return &client.Instance{State: state, Port: 8090, Timestamp: time.Now().UnixMilli()}, nil
+	}
+}
+
+func playModeReportOf(t *testing.T, resp *client.CommandResponse) playModeReport {
+	t.Helper()
+	if len(resp.Data) == 0 {
+		t.Fatalf("the play mode command answered with no report: %+v", resp)
+	}
+	var report playModeReport
+	if err := json.Unmarshal(resp.Data, &report); err != nil {
+		t.Fatalf("unreadable play mode report %s: %v", resp.Data, err)
+	}
+	return report
+}
+
 func TestEditorCmd_Refresh(t *testing.T) {
 	send, _ := mockSend("refresh_unity", t)
 	resolve := func() (*client.Instance, error) { return nil, nil }
-	if _, err := editorCmd([]string{"refresh"}, send, resolve); err != nil {
+	if _, err := editorCmd(context.Background(), []string{"refresh"}, send, resolve); err != nil {
 		t.Errorf("unexpected error: %v", err)
 	}
 }
@@ -68,7 +217,7 @@ func TestEditorCmd_Refresh(t *testing.T) {
 func TestEditorCmd_RefreshForce(t *testing.T) {
 	send, params := mockSend("refresh_unity", t)
 	resolve := func() (*client.Instance, error) { return nil, nil }
-	if _, err := editorCmd([]string{"refresh", "--force"}, send, resolve); err != nil {
+	if _, err := editorCmd(context.Background(), []string{"refresh", "--force"}, send, resolve); err != nil {
 		t.Errorf("unexpected error: %v", err)
 	}
 	if (*params)["force"] != true {
@@ -84,7 +233,7 @@ func TestEditorCmd_RefreshCompileForce(t *testing.T) {
 	base := int64(1_000)
 	f := &fakeEditor{t: t, diagnostics: clean(), echoFinished: &base, finishedAt: 2_000}
 
-	resp, err := editorCmd([]string{"refresh", "--compile", "--force"}, f.send, f.resolve)
+	resp, err := editorCmd(context.Background(), []string{"refresh", "--compile", "--force"}, f.send, f.resolve)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -102,7 +251,7 @@ func TestEditorCmd_RefreshCompileReportsCleanResult(t *testing.T) {
 	base := int64(1_000)
 	f := &fakeEditor{t: t, diagnostics: clean(), echoFinished: &base, finishedAt: 2_000}
 
-	resp, err := editorCmd([]string{"refresh", "--compile"}, f.send, f.resolve)
+	resp, err := editorCmd(context.Background(), []string{"refresh", "--compile"}, f.send, f.resolve)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -128,7 +277,7 @@ func TestEditorCmd_RefreshCompileReportsErrorsAndFails(t *testing.T) {
 		echoFinished: &base, finishedAt: 2_000,
 	}
 
-	resp, err := editorCmd([]string{"refresh", "--compile"}, f.send, f.resolve)
+	resp, err := editorCmd(context.Background(), []string{"refresh", "--compile"}, f.send, f.resolve)
 	if err == nil {
 		t.Fatal("expected a non-zero-worthy error when the compile fails")
 	}
@@ -158,7 +307,7 @@ func TestEditorCmd_RefreshCompileReportCarriesHints(t *testing.T) {
 		echoFinished: &base, finishedAt: 2_000,
 	}
 
-	resp, err := editorCmd([]string{"refresh", "--compile"}, f.send, f.resolve)
+	resp, err := editorCmd(context.Background(), []string{"refresh", "--compile"}, f.send, f.resolve)
 	if err == nil {
 		t.Fatal("expected a non-zero-worthy error when the compile fails")
 	}
@@ -176,7 +325,7 @@ func TestEditorCmd_RefreshCompileHeartbeatErrorsWithoutDiagnostics(t *testing.T)
 	base := int64(1_000)
 	f := &fakeEditor{t: t, compileErrors: true, diagnostics: clean(), echoFinished: &base, finishedAt: 2_000}
 
-	resp, err := editorCmd([]string{"refresh", "--compile"}, f.send, f.resolve)
+	resp, err := editorCmd(context.Background(), []string{"refresh", "--compile"}, f.send, f.resolve)
 	if err == nil {
 		t.Fatal("expected an error when the heartbeat says the compile failed")
 	}
@@ -193,7 +342,7 @@ func TestEditorCmd_RefreshCompileNothingToCompile(t *testing.T) {
 	base := int64(1_000)
 	f := &fakeEditor{t: t, diagnostics: clean(), echoFinished: &base, finishedAt: base}
 
-	resp, err := editorCmd([]string{"refresh", "--compile"}, f.send, f.resolve)
+	resp, err := editorCmd(context.Background(), []string{"refresh", "--compile"}, f.send, f.resolve)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -214,7 +363,7 @@ func TestEditorCmd_RefreshCompileDistinguishesTimeout(t *testing.T) {
 		stuckState: "compiling",
 	}
 
-	resp, err := editorCmd([]string{"refresh", "--compile"}, f.send, f.resolve)
+	resp, err := editorCmd(context.Background(), []string{"refresh", "--compile"}, f.send, f.resolve)
 	if err == nil {
 		t.Fatal("expected an error when the compile never finished")
 	}
@@ -229,7 +378,7 @@ func TestEditorCmd_RefreshCompileKeepConsole(t *testing.T) {
 	base := int64(1_000)
 	f := &fakeEditor{t: t, diagnostics: clean(), echoFinished: &base, finishedAt: 2_000}
 
-	if _, err := editorCmd([]string{"refresh", "--compile", "--keep-console"}, f.send, f.resolve); err != nil {
+	if _, err := editorCmd(context.Background(), []string{"refresh", "--compile", "--keep-console"}, f.send, f.resolve); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if f.called("console(clear)") {
@@ -243,7 +392,7 @@ func TestEditorCmd_RefreshCompileReportsOldConnector(t *testing.T) {
 	// that it could not prove a compile ran.
 	f := &fakeEditor{t: t, diagnostics: clean()}
 
-	resp, err := editorCmd([]string{"refresh", "--compile"}, f.send, f.resolve)
+	resp, err := editorCmd(context.Background(), []string{"refresh", "--compile"}, f.send, f.resolve)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -277,7 +426,7 @@ func TestEditorCmd_RefreshCompileEditorRestarted(t *testing.T) {
 		return inst, nil
 	}
 
-	resp, err := editorCmd([]string{"refresh", "--compile"}, f.send, resolve)
+	resp, err := editorCmd(context.Background(), []string{"refresh", "--compile"}, f.send, resolve)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -292,7 +441,7 @@ func TestEditorCmd_RefreshCompileEditorRestarted(t *testing.T) {
 
 func TestEditorCmd_RefreshWithoutCompileDoesNotWaitOrClear(t *testing.T) {
 	f := &fakeEditor{t: t}
-	resp, err := editorCmd([]string{"refresh"}, f.send, f.resolve)
+	resp, err := editorCmd(context.Background(), []string{"refresh"}, f.send, f.resolve)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -343,7 +492,7 @@ func TestEditorCmd_RefreshCompileReportCarriesProvenance(t *testing.T) {
 		provenance: map[string]interface{}{"provenance_line": provLine, "compiled_at_ms": 2_000,
 			"rebuilt_assemblies": []string{"Game"}}}
 
-	resp, err := editorCmd([]string{"refresh", "--compile"}, f.send, f.resolve)
+	resp, err := editorCmd(context.Background(), []string{"refresh", "--compile"}, f.send, f.resolve)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -364,7 +513,7 @@ func TestEditorCmd_RefreshCompileReportNotesStaleSources(t *testing.T) {
 		provenance: map[string]interface{}{"provenance_line": provLine, "stale_count": 1,
 			"stale_files": []string{"Assets/Foo.cs"}, "stale_line": "stale: Assets/Foo.cs modified after this compile"}}
 
-	resp, err := editorCmd([]string{"refresh", "--compile"}, f.send, f.resolve)
+	resp, err := editorCmd(context.Background(), []string{"refresh", "--compile"}, f.send, f.resolve)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -420,7 +569,7 @@ func TestEditorCmd_RefreshCompileFailureDoesNotWait(t *testing.T) {
 		return &client.Instance{State: "ready"}, nil
 	}
 
-	resp, err := editorCmd([]string{"refresh", "--compile"}, send, resolve)
+	resp, err := editorCmd(context.Background(), []string{"refresh", "--compile"}, send, resolve)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -440,7 +589,7 @@ func TestEditorCmd_RefreshCompileFailureDoesNotWait(t *testing.T) {
 func TestEditorCmd_EmptyArgs(t *testing.T) {
 	send, _ := mockSend("manage_editor", t)
 	resolve := func() (*client.Instance, error) { return nil, nil }
-	_, err := editorCmd(nil, send, resolve)
+	_, err := editorCmd(context.Background(), nil, send, resolve)
 	if err == nil {
 		t.Error("expected error for empty args")
 	}
@@ -449,7 +598,7 @@ func TestEditorCmd_EmptyArgs(t *testing.T) {
 func TestEditorCmd_UnknownAction(t *testing.T) {
 	send, _ := mockSend("manage_editor", t)
 	resolve := func() (*client.Instance, error) { return nil, nil }
-	_, err := editorCmd([]string{"fly"}, send, resolve)
+	_, err := editorCmd(context.Background(), []string{"fly"}, send, resolve)
 	if err == nil {
 		t.Error("expected error for unknown action")
 	}

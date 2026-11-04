@@ -15,6 +15,7 @@ cmd/                  # Go CLI — thin passthrough layer
   verify.go           # verify command (compile + compile_diagnostics + tests, brief output)
   wait.go             # wait command: block until the heartbeat is idle, then report compile provenance
   provenance.go       # compileProvenance payload shared by verify, editor refresh --compile and wait
+  playmode.go         # editor play/stop state confirmation, and the state report after a reload took a command's answer
   status.go           # status, waitForAlive, heartbeat reading
   signals.go          # SIGINT/SIGTERM/SIGALRM/SIGHUP handling; signals_unix.go/signals_windows.go
   evidence.go         # editor_starting_or_blocked: the startup-dialog report built from on-disk evidence
@@ -31,7 +32,8 @@ unity-connector/      # C# Unity Editor package (UPM)
                       # ExecAwait, ExecCompileCache, ExecCompiler, ExecSource, MainThread,
                       # RequestTicket/RequestTracker (every accepted request gets one answer: queue deadline,
                       # domain-reload answer, skip-on-abandon), ErrorCodes (data.code contract with the CLI),
-                      # ResponseJson (serialization can never leave a connection unanswered))
+                      # ResponseJson (serialization can never leave a connection unanswered),
+                      # PlayModeTransitions (play-mode change deferred a tick so its answer survives the reload it starts))
                       # ApiIndex/ApiReflection/XmlDocLookup back `api`; CompileHints reuses them for compile-error hints
     Tools/            # Tool implementations (auto-registered via [UnityCliTool] attribute)
     Burst/            # burst_status tool; own asmdef, only compiles when com.unity.burst is present

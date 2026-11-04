@@ -13,6 +13,14 @@ namespace UnityCliConnector
         /// Unity reloaded or quit while the request was in flight.
         public const string DomainReload = "domain_reload";
 
+        /// <summary>
+        /// A tool handler was already running when Unity reloaded, so the command started (its
+        /// effects may have applied) but its return value is gone with the old domain. Distinct from
+        /// <see cref="DomainReload"/>, which promises the command never ran: repeating that one is
+        /// safe, repeating this one may apply the effect twice.
+        /// </summary>
+        public const string ReloadDuringCommand = "reload_during_command";
+
         /// The tool produced a value that could not be serialized; the command did run.
         public const string SerializationFailed = "serialization_failed";
     }

@@ -145,9 +145,9 @@ namespace UnityCliConnector.Tools
         // The third constructor argument, not the second: `data` stays the tool's result
         // payload, so a caller parsing it sees the same shape as before the metadata existed.
         private static object CompileMeta(string state, long compileMs, int referenceCount,
-            string serializationError = null)
+            string serializationError = null, string stateChange = null)
         {
-            if (serializationError == null)
+            if (serializationError == null && stateChange == null)
                 return new { compile = state, compile_ms = compileMs, reference_assemblies = referenceCount };
             return new
             {
@@ -155,6 +155,7 @@ namespace UnityCliConnector.Tools
                 compile_ms = compileMs,
                 reference_assemblies = referenceCount,
                 serialization_error = serializationError,
+                state_change = stateChange,
             };
         }
 
@@ -219,6 +220,8 @@ namespace UnityCliConnector.Tools
                 compileState = "compiled";
             }
 
+            var playModeBefore = EditorApplication.isPlaying;
+            var playModeChangingBefore = EditorApplication.isPlayingOrWillChangePlaymode;
             object result;
             try
             {
@@ -263,10 +266,18 @@ namespace UnityCliConnector.Tools
             var message = outcome.Steps > 0
                 ? $"OK (routine completed in {outcome.Steps} steps)"
                 : "OK";
+            // A snippet that changed play mode may have reloaded the domain this very response is
+            // being written from, so the answer says what the snippet set in motion. It is reported
+            // in meta rather than guessed at, because the reload may still be a tick away.
+            var stateChange = MainThread.IsCurrent
+                ? PlayModeTransitions.ChangeStartedSince(playModeBefore, playModeChangingBefore)
+                : null;
+            if (stateChange != null)
+                message += $" (this snippet started {stateChange}; the next command may have to wait for the editor)";
             string serializationError;
             var data = Serialize(outcome.Value, out serializationError);
             return new SuccessResponse(message, data,
-                CompileMeta(compileState, compileMs, references.Count, serializationError));
+                CompileMeta(compileState, compileMs, references.Count, serializationError, stateChange));
         }
 
         /// <summary>
