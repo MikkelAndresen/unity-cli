@@ -53,7 +53,7 @@ func editorCmd(ctx context.Context, args []string, send sendFn, resolve instance
 				return nil, err
 			}
 			params["compile"] = mode
-			return editorRefreshCompile(send, resolve, params, keepConsole, os.Stderr)
+			return editorRefreshCompile(ctx, send, resolve, params, keepConsole, os.Stderr)
 		}
 		return send("refresh_unity", params)
 
@@ -80,7 +80,7 @@ func refreshCompileMode(raw string) (string, error) {
 // editorRefreshCompile requests a refresh plus script compilation, waits for the compile to
 // finish, and answers with one report that says what the compile did. It returns the report even
 // when the compile failed or timed out, so the JSON is printed before the non-zero exit.
-func editorRefreshCompile(send sendFn, resolve instanceResolver, params map[string]interface{}, keepConsole bool, logw io.Writer) (*client.CommandResponse, error) {
+func editorRefreshCompile(ctx context.Context, send sendFn, resolve instanceResolver, params map[string]interface{}, keepConsole bool, logw io.Writer) (*client.CommandResponse, error) {
 	// The connector closes its connection across the domain reload the compile triggers, which Go's
 	// HTTP client logs as an "Unsolicited response" line — noise next to the report. Same as verify.
 	original := log.Writer()
@@ -118,7 +118,7 @@ func editorRefreshCompile(send sendFn, resolve instanceResolver, params map[stri
 		baseline.PID = current.PID
 	}
 
-	outcome, err := waitForCompileTo(resolve, logw, "editor refresh --compile", baseline)
+	outcome, err := waitForCompileTo(ctx, resolve, logw, "editor refresh --compile", baseline)
 	if err != nil {
 		return nil, err
 	}
@@ -153,7 +153,7 @@ func editorRefreshCompile(send sendFn, resolve instanceResolver, params map[stri
 		if current, rerr := resolve(); rerr == nil && current != nil {
 			baseline.PID = current.PID
 		}
-		outcome, err = waitForCompileTo(resolve, logw, "editor refresh --compile (clean retry)", baseline)
+		outcome, err = waitForCompileTo(ctx, resolve, logw, "editor refresh --compile (clean retry)", baseline)
 		if err != nil {
 			return nil, err
 		}

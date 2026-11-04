@@ -3,6 +3,7 @@ package cmd
 import (
 	"context"
 	"errors"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -114,6 +115,80 @@ func TestWaitAndSendShareOneBudget(t *testing.T) {
 	}
 	if elapsed > 450*time.Millisecond {
 		t.Errorf("wait + send spent two budgets: %v (budget 300ms)", elapsed)
+	}
+}
+
+// TestCompileWaitsHonourTheInvocationDeadline is the regression for a short --timeout on verify or
+// editor refresh --compile: both poll for a compile with their own 5-minute deadline, so they must
+// also stop when the invocation context expires.
+func TestCompileWaitsHonourTheInvocationDeadline(t *testing.T) {
+	compileTestBudgets(t)
+	resolve := func() (*client.Instance, error) {
+		return &client.Instance{State: "compiling", CompileFinishedAt: 1_000}, nil
+	}
+
+	tests := []struct {
+		name string
+		wait func(ctx context.Context) error
+	}{
+		{
+			name: "verify",
+			wait: func(ctx context.Context) error {
+				_, timedOut, err := waitForReadyTo(ctx, resolve, io.Discard, "verify")
+				if err == nil && !timedOut {
+					return errors.New("returned without a timeout")
+				}
+				return err
+			},
+		},
+		{
+			name: "editor refresh --compile",
+			wait: func(ctx context.Context) error {
+				_, err := waitForCompileTo(ctx, resolve, io.Discard, "editor refresh --compile", compileBaseline{FinishedAt: 1_000})
+				return err
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 40*time.Millisecond)
+			defer cancel()
+			start := time.Now()
+			err := tt.wait(ctx)
+			elapsed := time.Since(start)
+			if err == nil || !strings.Contains(err.Error(), "--timeout") {
+				t.Fatalf("expected the invocation deadline to end the wait, got %v", err)
+			}
+			if elapsed > 250*time.Millisecond {
+				t.Errorf("the compile wait ignored the invocation deadline: %v", elapsed)
+			}
+		})
+	}
+}
+
+func TestTimeoutMessagesUseTheBudgetFormatter(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want string
+	}{
+		{
+			name: "heartbeat wait",
+			err:  waitForAliveTimeout(59997),
+			want: "timed out after 60s waiting for Unity to answer",
+		},
+		{
+			name: "invocation deadline",
+			err:  invocationDeadlineError("verify", 59997, context.DeadlineExceeded),
+			want: "timed out after 60s waiting for Unity to answer verify",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if !strings.Contains(tt.err.Error(), tt.want) {
+				t.Errorf("message = %q, want it to contain %q", tt.err, tt.want)
+			}
+		})
 	}
 }
 

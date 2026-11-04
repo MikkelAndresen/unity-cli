@@ -320,12 +320,12 @@ type RequestTimeoutError struct {
 }
 
 func (e *RequestTimeoutError) Error() string {
-	return fmt.Sprintf("timed out after %s waiting for Unity to answer %s (the editor may still be running it)", formatBudget(e.Budget), e.Command)
+	return fmt.Sprintf("timed out after %s waiting for Unity to answer %s (the editor may still be running it)", FormatBudget(e.Budget), e.Command)
 }
 
-// formatBudget keeps a context deadline's nanosecond remainder out of the message: callers passed
+// FormatBudget keeps a context deadline's nanosecond remainder out of the message: callers passed
 // a whole number of milliseconds, and "1.947998375s" reads like a bug rather than a budget.
-func formatBudget(d time.Duration) string {
+func FormatBudget(d time.Duration) string {
 	if d <= 0 {
 		return "0s"
 	}

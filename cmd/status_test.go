@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 	"os"
@@ -272,7 +273,7 @@ func TestWaitForCompile_ReadyHeartbeatIsNotEvidence(t *testing.T) {
 		return &client.Instance{State: "ready", CompileFinishedAt: 1_000}, nil
 	}
 
-	out, err := waitForCompileTo(resolve, io.Discard, "editor refresh --compile", compileBaseline{FinishedAt: 1_000})
+	out, err := waitForCompileTo(context.Background(), resolve, io.Discard, "editor refresh --compile", compileBaseline{FinishedAt: 1_000})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -288,7 +289,7 @@ func TestWaitForCompile_ClockAdvanceAfterRequestIsEvidence(t *testing.T) {
 		return &client.Instance{State: "ready", CompileFinishedAt: 1_001, CompileErrors: true}, nil
 	}
 
-	out, err := waitForCompileTo(resolve, io.Discard, "editor refresh --compile", compileBaseline{FinishedAt: 1_000})
+	out, err := waitForCompileTo(context.Background(), resolve, io.Discard, "editor refresh --compile", compileBaseline{FinishedAt: 1_000})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -303,7 +304,7 @@ func TestWaitForCompile_KeepsWaitingWhileCompiling(t *testing.T) {
 		return &client.Instance{State: "compiling", CompileFinishedAt: 1_000, CompileErrors: true}, nil
 	}
 
-	out, err := waitForCompileTo(resolve, io.Discard, "editor refresh --compile", compileBaseline{FinishedAt: 1_000})
+	out, err := waitForCompileTo(context.Background(), resolve, io.Discard, "editor refresh --compile", compileBaseline{FinishedAt: 1_000})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}

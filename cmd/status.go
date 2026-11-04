@@ -361,7 +361,25 @@ func waitForAliveTimeout(timeoutMs int) error {
 		return fmt.Errorf("timed out waiting for Unity")
 	}
 	return fmt.Errorf("timed out after %s waiting for Unity to answer (the editor may still be starting or busy)",
-		(time.Duration(timeoutMs) * time.Millisecond).String())
+		client.FormatBudget(time.Duration(timeoutMs)*time.Millisecond))
+}
+
+// pollOrCancel waits one poll interval, returning the context error when the invocation deadline
+// or a signal ends the wait first.
+func pollOrCancel(ctx context.Context) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-time.After(statusPollInterval):
+		return nil
+	}
+}
+
+func compileWaitError(cause error) error {
+	if cause == context.DeadlineExceeded {
+		return fmt.Errorf("timed out waiting for compilation (--timeout): %w", cause)
+	}
+	return fmt.Errorf("waiting for compilation cancelled: %w", cause)
 }
 
 // crashedWhileWaiting answers with the crash report when the heartbeat on disk belongs to an editor
@@ -382,12 +400,14 @@ func crashedWhileWaiting(inst *client.Instance) error {
 // writing progress to logw. command names the waiting command if a modal dialog blocks the editor.
 // It cannot tell a compile that finished from an editor that was already ready; callers that need
 // that proof use waitForCompileTo.
-func waitForReadyTo(resolve instanceResolver, logw io.Writer, command string) (hasErrors, timedOut bool, err error) {
+func waitForReadyTo(ctx context.Context, resolve instanceResolver, logw io.Writer, command string) (hasErrors, timedOut bool, err error) {
 	_, _ = fmt.Fprintf(logw, "Waiting for compilation...\n")
 
 	deadline := time.Now().Add(compileWaitTimeout)
 	for time.Now().Before(deadline) {
-		time.Sleep(statusPollInterval)
+		if err := pollOrCancel(ctx); err != nil {
+			return false, false, compileWaitError(err)
+		}
 		status, err := resolve()
 		if err != nil {
 			continue
@@ -444,14 +464,16 @@ type compileOutcome struct {
 // waitForCompileTo polls the heartbeat until the connector reports a script compilation that
 // finished after baseline. A heartbeat that is simply "ready" is not proof: it can already have
 // been ready when polling started, and the compile can finish inside one poll interval.
-func waitForCompileTo(resolve instanceResolver, logw io.Writer, command string, baseline compileBaseline) (compileOutcome, error) {
+func waitForCompileTo(ctx context.Context, resolve instanceResolver, logw io.Writer, command string, baseline compileBaseline) (compileOutcome, error) {
 	_, _ = fmt.Fprintf(logw, "Waiting for compilation...\n")
 
 	start := time.Now()
 	deadline := start.Add(compileWaitTimeout)
 	lastErrors := false
 	for time.Now().Before(deadline) {
-		time.Sleep(statusPollInterval)
+		if err := pollOrCancel(ctx); err != nil {
+			return compileOutcome{}, compileWaitError(err)
+		}
 		status, err := resolve()
 		if err != nil {
 			continue

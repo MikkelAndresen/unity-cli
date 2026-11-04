@@ -598,7 +598,7 @@ func remainingTimeoutMs(ctx context.Context, fallback int) int {
 func invocationDeadlineError(category string, timeoutMs int, cause error) error {
 	if cause == context.DeadlineExceeded {
 		return fmt.Errorf("timed out after %s waiting for Unity to answer %s (the editor may still be running it)",
-			(time.Duration(timeoutMs) * time.Millisecond).String(), category)
+			client.FormatBudget(time.Duration(timeoutMs)*time.Millisecond), category)
 	}
 	return fmt.Errorf("request cancelled: %w", cause)
 }

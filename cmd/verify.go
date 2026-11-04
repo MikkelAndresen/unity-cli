@@ -148,7 +148,7 @@ func verifyCmd(ctx context.Context, args []string, send, testSend sendFn, resolv
 	if !resp.Success {
 		return noReply("editor: %s", resp.Message)
 	}
-	hasErrors, timedOut, err := waitForReadyTo(resolve, io.Discard, "verify")
+	hasErrors, timedOut, err := waitForReadyTo(ctx, resolve, io.Discard, "verify")
 	if err != nil {
 		return noReply("compile: %v", err)
 	}

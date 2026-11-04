@@ -162,3 +162,20 @@ one 4 s budget). `test`/`verify` are no longer `0`; they default to 1800 s and a
   explicitly sets a short `--timeout` still gets that shorter overall budget.
 - `test --mode PlayMode` polling now honours the invocation context, but its existing 10-minute
   result-file limit remains as a second, independent bound.
+
+## Review follow-up
+
+A read-only review of the timeout branch found two remaining deadline/wording holes, both fixed:
+
+- `waitForReadyTo` (verify) and `waitForCompileTo` (`editor refresh --compile`) polled a private
+  5-minute `compileWaitTimeout` with `time.Sleep`, so an explicit short `--timeout` could still run
+  for five minutes before the next request noticed. Both now wait on the invocation context as well
+  and report `timed out waiting for compilation (--timeout)` when it expires.
+- The "timed out after X" sentence was formatted by hand in `waitForAliveTimeout` and
+  `invocationDeadlineError`, so a 60 s budget could read `59.997s`. `internal/client`'s budget
+  formatter is now exported as `FormatBudget` and used by all three producers of that sentence.
+
+Low-severity review notes left as-is: `--timeout 0` now means "no deadline" for the heartbeat wait
+(and PlayMode polling still has its 10-minute cap), `exec` reads piped stdin before discovery, the
+250 ms signal fallback can truncate a slow write, `client.Send`/`waitForAlive` remain as test-only
+shims, and one timeout test keeps tight wall-clock margins.
