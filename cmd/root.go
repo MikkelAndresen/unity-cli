@@ -108,7 +108,8 @@ func Execute() error {
 	if err != nil {
 		return noEditor(annotateNoEditor(err, targetProject, flagPort))
 	}
-	if err := checkConnectorVersion(alive, Version, flagIgnoreVersionMismatch); err != nil {
+	gate := newVersionGate(category)
+	if err := gate.check(alive); err != nil {
 		return noEditor(err)
 	}
 	if category != modalCommand && isModal(alive) {
@@ -121,7 +122,7 @@ func Execute() error {
 		if err != nil {
 			return nil, err
 		}
-		if err := checkConnectorVersion(inst, Version, flagIgnoreVersionMismatch); err != nil {
+		if err := gate.check(inst); err != nil {
 			return nil, err
 		}
 		return client.Send(inst, command, params, timeout)
@@ -137,7 +138,7 @@ func Execute() error {
 		if resolveErr != nil {
 			return resolveErr
 		}
-		if err := checkConnectorVersion(currentInst, Version, flagIgnoreVersionMismatch); err != nil {
+		if err := gate.check(currentInst); err != nil {
 			return err
 		}
 		testSend := sendWatchingModal(func(command string, params interface{}) (*client.CommandResponse, error) {

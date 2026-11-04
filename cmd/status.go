@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -24,17 +25,18 @@ func statusCmd(inst *client.Instance) error {
 	if age > staleHeartbeatAge {
 		verdict := assessCrash(status)
 		fmt.Fprint(os.Stderr, oneTrailingNewline(stalledEditorReport(status, age, verdict)))
+		printVersionSummary(os.Stderr, status)
 		if verdict.Crashed {
 			// A dead editor is not a state an agent can wait out, so it leaves as a failed exit.
 			return fmt.Errorf("%s", crashLine(status, verdict))
 		}
-		return checkConnectorVersion(status, Version, flagIgnoreVersionMismatch)
+		return nil
 	}
 
 	fmt.Printf("Unity (port %d): %s\n", status.Port, status.State)
 	fmt.Printf("  Project: %s\n", status.ProjectPath)
 	fmt.Printf("  Version: %s\n", status.UnityVersion)
-	fmt.Printf("  Connector: %s\n", connectorVersionLabel(status.ConnectorVersion))
+	printVersionSummary(os.Stdout, status)
 	fmt.Printf("  PID:     %d\n", status.PID)
 	if isModal(status) {
 		fmt.Print(describeModal(status.Modal))
@@ -42,7 +44,14 @@ func statusCmd(inst *client.Instance) error {
 	if status.Build != nil {
 		fmt.Print(describeBuild(status.Build))
 	}
-	return checkConnectorVersion(status, Version, flagIgnoreVersionMismatch)
+	return nil
+}
+
+func printVersionSummary(w io.Writer, status *client.Instance) {
+	v := assessConnectorVersion(status, Version)
+	fmt.Fprintf(w, "  CLI:     %s\n", v.CLI)
+	fmt.Fprintf(w, "  Connector: %s\n", connectorVersionLabel(status.ConnectorVersion))
+	fmt.Fprintf(w, "  Compatibility: %s\n", v.Verdict)
 }
 
 // staleHeartbeatReport is what status prints once the heartbeat stops arriving. The evidence line
@@ -90,25 +99,134 @@ func connectorVersionLabel(version string) string {
 	return version
 }
 
-func checkConnectorVersion(inst *client.Instance, cliVersion string, ignoreMismatch bool) error {
-	if normalizeVersion(cliVersion) == "dev" {
-		return nil
-	}
-	if ignoreMismatch {
-		return nil
-	}
-	if inst == nil {
-		return nil
+// minConnectorVersion is the oldest connector protocol this CLI is built against. 0.7.0 is the
+// first release with the command set and heartbeat fields (compileFinishedAt, modal, build) that
+// current commands such as verify, wait and build send or read; anything older is refused unless
+// --ignore-version-mismatch says the caller knows better.
+const minConnectorVersion = "0.7.0"
+
+// versionExemptCommands are read-only or recovery commands: they must keep answering even when the
+// connector speaks a different protocol, because they are how an operator diagnoses and repairs the
+// mismatch. Gating them only turns a version drift into an unusable session (#11).
+var versionExemptCommands = map[string]struct{}{
+	"status":              {},
+	"console":             {},
+	"compile_diagnostics": {},
+	"compile_status":      {},
+	"modal":               {},
+	"tools":               {},
+	"tool_describe":       {},
+	"wait":                {},
+	"dialogs":             {},
+	"list":                {},
+	"help":                {},
+	"version":             {},
+	"update":              {},
+}
+
+type connectorCompatibility struct {
+	CLI        string
+	Connector  string
+	Compatible bool
+	Verdict    string
+	Warning    string
+	Refusal    error
+}
+
+type semanticVersion struct {
+	major int
+	minor int
+	patch int
+}
+
+func assessConnectorVersion(inst *client.Instance, cliVersion string) connectorCompatibility {
+	v := connectorCompatibility{CLI: normalizeVersion(cliVersion)}
+	if inst != nil {
+		v.Connector = strings.TrimSpace(inst.ConnectorVersion)
 	}
 
-	connectorVersion := strings.TrimSpace(inst.ConnectorVersion)
+	cli, cliOK := parseVersion(v.CLI)
+	if v.CLI == "dev" || !cliOK {
+		v.Compatible = true
+		v.Verdict = "development CLI; compatibility not checked"
+		return v
+	}
+	if v.Connector == "" {
+		v.Compatible = true
+		v.Verdict = "unknown connector version; update the connector package"
+		v.Warning = versionWarning(v.CLI, "", "the connector reports no version")
+		return v
+	}
+
+	connector, connectorOK := parseVersion(v.Connector)
+	if !connectorOK {
+		v.Compatible = true
+		v.Verdict = fmt.Sprintf("unrecognised connector version %q; update the connector package", v.Connector)
+		v.Warning = versionWarning(v.CLI, v.Connector, "the connector version is not a version number")
+		return v
+	}
+	min, _ := parseVersion(minConnectorVersion)
+	if versionLess(connector, min) {
+		v.Compatible = false
+		v.Verdict = fmt.Sprintf("connector %s is older than the minimum %s; update the connector package", v.Connector, minConnectorVersion)
+		v.Refusal = fmt.Errorf("connector %s is older than the minimum %s supported by unity-cli %s (%s). Update the com.youngwoocho02.unity-cli-connector package in Unity, or rerun with --ignore-version-mismatch", v.Connector, minConnectorVersion, v.CLI, executablePath())
+		return v
+	}
+	if connector.major == cli.major && connector.minor == cli.minor {
+		v.Compatible = true
+		v.Verdict = fmt.Sprintf("compatible (same major.minor %d.%d)", cli.major, cli.minor)
+		return v
+	}
+
+	v.Compatible = true
+	field := "minor"
+	if connector.major != cli.major {
+		field = "major"
+	}
+	v.Verdict = fmt.Sprintf("compatible with a warning (CLI and connector differ in %s version)", field)
+	v.Warning = versionWarning(v.CLI, v.Connector, "they differ in "+field+" version")
+	return v
+}
+
+func versionWarning(cliVersion, connectorVersion, detail string) string {
 	if connectorVersion == "" {
-		return fmt.Errorf("connector version is unknown; update the Unity Connector package to match unity-cli %s, or rerun with --ignore-version-mismatch", cliVersion)
+		connectorVersion = "unknown"
 	}
-	if normalizeVersion(connectorVersion) != normalizeVersion(cliVersion) {
-		return fmt.Errorf("connector version mismatch: unity-cli %s, connector %s. Update both to the same release, or rerun with --ignore-version-mismatch", cliVersion, connectorVersion)
+	return fmt.Sprintf("warning: unity-cli %s (%s) and connector %s: %s. Run `unity-cli update` for the CLI and update the com.youngwoocho02.unity-cli-connector package in Unity; rerun with --ignore-version-mismatch to hide this warning.", cliVersion, executablePath(), connectorVersion, detail)
+}
+
+func executablePath() string {
+	exe, err := os.Executable()
+	if err != nil || strings.TrimSpace(exe) == "" {
+		return "unknown path"
 	}
-	return nil
+	return exe
+}
+
+func parseVersion(version string) (semanticVersion, bool) {
+	parts := strings.SplitN(normalizeVersion(version), ".", 3)
+	if len(parts) != 3 {
+		return semanticVersion{}, false
+	}
+	values := [3]int{}
+	for i, part := range parts {
+		n, err := strconv.Atoi(part)
+		if err != nil || n < 0 {
+			return semanticVersion{}, false
+		}
+		values[i] = n
+	}
+	return semanticVersion{major: values[0], minor: values[1], patch: values[2]}, true
+}
+
+func versionLess(a, b semanticVersion) bool {
+	if a.major != b.major {
+		return a.major < b.major
+	}
+	if a.minor != b.minor {
+		return a.minor < b.minor
+	}
+	return a.patch < b.patch
 }
 
 func normalizeVersion(version string) string {
@@ -116,6 +234,46 @@ func normalizeVersion(version string) string {
 	version = strings.TrimPrefix(version, "v")
 	version = strings.TrimPrefix(version, "V")
 	return version
+}
+
+// versionGate applies the compatibility rule once per command invocation. Diagnostic commands bypass
+// both the refusal and the warning; everything else prints a drift warning at most once per version
+// pair, even though the gate runs both before dispatch and inside every send.
+type versionGate struct {
+	cliVersion string
+	ignore     bool
+	exempt     bool
+	warned     map[string]bool
+}
+
+func newVersionGate(command string) *versionGate {
+	_, exempt := versionExemptCommands[command]
+	return &versionGate{
+		cliVersion: Version,
+		ignore:     flagIgnoreVersionMismatch,
+		exempt:     exempt,
+		warned:     map[string]bool{},
+	}
+}
+
+func (g *versionGate) check(inst *client.Instance) error {
+	v := assessConnectorVersion(inst, g.cliVersion)
+	if g.ignore || g.exempt {
+		return nil
+	}
+	if v.Refusal != nil {
+		return v.Refusal
+	}
+	if v.Warning == "" {
+		return nil
+	}
+	key := v.CLI + "\x00" + v.Connector
+	if g.warned[key] {
+		return nil
+	}
+	g.warned[key] = true
+	fmt.Fprintln(os.Stderr, v.Warning)
+	return nil
 }
 
 // waitForAlive resolves the current target instance, then polls until a newer heartbeat appears.

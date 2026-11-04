@@ -884,6 +884,9 @@ unity-cli status
 # Output: Unity (port 8090): ready
 #   Project: /path/to/project
 #   Version: 6000.1.0f1
+#   CLI:     0.7.1
+#   Connector: 0.7.0
+#   Compatibility: compatible (same major.minor 0.7)
 #   PID:     12345
 ```
 
@@ -930,7 +933,7 @@ can decide there; the verdict always prints which evidence it used.
 | `--port <N>` | Select Unity instance by active heartbeat port | auto |
 | `--project <path>` | Select Unity instance by project path | latest |
 | `--timeout <ms>` | HTTP request timeout | 120000 |
-| `--ignore-version-mismatch` | Run even when CLI and connector versions differ | false |
+| `--ignore-version-mismatch` | Suppress the version-drift warning (and the refusal for a connector older than 0.7.0) | false |
 | `--meta` | Print the response's `meta` (how the call was served, e.g. `exec`'s compile cache state) to stderr | false |
 
 ```bash
@@ -940,9 +943,16 @@ unity-cli --port 8091 editor play
 # Select by project path when multiple Unity instances are open
 unity-cli --project MyGame editor stop
 
-# Run anyway when the installed connector has a different release version
-unity-cli --ignore-version-mismatch status
+# Hide the warning when the installed connector has a different release version
+unity-cli --ignore-version-mismatch exec 'return 1 + 1;'
 ```
+
+CLI and connector versions do not have to match exactly. A patch difference in the same major.minor
+is accepted silently. A different minor or major version is accepted with one warning on stderr that
+names both versions, the CLI binary and the fix; diagnostic commands (`status`, `console`,
+`compile_diagnostics`, `compile_status`, `modal`, `tools`, `tool_describe`, `wait`, `dialogs`, `list`)
+never fail on it. The CLI refuses only a connector older than 0.7.0, the oldest protocol it speaks.
+`status` always prints both versions and the compatibility verdict.
 
 Use `--help` on any command for detailed usage:
 
