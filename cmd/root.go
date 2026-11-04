@@ -444,15 +444,19 @@ Reserialize:
     reserialize Assets/Scenes/Main.unity
     reserialize Assets/Prefabs/A.prefab Assets/Prefabs/B.prefab
 
-Burst Cache:
+Burst:
   clear_burst_cache              Delete Library/BurstCache (Burst recompiles on next use)
   clear_burst_cache --scope jit  Only the JIT library cache, keep AOT settings hashes
   clear_burst_cache --dry_run    List files and size without deleting
+  burst_status                   Is Burst done compiling, what compiled, what failed (BCxxxx)
+  burst_status --wait 60         Wait up to 60s for Burst to finish, then report
 
   Examples:
     clear_burst_cache
     clear_burst_cache --dry_run
     clear_burst_cache --scope jit
+    burst_status --wait 60
+    burst_status --assembly MyGame.Runtime --list
 
 Tests:
   test                            Run EditMode tests (default)
@@ -466,6 +470,7 @@ Verify (compile + tests, brief output for agents):
   verify                          Compile, list errors in your code, run EditMode tests
   verify --no-tests               Stop after the compile
   verify --assembly <a,b>         Only these test assemblies (also --filter, --mode)
+  verify --no-burst               Skip the Burst step
 
 Build (long-running; the editor stays observable while it runs):
   build --profile <name> --output <path>      Start a player build job, watch progress, exit 0/1
@@ -773,6 +778,47 @@ Examples:
   unity-cli clear_burst_cache --dry_run
   unity-cli clear_burst_cache --scope jit
 `)
+	case "burst_status":
+		fmt.Print(`Usage: unity-cli burst_status [options]
+
+Ask Burst what it has compiled. Burst compiles outside Unity's script compilation,
+so a clean C# compile and a quiet console do not prove a [BurstCompile] job was
+compiled — and a Burst (BCxxxx) error can appear after the compile finished.
+
+Reports whether Burst's own queue is idle, and the [BurstCompile] targets in the
+project's own assemblies (package assemblies are left out unless --include_packages)
+with status compiled / failed / not-compiled-yet / unknown. Default output is short:
+counts plus the Burst errors, each as file:line:col CODE message.
+
+A filter (--type, --namespace, --assembly) turns the listing on: the matching targets
+with their status.
+
+How status is decided: Burst eager-compiles every target it knows when an assembly
+finishes compiling, so "its queue is idle" plus "no error names this target" is what
+compiled means here. --compile forces a Burst recompile now, so the answer comes from
+this call (method: forced_recompile) instead of the last script compile (method: eager).
+
+Needs com.unity.burst installed: without it the tool is not built and the command is
+unknown. verify runs this step automatically; see unity-cli help verify.
+
+Options:
+  --wait <seconds>        Wait for Burst to go idle (default 0 = answer immediately;
+                          with --compile the default is 60)
+  --compile               Force Burst to recompile its targets now
+  --type <name>           Only targets whose type or target name contains this
+  --namespace <ns>        Only targets in this namespace or below
+  --assembly <a,b>        Only targets in these assemblies (comma-separated)
+  --list                  List matched targets even without a filter
+  --include_packages      Include targets in package assemblies too
+  --limit <n>             Max errors and targets to list (default 20)
+
+Examples:
+  unity-cli burst_status
+  unity-cli burst_status --wait 60
+  unity-cli burst_status --type ScaleValuesJob
+  unity-cli burst_status --assembly MyGame.Runtime --list
+  unity-cli burst_status --compile --wait 120 --timeout 130000
+`)
 	case "profiler":
 		fmt.Print(`Usage: unity-cli profiler <subcommand> [options]
 
@@ -838,11 +884,17 @@ brief enough for an agent's context:
   2. Refreshes assets, compiles, and waits for it to finish.
   3. Lists this compile's errors in your code as file:line:col CODE message.
      Errors in Library/ or PackageCache/ are listed only when nothing else is.
-  4. Unless --no-tests: saves dirty open scenes and runs the tests, then
+  4. Asks Burst (burst_status) whether it is still compiling, what compiled, and
+     what failed, waiting up to --burst-wait seconds. Burst errors print the same
+     way as compile errors and fail verify. --no-burst skips the step; projects
+     without Burst print nothing.
+  5. Unless --no-tests: saves dirty open scenes and runs the tests, then
      prints passed/total and the first line of each failure.
 
 Options:
   --no-tests                    Stop after the compile
+  --no-burst                    Skip the Burst step
+  --burst-wait <seconds>        How long to wait for Burst to go idle (default 60)
   --assembly <a,b>              Only tests in these assemblies (comma-separated)
   --filter <name>               Filter by namespace, class, or full test name
   --mode <EditMode|PlayMode>    Test mode (default: EditMode)
@@ -851,17 +903,22 @@ Options:
   --json                        One JSON object instead of text
 
 Exit codes:
-  0  compiles and every test passes
-  1  compile errors, failing tests, or no test ran
+  0  compiles, Burst is quiet, and every test passes
+  1  compile errors, Burst errors, failing tests, or no test ran
   2  the editor could not answer: not running, timed out, or blocked by a
      modal dialog (named, with the command that answers it)
 
+A Burst check that cannot run (older connector, editor busy) is printed as a note
+and does not change the exit code; keep --timeout above --burst-wait.
+
 Needs connector 0.7.0 for live compile errors; older connectors fall back to
-console errors.
+console errors. The burst step needs the connector's Burst tool, which is built
+only when com.unity.burst is installed.
 
 Examples:
   unity-cli verify
   unity-cli verify --no-tests
+  unity-cli verify --no-burst
   unity-cli verify --assembly MyGame.Tests.Editor
   unity-cli verify --json
 `)

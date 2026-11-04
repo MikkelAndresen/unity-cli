@@ -21,6 +21,7 @@ unity-connector/      # C# Unity Editor package (UPM)
   Editor/
     Core/             # Shared utilities (Response, ParamCoercion, ToolParams, StringCaseUtility, StackTraceFilter)
     Tools/            # Tool implementations (auto-registered via [UnityCliTool] attribute)
+    Burst/            # burst_status tool; own asmdef, only compiles when com.unity.burst is present
     BuildJobs/        # Player build jobs: job record, Temp/ persistence across reloads, runner off the command lock
     InputInjection/   # `input` tool — own asmdef, only compiles when com.unity.inputsystem is present
     Modal/            # macOS modal dialog handling: AppKit via objc_msgSend, runs during the modal loop
@@ -36,9 +37,10 @@ unity-connector/      # C# Unity Editor package (UPM)
 3. Positional args arrive as `args` array, flags as named params
 4. Go-side code is only needed for polling/waiting logic (editor, test)
 5. A tool that needs an optional package goes in its own folder + asmdef with `versionDefines` and
-   `defineConstraints` (see `Editor/InputInjection/`); ToolDiscovery scans every loaded assembly, so
-   no registration is needed. Unity must generate the `.meta` files — refresh the asset database
-   rather than writing GUIDs.
+   `defineConstraints` (see `Editor/InputInjection/` and `Editor/Burst/`); ToolDiscovery scans every
+   loaded assembly, so no registration is needed. Unity must generate the `.meta` files — refresh the
+   asset database rather than writing GUIDs. Keep the version-sensitive part in that assembly and the
+   pure logic (parsing, filtering) in `Editor/Core/` so the tests compile without the package.
 6. A tool that must answer while the main thread is busy (a modal loop, a player build) is marked
    `[UnityCliTool(RunOffMainThread = true)]`: the HTTP server calls it on the request thread, past the
    command lock and the compilation gate. It may then touch no Unity API except through a thread-safe

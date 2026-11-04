@@ -33,6 +33,7 @@ type verifyResult struct {
 		Errors []verifyDiag `json:"errors,omitempty"`
 		Source string       `json:"source,omitempty"` // "console" when the connector predates compile_diagnostics
 	} `json:"compile"`
+	Burst *verifyBurst `json:"burst,omitempty"`
 	Tests *struct {
 		Total    int      `json:"total"`
 		Passed   int      `json:"passed"`
@@ -41,9 +42,39 @@ type verifyResult struct {
 		Failures []string `json:"failures,omitempty"`
 	} `json:"tests,omitempty"`
 	Notes []string `json:"notes,omitempty"`
-	Error string   `json:"error,omitempty"`
-	Exit  int      `json:"exit"`
+	// Burst could not be checked at all (old connector answers, editor busy, HTTP timeout). The tool
+	// being absent is not an error: it means the project has no Burst to ask.
+	BurstError string `json:"burst_error,omitempty"`
+	Error      string `json:"error,omitempty"`
+	Exit       int    `json:"exit"`
 }
+
+// verifyBurst is the burst_status reply. Compiled/failed/... count the [BurstCompile] targets in the
+// project's own assemblies; ErrorCount counts every Burst (BCxxxx) error the editor is holding.
+type verifyBurst struct {
+	Idle           bool         `json:"idle"`
+	IdleKnown      bool         `json:"idle_known"`
+	Eager          string       `json:"eager"`
+	Method         string       `json:"method"`
+	Version        string       `json:"burst_version"`
+	WaitedMs       int          `json:"waited_ms"`
+	WaitS          float64      `json:"wait_s"`
+	TimedOut       bool         `json:"timed_out"`
+	ProjectTargets int          `json:"project_targets"`
+	PackageTargets int          `json:"package_targets"`
+	Matched        int          `json:"matched"`
+	Compiled       int          `json:"compiled"`
+	Failed         int          `json:"failed"`
+	NotCompiled    int          `json:"not_compiled"`
+	Unknown        int          `json:"unknown"`
+	ErrorCount     int          `json:"error_count"`
+	Errors         []verifyDiag `json:"errors,omitempty"`
+	Notes          []string     `json:"notes,omitempty"`
+}
+
+// burstWaitSeconds is verify's bounded wait for Burst to finish; the connector caps its own wait at
+// the same value, so a bounded wait never turns into an unbounded one.
+const defaultBurstWaitSeconds = 60
 
 // verifyCmd checks that the project compiles and its tests pass, in one call and with output short
 // enough for an agent's context. testSend carries no request timeout (test runs can be long); port
@@ -51,8 +82,15 @@ type verifyResult struct {
 func verifyCmd(args []string, send, testSend sendFn, resolve instanceResolver, port int, out io.Writer) int {
 	flags := parseSubFlags(args)
 	_, noTests := flags["no-tests"]
+	_, noBurst := flags["no-burst"]
 	_, keepConsole := flags["keep-console"]
 	_, asJSON := flags["json"]
+	burstWait := defaultBurstWaitSeconds
+	if v, ok := flags["burst-wait"]; ok {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			burstWait = n
+		}
+	}
 	max := 20
 	if v, ok := flags["max"]; ok {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
@@ -117,6 +155,29 @@ func verifyCmd(args []string, send, testSend sendFn, resolve instanceResolver, p
 	if !r.Compile.OK {
 		return finish(verifyFailed)
 	}
+
+	// Burst compiles outside Unity's script compilation, so a clean C# compile says nothing about the
+	// [BurstCompile] jobs; ask Burst itself. A missing tool means no Burst (or an old connector): say
+	// nothing rather than claiming the project has no Burst work.
+	if !noBurst {
+		burst, found, err := verifyBurstStatus(send, burstWait, max)
+		if err != nil {
+			r.BurstError = err.Error()
+			if !asJSON {
+				_, _ = fmt.Fprintf(out, "burst: could not be checked (%s)\n", firstLine(err.Error()))
+			}
+		}
+		if found && burst != nil {
+			r.Burst = burst
+			if !asJSON {
+				printBurst(out, burst)
+			}
+			if burst.ErrorCount > 0 {
+				return finish(verifyFailed)
+			}
+		}
+	}
+
 	if noTests {
 		return finish(verifyOK)
 	}
@@ -276,6 +337,69 @@ func printCompile(out io.Writer, ok bool, total int, diags []verifyDiag, source 
 			code = d.Code + " "
 		}
 		_, _ = fmt.Fprintf(out, "  %s%s%s\n", where, code, d.Message)
+	}
+}
+
+// verifyBurstStatus asks the connector's burst_status tool and waits up to waitSeconds for Burst to
+// go idle. found=false when the connector has no such tool — no Burst installed, or a connector older
+// than the tool — which is not a failure and leaves verify's verdict untouched. A transport error or a
+// tool error comes back as err: verify reports it and keeps going, because Burst is a signal on top
+// of the compile/test verdict, not part of it.
+func verifyBurstStatus(send sendFn, waitSeconds, max int) (*verifyBurst, bool, error) {
+	params := map[string]interface{}{"wait": waitSeconds, "limit": max}
+	resp, err := send("burst_status", params)
+	if err != nil {
+		return nil, false, err
+	}
+	if !resp.Success {
+		if strings.Contains(resp.Message, "Unknown command") {
+			return nil, false, nil
+		}
+		return nil, true, fmt.Errorf("%s", resp.Message)
+	}
+	var b verifyBurst
+	if err := json.Unmarshal(resp.Data, &b); err != nil {
+		return nil, true, fmt.Errorf("unreadable burst_status reply: %w", err)
+	}
+	return &b, true, nil
+}
+
+func printBurst(out io.Writer, b *verifyBurst) {
+	if b == nil {
+		return
+	}
+	line := fmt.Sprintf("burst: %d targets compiled, %d error(s)", b.Compiled, b.ErrorCount)
+	if b.Failed > 0 {
+		line += fmt.Sprintf(", %d failed", b.Failed)
+	}
+	if b.NotCompiled > 0 {
+		line += fmt.Sprintf(", %d not compiled", b.NotCompiled)
+	}
+	if b.Unknown > 0 {
+		line += fmt.Sprintf(", %d unknown", b.Unknown)
+	}
+	if b.TimedOut {
+		line += fmt.Sprintf(" (Burst still compiling after %ds)", int(b.WaitS))
+	}
+	_, _ = fmt.Fprintln(out, line)
+	for _, e := range b.Errors {
+		where := ""
+		if e.File != "" && e.Line > 0 {
+			where = fmt.Sprintf("%s:%d", e.File, e.Line)
+			if e.Col > 0 {
+				where += fmt.Sprintf(":%d", e.Col)
+			}
+			where += " "
+		}
+		code := ""
+		if e.Code != "" {
+			code = e.Code + " "
+		}
+		_, _ = fmt.Fprintf(out, "  %s%s%s\n", where, code, e.Message)
+	}
+	// One caveat line is enough for a two-line summary; the tool keeps the rest for burst_status.
+	if len(b.Notes) > 0 {
+		_, _ = fmt.Fprintf(out, "  (%s)\n", b.Notes[0])
 	}
 }
 
