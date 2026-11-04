@@ -1077,8 +1077,10 @@ be late or never come. The Connector bounds the wait instead of leaving the conn
 
 - Each request carries its client budget (`deadline_ms`, the remaining part of `--timeout`). The
   Connector uses it as its queue deadline minus a margin, so the editor answers **before** the client
-  gives up. Without a declared deadline the Connector's own 60 s default applies, and a per-call
-  `queue_deadline_ms` parameter overrides both (clamped to 0.5–600 s).
+  gives up. A budget below the 0.5 s floor can still expire client-side first; the floor exists so a
+  tiny budget cannot race the connector's answer. Without a declared deadline the Connector's own
+  60 s default applies, and a per-call `queue_deadline_ms` parameter overrides both (clamped to
+  0.5–600 s).
 - The deadline bounds the wait for the main thread to *start* the command, never the command's runtime.
   A running tool is bounded only by your `--timeout`.
 - On `beforeAssemblyReload` and on quit, every in-flight request is answered first, and new
@@ -1086,15 +1088,17 @@ be late or never come. The Connector bounds the wait instead of leaving the conn
   answered `domain_reload` (retry it); one whose tool handler was already running is answered
   `reload_during_command` — it ran, only its return value went down with the old domain. A request
   whose tool had already returned keeps its own result: the reload wait gives the unwritten response
-  a bounded window to reach the socket. Tools marked `RunOffMainThread` (`modal`, `build_status`,
-  `compile_diagnostics`, …) stay callable throughout.
+  a bounded window to reach the socket. Answers to a quit carry no `data.code`: the editor is gone,
+  so there is nothing to wait for, and repeating the command depends on whether it had started.
+  Tools marked `RunOffMainThread` (`modal`, `build_status`, `compile_diagnostics`, …) stay callable
+  throughout.
 - A request that was already answered is skipped when its turn comes, so it cannot apply side effects
   after the caller was told it did not run.
 
 ```bash
 unity-cli --timeout 5000 exec 'return 1;'
 # Error: exec was queued but the main thread did not pick it up within 3.9s (waited 4.1s):
-#        editor busy (blocked by the running command test_run (42s))[heartbeat: playing,
+#        editor busy (blocked by the running command test_run (42s)) [heartbeat: playing,
 #        queue depth: 2]. The command did not run; nothing changed.
 # Details: {"code":"main_thread_busy","command":"exec","running_command":"test_run",…}
 #   next:      the command did not run and nothing changed; run 'unity-cli wait' until the
@@ -1107,7 +1111,7 @@ unity-cli exec --params '{"code":"AssetDatabase.Refresh(); return 1;","queue_dea
 | `data.code` | what happened | did the command run? |
 |-------------|---------------|----------------------|
 | `main_thread_busy` | the main thread never picked it up | no — nothing changed |
-| `domain_reload` | Unity reloaded or quit while the command was still queued | no — safe to repeat |
+| `domain_reload` | Unity reloaded while the command was still queued | no — safe to repeat |
 | `reload_during_command` | Unity reloaded while the command was running | yes, at least partly — check the state before repeating it |
 | `serialization_failed` | the tool's result could not be serialized | yes — its effects stand, only the returned value is lost |
 

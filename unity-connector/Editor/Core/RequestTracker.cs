@@ -185,7 +185,7 @@ namespace UnityCliConnector
                         : "the editor is not ticking";
 
             var message = $"{ticket.Command} was queued but the main thread did not pick it up within "
-                + $"{FormatSeconds(ticket.QueueWaitMs)} (waited {FormatSeconds(waited)}): editor busy ({reason})"
+                + $"{FormatSeconds(ticket.QueueWaitMs)} (waited {FormatSeconds(waited)}): editor busy ({reason}) "
                 + $"[heartbeat: {diag.HeartbeatState ?? "unknown"}, queue depth: {diag.QueueDepth}]. "
                 + "The command did not run; nothing changed.";
 

@@ -222,6 +222,9 @@ namespace UnityCliConnector
         static void Stop()
         {
             var port = s_Port;
+            // Refuse new main-thread work before the snapshot: a request tracked after it would never
+            // be answered before the listener goes away.
+            s_RefusingWork = true;
             // No error code for a quit: the editor is gone, so "wait for it and retry" would be a lie.
             AnswerPending("the editor is quitting", quitting: true);
             RequestTracker.AwaitForAnswers(PENDING_ANSWER_WAIT_MS);
@@ -393,15 +396,25 @@ namespace UnityCliConnector
                     else
                     {
                         ticket = RequestTracker.Track(new RequestTicket(command, QueueWaitMsFor(json, parameters)));
-                        s_Queue.Enqueue(new WorkItem
+                        // A reload or quit can flip the flag after the read above but before Track; without
+                        // this second read its "answer everything" snapshot would miss this ticket.
+                        if (s_RefusingWork)
                         {
-                            Command = command,
-                            Parameters = parameters,
-                            Ticket = ticket,
-                        });
-                        ForceEditorUpdate();
-                        result = await AwaitAnswer(ticket);
-                        ReportSlowQueue(ticket, ref result);
+                            result = RequestTracker.BuildRefusedError(command, "a reload or quit is already under way");
+                            ticket.TryAnswer(result);
+                        }
+                        else
+                        {
+                            s_Queue.Enqueue(new WorkItem
+                            {
+                                Command = command,
+                                Parameters = parameters,
+                                Ticket = ticket,
+                            });
+                            ForceEditorUpdate();
+                            result = await AwaitAnswer(ticket);
+                            ReportSlowQueue(ticket, ref result);
+                        }
                     }
                 }
             }
@@ -436,9 +449,12 @@ namespace UnityCliConnector
             // command that is still changing the editor, and the caller's client timeout already
             // bounds how long it watches. If the deadline passes while the handler is waiting on the
             // command lock, the request is answered as "did not run" and CommandRouter skips it.
-            var finished = await Task.WhenAny(ticket.Tcs.Task, Task.Delay(ticket.QueueWaitMs));
+            using var deadline = new CancellationTokenSource();
+            var finished = await Task.WhenAny(ticket.Tcs.Task, Task.Delay(ticket.QueueWaitMs, deadline.Token));
             if (finished != ticket.Tcs.Task)
                 RequestTracker.TryAnswerWaiting(ticket, Diagnostics());
+            else
+                deadline.Cancel();
 
             return await ticket.Tcs.Task;
         }
