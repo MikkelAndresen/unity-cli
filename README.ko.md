@@ -151,6 +151,7 @@ Unity 커넥터의 동작:
 | `menu` | Unity 메뉴 아이템을 경로로 실행 |
 | `reserialize` | Unity 시리얼라이저를 통해 에셋 재직렬화 |
 | `clear_burst_cache` | `Library/BurstCache`를 삭제해 Burst가 처음부터 다시 컴파일하게 함 |
+| `burst_status` | Burst 컴파일이 끝났는지, 어떤 `[BurstCompile]` 대상이 컴파일됐는지, 무엇이 실패했는지(BCxxxx) |
 | `screenshot` | Scene/Game 뷰를 PNG로 캡처 |
 | `profiler` | 프로파일러 하이어라키 읽기, 녹화 제어 |
 | `modal` | 에디터를 막고 있는 모달 다이얼로그 확인 및 응답 (macOS) |
@@ -288,6 +289,38 @@ unity-cli clear_burst_cache --scope jit
 
 Burst가 아직 매핑 중인 파일은 삭제 전체를 중단시키는 대신 경로별로 보고되므로, 부분 삭제 결과도 항상 근거가 남습니다.
 
+### Burst 컴파일 상태
+
+Burst는 Unity의 스크립트 컴파일과 별다른 일정으로 자체 컴파일한다. `compile: ok`에 테스트 통과, 빈 콘솔이 겹쳐도 `[BurstCompile]` job이 실제로 컴파일됐다는 증거가 아니고, `BCxxxx` 에러는 컴파일이 깨끗해 보인 뒤에도 뒤늦게 나타난다. `Library/BurstCache`를 직접 읽어도 답은 없다 — 파일명만 남고 상태와 에러는 없다.
+
+```bash
+# idle 여부, 컴파일된 대상 수, Burst 에러
+unity-cli burst_status
+
+# 최대 60초 동안 Burst가 끝나기를 기다린 뒤 답한다
+unity-cli burst_status --wait 60
+
+# 조건에 맞는 대상과 상태 목록
+unity-cli burst_status --type ScaleValuesJob
+unity-cli burst_status --assembly MyGame.Runtime --list
+
+# 이번 호출에서 Burst를 강제로 다시 컴파일하게 함
+unity-cli burst_status --compile --wait 120 --timeout 130000
+```
+
+```
+idle: true, 3/4 targets compiled, 1 Burst error
+  Assets/Jobs/HeavyJob.cs:39 BC1006 The `catch` construction is not supported
+```
+
+대상은 Burst가 직접 나열하는 `[BurstCompile]` job과 static method이고, 목록에는 프로젝트 자체 어셈블리의 대상만 올린다(패키지와 엔진 대상은 따로 세며, 목록에 넣으려면 `--include_packages`가 필요하다). 상태는 `compiled`, `failed`, `not-compiled-yet`, `unknown` 네 가지다. Burst는 어셈블리 컴파일이 끝날 때 아는 대상 전부를 eager 컴파일하므로, “Burst의 큐가 idle” + “이 대상을 지칭하는 에러가 없음”이 `compiled`의 뜻이고, 에러가 대상을 지칭하지 못하면 추측 대신 `notes`에 그 수를 적는다. `method` 필드는 답이 eager 큐에서 나왔는지 이번 호출이 강제한 재컴파일(`forced_recompile`)에서 나왔는지 알려 준다.
+
+job producer 에러가 가리키는 위치는 엔진이 생성한 job struct이므로, 도구는 엔진 밖의 첫 stack frame — 사용자의 파일과 라인 — 을 우선해 `file:line:col BCxxxx message` 형태로 출력한다. `verify`가 컴파일 뒤에 이 단계를 실행하므로 별도로 물어 볼 필요가 없고, `--no-burst`로 건너뛸 수 있다.
+
+이 도구는 `com.unity.burst`가 설치된 프로젝트에서만 빌린다(어셈블리가 패키지로 constrained). Burst가 없는 프로젝트에서는 명령이 unknown이고 `verify`에 `burst:` 줄이 나오지 않는다.
+
+Burst가 public으로 열어 둔 면은 좁다. `IsCurrentCompilationDone`, `TriggerRecompilation`, 인스펙터의 대상 목록(`GetInspectorEntryPoints`), eager 컴파일 상태는 internal이거나 private이므로 커넥터는 reflection으로 묶고, 이름이 없으면 실패 대신 `unknown`으로 답한다. Unity 6000.6.5f1 + Burst 2.0.0에서 측정한 사실: 대상별 컴파일을 강제하는 경로(`BurstCompilerService.GetDisassembly`)는 유효한 대상에서도 `Unable to compile method in BurstCompilerService::CompileAsync`로 실패해 상태 판정에 쓰지 않는다. `--compile`은 Burst 자신의 재컴파일 패스를 돌리며, 코드 수준 에러(BC1006/BC1091)는 다시 기록되지만 어셈블리 post-process 중에만 나오는 에러(BC1051, job struct의 관리되는 필드)는 다시 나오지 않는다. 또한 Burst는 method의 에러를 세션당 한 번 기록하므로, 비운 콘솔은 실제로 실패하는 job에 대해 조용할 수 있다. `notes`에 근거가 적힌다.
+
 ### 프로파일러
 
 ```bash
@@ -360,6 +393,9 @@ unity-cli verify --no-tests
 # 일부 테스트만 (--filter, --mode PlayMode도 가능)
 unity-cli verify --assembly MyGame.Tests.Editor
 
+# Burst 단계 건너뛰기
+unity-cli verify --no-burst
+
 # 텍스트 대신 JSON 객체 하나
 unity-cli verify --json
 ```
@@ -369,7 +405,17 @@ compile: 1 error(s)
   Assets/Scripts/Player.cs:42:13 CS0103 The name 'speed' does not exist in the current context
 ```
 
-`verify`는 먼저 콘솔을 비웁니다 (Burst 에러는 코드가 바뀐 뒤에도 콘솔에 남고, 다음 컴파일에서 Burst가 살아 있는 에러를 다시 기록합니다. `--keep-console`로 생략 가능). 그다음 리프레시와 컴파일을 하고, 커넥터의 `compile_diagnostics` 도구로 이번 컴파일의 에러를 출력합니다. `Library/`와 `PackageCache/`의 에러는 다른 실패가 없을 때만 보여 줍니다. 이어서 저장되지 않은 열린 씬을 저장하고 테스트를 실행해 `passed/total`과 실패마다 첫 줄을 출력합니다 (`--max`로 두 목록의 길이를 제한, 기본값 20). 종료 코드 0은 컴파일 성공과 모든 테스트 통과, 1은 컴파일 에러, 실패한 테스트, 또는 실행된 테스트 없음, 2는 에디터가 응답하지 못함(실행 중이 아님, 시간 초과, 모달 다이얼로그에 막힘)을 뜻하며, 다이얼로그는 응답 명령과 함께 표시됩니다. 0.7.0 이전 커넥터에는 `compile_diagnostics`가 없고 `--assembly`를 무시합니다. 이때 `verify`는 콘솔 에러를 보여 주고 그 사실을 알립니다.
+C# 컴파일이 깨끗해도 Burst 줄이 따라 나온다. Burst는 스크립트 컴파일 밖에서 컴파일하고 `BCxxxx` 에러는 깨끗해 보인 뒤 도착할 수 있기 때문이다:
+
+```
+compile: ok
+burst: 14 targets compiled, 0 error(s)
+tests: 31/31 passed
+```
+
+Burst 에러는 컴파일 에러와 같은 형태로 출력되고, 테스트가 실행되기 전에 verify를 실패시킨다(exit 1). `--burst-wait <초>`는 Burst가 idle이 되기를 기다리는 시간의 상한이다(기본 60, `--timeout`을 그보다 크게 유지할 것). Burst 확인을 할 수 없는 경우 — Burst가 설치되지 않아 `burst_status` 도구가 없거나 에디터가 응답하지 않는 경우 — 는 아무것도 출력하지 않거나 메모만 남기고 판정은 바꾸지 않는다.
+
+`verify`는 먼저 콘솔을 비웁니다 (Burst 에러는 코드가 바뀐 뒤에도 콘솔에 남고, 다음 컴파일에서 Burst가 살아 있는 에러를 다시 기록합니다. `--keep-console`로 생략 가능). 그다음 리프레시와 컴파일을 하고, 커넥터의 `compile_diagnostics` 도구로 이번 컴파일의 에러를 출력합니다. `Library/`와 `PackageCache/`의 에러는 다른 실패가 없을 때만 보여 줍니다. 이어서 저장되지 않은 열린 씬을 저장하고 테스트를 실행해 `passed/total`과 실패마다 첫 줄을 출력합니다 (`--max`로 두 목록의 길이를 제한, 기본값 20). 종료 코드 0은 컴파일 성공, Burst 무오류, 모든 테스트 통과를 뜻하고, 1은 컴파일 에러, Burst 에러, 실패한 테스트, 또는 실행된 테스트 없음을 뜻하며, 2는 에디터가 응답하지 못함(실행 중이 아님, 시간 초과, 모달 다이얼로그에 막힘)을 뜻한다. 다이얼로그는 응답 명령과 함께 표시됩니다. 0.7.0 이전 커넥터에는 `compile_diagnostics`가 없고 `--assembly`를 무시합니다. 이때 `verify`는 콘솔 에러를 보여 주고 그 사실을 알립니다.
 
 ### 모달 다이얼로그 (macOS)
 

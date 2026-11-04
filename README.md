@@ -153,6 +153,7 @@ Before compiling or reloading, the Connector records the state (`compiling`, `re
 | `menu` | Execute any Unity menu item by path |
 | `reserialize` | Re-serialize assets through Unity's serializer |
 | `clear_burst_cache` | Delete `Library/BurstCache` so Burst recompiles from scratch |
+| `burst_status` | Is Burst done compiling, which `[BurstCompile]` targets compiled, which failed (BCxxxx) |
 | `screenshot` | Capture scene/game view as PNG |
 | `profiler` | Read profiler hierarchy, control recording |
 | `modal` | Inspect and answer a modal dialog blocking the editor (macOS) |
@@ -405,11 +406,54 @@ unity-cli reserialize Assets/Materials/Character.mat
 
 This is what makes text-based asset editing safe. Without it, a single misplaced YAML field can break a prefab with no visible error until runtime. With it, **AI agents can confidently modify any Unity asset through plain text** — add components to prefabs, adjust scene hierarchies, change material properties — and know the result will load correctly.
 
-### Burst Cache
+### Burst: cache and compile status
 
 Burst keeps its compiled JIT libraries in `<project>/Library/BurstCache`. When that cache goes stale — a Burst package upgrade, a switch of Burst options, or jobs behaving like old code — the fix is to delete it and let Burst recompile.
 
 `clear_burst_cache` does that from inside the editor, without a shell: it only ever touches paths under `Library/BurstCache` (no path argument exists), reports every file and byte it removed, and can list the same for a dry run.
+
+```bash
+# Delete the whole cache; Burst rebuilds it on the next compile
+unity-cli clear_burst_cache
+
+# See what would go first, sizes included
+unity-cli clear_burst_cache --dry_run
+
+# Only the JIT library cache, keep the AOT settings hashes
+unity-cli clear_burst_cache --scope jit
+```
+
+Files Burst still has mapped are reported per path instead of aborting the clear, so a partial result is always accounted for.
+
+`burst_status` answers the other half: whether Burst is *done* compiling, what it compiled, and what failed. Burst compiles on its own schedule, outside Unity's script compilation, so `compile: ok` plus passing tests plus an empty console does not prove a `[BurstCompile]` job was ever compiled — and a `BCxxxx` error can show up after the compile already looked clean. Reading `Library/BurstCache` by hand answers none of that (bundle file names only, no status, no errors, and code from earlier work mixed in).
+
+```bash
+# Idle or compiling, how many targets compiled, and any Burst error
+unity-cli burst_status
+
+# Wait up to 60 s for Burst to finish first
+unity-cli burst_status --wait 60
+
+# List the matching targets with per-target status
+unity-cli burst_status --type ScaleValuesJob
+unity-cli burst_status --assembly MyGame.Runtime --list
+
+# Force Burst to recompile now, so the answer comes from this call
+unity-cli burst_status --compile --wait 120 --timeout 130000
+```
+
+```
+idle: true, 3/4 targets compiled, 1 Burst error
+  Assets/Jobs/HeavyJob.cs:39 BC1006 The `catch` construction is not supported
+```
+
+Targets are the `[BurstCompile]` jobs and static methods Burst itself lists, filtered to the project's own assemblies (package and engine targets are counted separately and left out of the listing unless `--include_packages`). Status is `compiled`, `failed`, `not-compiled-yet`, or `unknown`: Burst eager-compiles everything it knows about when an assembly finishes compiling, so "Burst's own queue is idle" plus "no error names this target" is what `compiled` means — the `method` field says whether the answer came from that eager compile (`eager`) or from a recompile `burst_status` forced this call (`forced_recompile`). `failed` requires an error that names the target; when an error cannot be attributed, the count says so in `notes` instead of guessing.
+
+Burst's own position for a job-producer error points at the engine's generated job struct; the tool prefers the first stack frame outside the engine, which is your file and line. `verify` runs this step after the compile, so an agent gets the answer without asking; `--no-burst` skips it.
+
+The tool is built only when `com.unity.burst` is installed (its assembly is constrained on the package), so on a project without Burst the command is simply unknown and `verify` prints no `burst:` line.
+
+What Burst exposes publicly is thin: `IsCurrentCompilationDone`, `TriggerRecompilation`, the inspector's entry-point list (`GetInspectorEntryPoints`) and the eager-compile status are internal or private, so the connector binds them by reflection and reports `unknown` instead of failing when a name is missing from the installed Burst. Measured on Unity 6000.6.5f1 with Burst 2.0.0: the per-method disassembly path (`BurstCompilerService.GetDisassembly`) rejected valid targets with `Unable to compile method in BurstCompilerService::CompileAsync`, so it is not used to decide per-target status. `--compile` uses Burst's own recompile pass, which re-logs code-level errors (BC1006/BC1091) but not the ones Unity only emits while post-processing an assembly (BC1051, an invalid managed field on a job struct), and Burst logs a method's error once per editor session — so a cleared console can be quiet about a job that really does fail. `notes` says which evidence the answer rests on.
 
 ```bash
 # Delete the whole cache; Burst rebuilds it on the next compile
@@ -493,6 +537,9 @@ unity-cli verify
 # Stop after the compile
 unity-cli verify --no-tests
 
+# Skip the Burst step
+unity-cli verify --no-burst
+
 # Only some tests (also --filter, --mode PlayMode)
 unity-cli verify --assembly MyGame.Tests.Editor
 
@@ -505,7 +552,17 @@ compile: 1 error(s)
   Assets/Scripts/Player.cs:42:13 CS0103 The name 'speed' does not exist in the current context
 ```
 
-`verify` clears the console first (a Burst error stays there after its code changes; Burst logs a live one again on the next compile; `--keep-console` skips the clear), refreshes and compiles, and lists this compile's errors from the connector's `compile_diagnostics` tool, leaving out `Library/` and `PackageCache/` unless nothing else failed. It then saves dirty open scenes and runs the tests, printing `passed/total` and the first line of each failure (`--max` caps both lists, default 20). Exit code 0 means it compiles and every test passed; 1 means compile errors, failing tests or no test ran; 2 means the editor couldn't answer: not running, timed out, or blocked by a modal dialog, which is named along with the command that answers it. Connectors before 0.7.0 have no `compile_diagnostics` and ignore `--assembly`; `verify` then lists console errors and says so.
+A clean C# compile also gets a Burst line, because Burst compiles outside script compilation and a `BCxxxx` error can arrive after it looked clean:
+
+```
+compile: ok
+burst: 14 targets compiled, 0 error(s)
+tests: 31/31 passed
+```
+
+Burst errors print like compile errors and fail verify (exit 1) before the tests run; `--burst-wait <seconds>` bounds how long verify waits for Burst to go idle (default 60, keep `--timeout` above it). A Burst check that cannot run — no `burst_status` tool because Burst is not installed, or the editor wouldn't answer — prints nothing or a note and leaves the verdict alone.
+
+`verify` clears the console first (a Burst error stays there after its code changes; Burst logs a live one again on the next compile; `--keep-console` skips the clear), refreshes and compiles, and lists this compile's errors from the connector's `compile_diagnostics` tool, leaving out `Library/` and `PackageCache/` unless nothing else failed. It then saves dirty open scenes and runs the tests, printing `passed/total` and the first line of each failure (`--max` caps both lists, default 20). Exit code 0 means it compiles, Burst is quiet and every test passed; 1 means compile errors, Burst errors, failing tests or no test ran; 2 means the editor couldn't answer: not running, timed out, or blocked by a modal dialog, which is named along with the command that answers it. Connectors before 0.7.0 have no `compile_diagnostics` and ignore `--assembly`; `verify` then lists console errors and says so.
 
 ### Build a Player (long-running)
 

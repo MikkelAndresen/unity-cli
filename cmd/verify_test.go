@@ -27,6 +27,9 @@ type fakeEditor struct {
 	tests         map[string]interface{} // run_tests summary; nil: tests not expected
 	testsSuccess  bool
 	testsMessage  string
+	burst         map[string]interface{} // burst_status reply; nil: connector has no burst_status tool
+	burstSuccess  bool
+	burstMessage  string
 	refreshErr    error
 	calls         []string
 	params        map[string]map[string]interface{}
@@ -84,6 +87,11 @@ func (f *fakeEditor) send(command string, params interface{}) (*client.CommandRe
 			f.t.Fatalf("run_tests called but not expected")
 		}
 		return &client.CommandResponse{Success: f.testsSuccess, Message: f.testsMessage, Data: data(f.tests)}, nil
+	case "burst_status":
+		if f.burst == nil {
+			return &client.CommandResponse{Success: false, Message: "Unknown command: burst_status"}, nil
+		}
+		return &client.CommandResponse{Success: f.burstSuccess, Message: f.burstMessage, Data: data(f.burst)}, nil
 	}
 	f.t.Fatalf("unexpected command %q", command)
 	return nil, nil
@@ -137,7 +145,7 @@ func TestVerify_CleanCompileAndPassingTests(t *testing.T) {
 	if out != "compile: ok\ntests: 3/3 passed\n" {
 		t.Errorf("output = %q", out)
 	}
-	want := []string{"console(clear)", "refresh_unity", "compile_diagnostics(source_tree_only=true)", "run_tests"}
+	want := []string{"console(clear)", "refresh_unity", "compile_diagnostics(source_tree_only=true)", "burst_status", "run_tests"}
 	if strings.Join(f.calls, ",") != strings.Join(want, ",") {
 		t.Errorf("calls = %v, want %v", f.calls, want)
 	}
@@ -317,6 +325,138 @@ func TestVerify_OldConnectorRunningEveryTestIsSaid(t *testing.T) {
 	f = &fakeEditor{t: t, connector: "0.7.0", diagnostics: clean(), tests: passing(3), testsSuccess: true}
 	if _, out := f.run("--assembly", "A.Tests"); strings.Contains(out, "ignores --assembly") {
 		t.Errorf("note shown for connector 0.7.0: %q", out)
+	}
+}
+
+func TestVerify_BurstLineFollowsTheCompile(t *testing.T) {
+	f := &fakeEditor{t: t, diagnostics: clean(), tests: passing(3), testsSuccess: true,
+		burstSuccess: true,
+		burst: map[string]interface{}{
+			"idle": true, "idle_known": true, "compiled": 14, "error_count": 0,
+			"project_targets": 14, "method": "eager",
+		}}
+	code, out := f.run()
+	if code != verifyOK {
+		t.Fatalf("exit = %d, want 0; output:\n%s", code, out)
+	}
+	if out != "compile: ok\nburst: 14 targets compiled, 0 error(s)\ntests: 3/3 passed\n" {
+		t.Errorf("output = %q", out)
+	}
+	if f.params["burst_status"]["wait"] != defaultBurstWaitSeconds {
+		t.Errorf("burst_status wait = %v, want %d", f.params["burst_status"]["wait"], defaultBurstWaitSeconds)
+	}
+}
+
+func TestVerify_BurstErrorsFailLikeCompileErrors(t *testing.T) {
+	f := &fakeEditor{t: t, diagnostics: clean(), tests: passing(3), testsSuccess: true,
+		burstSuccess: true,
+		burst: map[string]interface{}{
+			"idle": true, "compiled": 4, "failed": 1, "error_count": 2,
+			"notes": []interface{}{"Burst logs a method's error once per session", "a second caveat"},
+			"errors": []interface{}{
+				map[string]interface{}{
+					"file": "/proj/Assets/Job.cs", "line": 39, "col": 0, "code": "BC1091",
+					"message": "The `catch` construction is not supported",
+				},
+				map[string]interface{}{
+					"file": "/engine/IJob.cs", "line": 61, "col": 17, "code": "BC1051",
+					"message": "Invalid managed type found for the field `Values` of the struct `MyGame.HeavyJob`",
+				},
+			},
+		}}
+	code, out := f.run()
+	if code != verifyFailed {
+		t.Fatalf("exit = %d, want 1; output:\n%s", code, out)
+	}
+	want := "compile: ok\n" +
+		"burst: 4 targets compiled, 2 error(s), 1 failed\n" +
+		"  /proj/Assets/Job.cs:39 BC1091 The `catch` construction is not supported\n" +
+		"  /engine/IJob.cs:61:17 BC1051 Invalid managed type found for the field `Values` of the struct `MyGame.HeavyJob`\n" +
+		// One caveat line only: a two-line summary stays readable.
+		"  (Burst logs a method's error once per session)\n"
+	if out != want {
+		t.Errorf("output = %q, want %q", out, want)
+	}
+	if f.called("run_tests") {
+		t.Errorf("tests ran despite Burst errors: %v", f.calls)
+	}
+}
+
+func TestVerify_NoBurstSkipsTheCheck(t *testing.T) {
+	f := &fakeEditor{t: t, diagnostics: clean(), tests: passing(1), testsSuccess: true,
+		burstSuccess: true,
+		burst:        map[string]interface{}{"idle": true, "compiled": 1, "error_count": 1},
+		burstMessage: "one error",
+	}
+	code, out := f.run("--no-burst")
+	if code != verifyOK || strings.Contains(out, "burst") || f.called("burst_status") {
+		t.Errorf("exit = %d, output = %q, calls = %v; want the burst check skipped", code, out, f.calls)
+	}
+}
+
+func TestVerify_ConnectorWithoutBurstToolSaysNothing(t *testing.T) {
+	f := &fakeEditor{t: t, connector: "0.7.0", diagnostics: clean(), tests: passing(2), testsSuccess: true}
+	code, out := f.run()
+	if code != verifyOK || strings.Contains(out, "burst") {
+		t.Errorf("exit = %d, output = %q; want no burst line when the tool is absent", code, out)
+	}
+}
+
+func TestVerify_BurstStillCompilingIsReportedButNotAFailure(t *testing.T) {
+	f := &fakeEditor{t: t, diagnostics: clean(), tests: passing(2), testsSuccess: true,
+		burstSuccess: true,
+		burst: map[string]interface{}{
+			"idle": false, "timed_out": true, "wait_s": 5, "not_compiled": 3, "compiled": 1, "error_count": 0,
+			"notes": []string{"Burst has not scheduled an eager compile in this editor session"},
+		}}
+	code, out := f.run("--burst-wait", "5")
+	if code != verifyOK {
+		t.Fatalf("exit = %d, want 0; output:\n%s", code, out)
+	}
+	want := "compile: ok\n" +
+		"burst: 1 targets compiled, 0 error(s), 3 not compiled (Burst still compiling after 5s)\n" +
+		"  (Burst has not scheduled an eager compile in this editor session)\n" +
+		"tests: 2/2 passed\n"
+	if out != want {
+		t.Errorf("output = %q, want %q", out, want)
+	}
+	if f.params["burst_status"]["wait"] != 5 {
+		t.Errorf("burst_status wait = %v, want 5", f.params["burst_status"]["wait"])
+	}
+}
+
+func TestVerify_BurstCheckFailureDoesNotChangeTheVerdict(t *testing.T) {
+	f := &fakeEditor{t: t, diagnostics: clean(), tests: passing(2), testsSuccess: true,
+		burst:        map[string]interface{}{"idle": false},
+		burstSuccess: false, burstMessage: "Burst is installed but its compiler types are not loaded",
+	}
+	code, out := f.run()
+	if code != verifyOK || !strings.Contains(out, "burst: could not be checked (Burst is installed but") {
+		t.Errorf("exit = %d, output = %q; want 0 and the note", code, out)
+	}
+	if !f.called("run_tests") {
+		t.Errorf("tests were skipped after a failed burst check: %v", f.calls)
+	}
+}
+
+func TestVerify_BurstInJSON(t *testing.T) {
+	f := &fakeEditor{t: t, diagnostics: clean(), tests: passing(1), testsSuccess: true,
+		burstSuccess: true,
+		burst:        map[string]interface{}{"idle": true, "compiled": 7, "error_count": 0, "burst_version": "2.0.0"},
+	}
+	code, out := f.run("--json")
+	var r struct {
+		Burst *struct {
+			Compiled int    `json:"compiled"`
+			Version  string `json:"burst_version"`
+		} `json:"burst"`
+		Exit int `json:"exit"`
+	}
+	if err := json.Unmarshal([]byte(out), &r); err != nil {
+		t.Fatalf("output is not one JSON object: %q (%v)", out, err)
+	}
+	if code != verifyOK || r.Burst == nil || r.Burst.Compiled != 7 || r.Burst.Version != "2.0.0" || r.Exit != 0 {
+		t.Errorf("exit = %d, parsed = %+v", code, r)
 	}
 }
 

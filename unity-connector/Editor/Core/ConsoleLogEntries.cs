@@ -32,7 +32,7 @@ namespace UnityCliConnector
 		public const int StickyErrorMask = 1 << 13;
 
 		// What the console fallback treats as a compile-blocking error.
-		internal const int CompileBlockingMask = ScriptCompileErrorMask | StickyErrorMask;
+		public const int CompileBlockingMask = ScriptCompileErrorMask | StickyErrorMask;
 
 		// Internal seam for unit tests: when set, bypasses reflection entirely and
 		// returns the supplied diagnostics. Production code must not set this.
@@ -62,6 +62,14 @@ namespace UnityCliConnector
 				if (TryConvertEntry(mode, message, file, line, includeWarnings, out var diag))
 					result.Add(diag);
 			});
+		}
+
+		/// Every in-memory console entry, unfiltered, with the full message including its stack
+		/// trace. <see cref="Parse"/> cuts the head, and a Burst error writes its position only as an
+		/// "(at <file>:<line>)" frame — so a tool that wants Burst's file:line has to read past the head.
+		public static bool TryForEachRawEntry(Action<int, string, string, int> visitor)
+		{
+			return ReadConsole.TryForEachEntry(visitor);
 		}
 
 		/// Pure conversion of an in-memory LogEntry's primitive fields into a CompileDiag.
@@ -95,6 +103,20 @@ namespace UnityCliConnector
 					Severity = m.Groups["sev"].Value,
 					Code = m.Groups["code"].Value,
 					Message = m.Groups["msg"].Value
+				};
+
+			// Burst writes "<file>(<line>,<col>): Burst error BCxxxx: ...", or "(0,0): Burst error ..."
+			// with the position only in a stack frame. Neither reads as a C# header, so without this a
+			// Burst error is reported with no file and no code.
+			if (BurstErrors.TryParse(fullMessage, fileFallback, lineFallback, out var burst))
+				return new CompileDiag
+				{
+					File = burst.File,
+					Line = burst.Line,
+					Col = burst.Col,
+					Severity = isError ? "error" : "warning",
+					Code = burst.Code,
+					Message = burst.Message
 				};
 
 			// Header didn't match — fall back to LogEntry's own file/line fields.
