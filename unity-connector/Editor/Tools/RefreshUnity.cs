@@ -34,6 +34,9 @@ namespace UnityCliConnector.Tools
             bool force = p.GetBool("force");
 
             bool compileRequested = false;
+            // Echoed so the CLI has a request-time baseline: a compile can finish before its first
+            // poll, and a heartbeat that was already "ready" proves nothing on its own.
+            long compileFinishedBefore = CompilationGate.LastCompileFinishedAt;
             var dirtyScenes = GetDirtyOpenScenes();
             var warning = dirtyScenes.Count > 0
                 ? "Open scenes have unsaved changes. If Unity becomes unresponsive, an editor modal such as \"open scene changed on disk, reload?\" may be blocking the refresh."
@@ -51,6 +54,8 @@ namespace UnityCliConnector.Tools
             if (string.Equals(compile, "request", StringComparison.OrdinalIgnoreCase))
             {
                 Heartbeat.MarkCompileRequested();
+                // RequestScriptCompilation is fire-and-forget here: the domain reload it triggers
+                // drops the HTTP connection, so the outcome is polled from the heartbeat instead.
                 CompilationPipeline.RequestScriptCompilation();
                 compileRequested = true;
             }
@@ -59,6 +64,7 @@ namespace UnityCliConnector.Tools
             {
                 refresh_triggered = true,
                 compile_requested = compileRequested,
+                compile_finished_at = compileFinishedBefore,
                 force = force,
                 warning = warning,
                 dirty_scenes = dirtyScenes,

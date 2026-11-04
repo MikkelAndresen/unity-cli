@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"encoding/json"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -295,5 +296,53 @@ func TestWaitForAlive_FollowsResolverPortChange(t *testing.T) {
 	}
 	if callCount < 2 {
 		t.Fatalf("expected resolver to be called multiple times, got %d", callCount)
+	}
+}
+
+func TestWaitForCompile_ReadyHeartbeatIsNotEvidence(t *testing.T) {
+	compileTestBudgets(t)
+	// The heartbeat was already "ready" and its compile clock never moves: polling must not
+	// report a compile it never saw finish.
+	resolve := func() (*client.Instance, error) {
+		return &client.Instance{State: "ready", CompileFinishedAt: 1_000}, nil
+	}
+
+	out, err := waitForCompileTo(resolve, io.Discard, "editor refresh --compile", compileBaseline{FinishedAt: 1_000})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if out.Evidence || !out.NothingToCompile || out.TimedOut {
+		t.Errorf("outcome = %+v, want nothing_to_compile without evidence", out)
+	}
+}
+
+func TestWaitForCompile_ClockAdvanceAfterRequestIsEvidence(t *testing.T) {
+	compileTestBudgets(t)
+	// The compile can finish before the first poll; the connector's clock is what proves it ran.
+	resolve := func() (*client.Instance, error) {
+		return &client.Instance{State: "ready", CompileFinishedAt: 1_001, CompileErrors: true}, nil
+	}
+
+	out, err := waitForCompileTo(resolve, io.Discard, "editor refresh --compile", compileBaseline{FinishedAt: 1_000})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !out.Evidence || out.NothingToCompile || !out.HasErrors {
+		t.Errorf("outcome = %+v, want evidence of a compile that ended in errors", out)
+	}
+}
+
+func TestWaitForCompile_KeepsWaitingWhileCompiling(t *testing.T) {
+	compileTestBudgets(t)
+	resolve := func() (*client.Instance, error) {
+		return &client.Instance{State: "compiling", CompileFinishedAt: 1_000}, nil
+	}
+
+	out, err := waitForCompileTo(resolve, io.Discard, "editor refresh --compile", compileBaseline{FinishedAt: 1_000})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !out.TimedOut || out.NothingToCompile {
+		t.Errorf("outcome = %+v, want a timeout while the editor never left 'compiling'", out)
 	}
 }

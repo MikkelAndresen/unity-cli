@@ -183,6 +183,20 @@ unity-cli editor refresh --compile
 unity-cli editor refresh --force
 ```
 
+`editor refresh --compile` waits for the compilation and answers with one report instead of a bare
+`refresh_triggered`: `compile_requested`, `compile_succeeded`, `error_count`, `errors[]`
+(file/line/col/severity/code/message, from the connector's `compile_diagnostics` tool), `timed_out`
+and `elapsed_ms`. `timed_out: true` means the wait gave up after 5 minutes — not that the compile
+failed. `nothing_to_compile: true` means no compilation was seen to run after the request, in which
+case `compile_succeeded` describes the editor's current compile state rather than a compile this
+command caused. The proof a compile actually ran is the connector's compile-finished clock: the
+refresh reply reports it at request time and the heartbeat is polled until that number moves, so a
+heartbeat that was already `ready` is never mistaken for a finished compile. Exit code is 1 when the
+compile failed or timed out, and the report is printed either way. `--compile` clears the console
+first so an error left over from an earlier compile is not reported as this one's; `--keep-console`
+skips the clear. Connectors without the compile-finished clock fall back to the heartbeat's
+`compileErrors` flag and say so in `notes`.
+
 ### Console Logs
 
 ```bash

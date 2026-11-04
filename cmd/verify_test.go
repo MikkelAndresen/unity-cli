@@ -16,6 +16,10 @@ type fakeEditor struct {
 	t             *testing.T
 	compileErrors bool                   // heartbeat flag after the compile
 	connector     string                 // heartbeat connectorVersion
+	finishedAt    int64                  // heartbeat compileFinishedAt seen while polling
+	echoFinished  *int64                 // refresh_unity echoes compile_finished_at; nil: connector without the clock
+	pid           int                    // heartbeat pid (0: no restart, no restart detection)
+	stuckState    string                 // heartbeat state while polling (default "ready")
 	diagnostics   map[bool][]interface{} // compile_diagnostics by source_tree_only; nil: tool unknown (old connector)
 	console       []string               // console error entries (old-connector fallback)
 	tests         map[string]interface{} // run_tests summary; nil: tests not expected
@@ -52,7 +56,11 @@ func (f *fakeEditor) send(command string, params interface{}) (*client.CommandRe
 		if f.refreshErr != nil {
 			return nil, f.refreshErr
 		}
-		return &client.CommandResponse{Success: true}, nil
+		reply := map[string]interface{}{"refresh_triggered": true, "compile_requested": true}
+		if f.echoFinished != nil {
+			reply["compile_finished_at"] = *f.echoFinished
+		}
+		return &client.CommandResponse{Success: true, Data: data(reply)}, nil
 	case "compile_diagnostics":
 		if f.diagnostics == nil {
 			return &client.CommandResponse{Success: false, Message: "Unknown command: compile_diagnostics"}, nil
@@ -72,7 +80,17 @@ func (f *fakeEditor) send(command string, params interface{}) (*client.CommandRe
 }
 
 func (f *fakeEditor) resolve() (*client.Instance, error) {
-	return &client.Instance{State: "ready", CompileErrors: f.compileErrors, ConnectorVersion: f.connector}, nil
+	state := f.stuckState
+	if state == "" {
+		state = "ready"
+	}
+	return &client.Instance{
+		State:             state,
+		CompileErrors:     f.compileErrors,
+		ConnectorVersion:  f.connector,
+		CompileFinishedAt: f.finishedAt,
+		PID:               f.pid,
+	}, nil
 }
 
 func (f *fakeEditor) run(args ...string) (int, string) {

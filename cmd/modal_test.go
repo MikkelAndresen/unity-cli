@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"io"
 	"strings"
 	"testing"
 	"time"
@@ -101,12 +102,12 @@ func TestDescribeModal_NoButtons(t *testing.T) {
 	}
 }
 
-func TestWaitForReady_ModalReturnsError(t *testing.T) {
+func TestWaitForCompile_ModalReturnsError(t *testing.T) {
 	fastPolling(t)
 	resolve := func() (*client.Instance, error) { return modalInstance(), nil }
 
-	if _, err := waitForReady(resolve); err == nil {
-		t.Fatal("expected modal error from waitForReady")
+	if _, err := waitForCompileTo(resolve, io.Discard, "editor refresh --compile", compileBaseline{}); err == nil {
+		t.Fatal("expected modal error from waitForCompileTo")
 	}
 }
 

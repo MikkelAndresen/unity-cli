@@ -1,3 +1,4 @@
+using System;
 using System.Collections.Generic;
 using System.IO;
 using Newtonsoft.Json.Linq;
@@ -15,10 +16,26 @@ namespace UnityCliConnector
 		// Cleared on each fresh compile-start so stale entries from removed assemblies don't linger.
 		private static readonly Dictionary<string, CompilerMessage[]> ByAssembly = new();
 
+		// Wall-clock ms of the last observed script-compilation finish. The CLI compares this against
+		// the value the refresh_unity reply echoes at request time to prove a compile actually finished;
+		// a heartbeat that was already "ready" proves nothing. Statics reset on domain reload, so
+		// afterAssemblyReload re-stamps it; a failed compile never reloads, which is why
+		// compilationFinished has to cover that case.
+		private static long s_CompileFinishedAt;
+
+		public static long LastCompileFinishedAt => s_CompileFinishedAt;
+
 		static CompilationGate()
 		{
 			CompilationPipeline.compilationStarted += _ => ByAssembly.Clear();
 			CompilationPipeline.assemblyCompilationFinished += (path, messages) => ByAssembly[path] = messages;
+			CompilationPipeline.compilationFinished += _ => NoteCompileFinished();
+			AssemblyReloadEvents.afterAssemblyReload += NoteCompileFinished;
+		}
+
+		private static void NoteCompileFinished()
+		{
+			s_CompileFinishedAt = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
 		}
 
 		/// Returns an ErrorResponse with compile diagnostics if the editor is mid-compile or has
@@ -170,5 +187,7 @@ namespace UnityCliConnector
 		{
 			ByAssembly.Clear();
 		}
+
+		internal static void NoteCompileFinishedForTests() => NoteCompileFinished();
 	}
 }

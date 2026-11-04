@@ -170,6 +170,11 @@ func Execute() error {
 	}
 
 	if err != nil {
+		// A command may answer with a report and still fail (editor refresh --compile prints its
+		// compile report, then exits non-zero), so a failing exit code must not hide the JSON.
+		if resp != nil {
+			printResponse(resp)
+		}
 		return err
 	}
 
@@ -497,6 +502,12 @@ Subcommands:
   refresh             Refresh AssetDatabase (reimport changed assets).
                       Blocked in play mode unless --force is set.
     --compile         Recompile scripts and wait until compilation finishes.
+                      Answers with one report: compile_requested, compile_succeeded,
+                      error_count, errors[], timed_out, elapsed_ms, plus nothing_to_compile
+                      when the scripts were already up to date. Exit 1 when the compile
+                      failed or timed out; the report is still printed.
+    --keep-console    With --compile, don't clear the console first (the default clear keeps
+                      stale errors from a previous compile out of the report).
     --force           Allow refresh during play mode and force asset update.
 
 Examples:
