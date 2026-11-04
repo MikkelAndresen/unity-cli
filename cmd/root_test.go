@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"encoding/json"
 	"testing"
 
 	"github.com/youngwoocho02/unity-cli/internal/client"
@@ -21,6 +22,41 @@ func mockSend(wantCmd string, t *testing.T) (sendFn, *map[string]interface{}) {
 		return &client.CommandResponse{Success: true}, nil
 	}
 	return fn, &captured
+}
+
+func TestMetaLine(t *testing.T) {
+	tests := []struct {
+		name    string
+		meta    json.RawMessage
+		enabled bool
+		want    string
+	}{
+		{"no meta", nil, true, ""},
+		{"explicit null", json.RawMessage("null"), true, ""},
+		{"empty object", json.RawMessage("{}"), true, "meta: {}\n"},
+		// Without --meta the line is suppressed: 'exec ... 2>&1 | tail -1' would otherwise
+		// surface the meta note instead of the result (#32).
+		{
+			"exec compile meta, flag off",
+			json.RawMessage(`{"compile":"cached","compile_ms":0,"reference_assemblies":234}`),
+			false,
+			"",
+		},
+		{
+			"exec compile meta",
+			json.RawMessage(`{"compile":"cached","compile_ms":0,"reference_assemblies":234}`),
+			true,
+			"meta: {\"compile\":\"cached\",\"compile_ms\":0,\"reference_assemblies\":234}\n",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := metaLine(tt.meta, tt.enabled); got != tt.want {
+				t.Errorf("metaLine(%s, %v) = %q, want %q", string(tt.meta), tt.enabled, got, tt.want)
+			}
+		})
+	}
 }
 
 func TestParseSubFlags(t *testing.T) {
@@ -66,6 +102,7 @@ func TestSplitArgs(t *testing.T) {
 		{"project flag", []string{"--project", "myproj", "status"}, []string{"--project", "myproj"}, []string{"status"}},
 		{"timeout flag", []string{"exec", "--timeout", "5000", "Time.time"}, []string{"--timeout", "5000"}, []string{"exec", "Time.time"}},
 		{"ignore version mismatch flag", []string{"exec", "--ignore-version-mismatch", "Time.time"}, []string{"--ignore-version-mismatch"}, []string{"exec", "Time.time"}},
+		{"meta flag", []string{"exec", "return 1;", "--meta"}, []string{"--meta"}, []string{"exec", "return 1;"}},
 		{"multiple global flags", []string{"--port", "8080", "--timeout", "3000", "exec", "code"}, []string{"--port", "8080", "--timeout", "3000"}, []string{"exec", "code"}},
 		// wait's own --timeout is seconds of waiting, not the global request timeout in ms.
 		{"wait timeout belongs to the command", []string{"wait", "--compile", "--timeout", "120"}, nil, []string{"wait", "--compile", "--timeout", "120"}},

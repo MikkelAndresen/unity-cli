@@ -19,6 +19,7 @@ var (
 	flagProject               string
 	flagTimeout               int
 	flagIgnoreVersionMismatch bool
+	flagMeta                  bool
 )
 
 func Execute() error {
@@ -26,6 +27,7 @@ func Execute() error {
 	flag.StringVar(&flagProject, "project", "", "Select Unity instance by project path")
 	flag.IntVar(&flagTimeout, "timeout", 120000, "Request timeout in milliseconds")
 	flag.BoolVar(&flagIgnoreVersionMismatch, "ignore-version-mismatch", false, "Run even when CLI and connector versions differ")
+	flag.BoolVar(&flagMeta, "meta", false, "Print the connector's response meta (how the call was served) to stderr")
 
 	flag.Usage = func() { printHelp() }
 
@@ -210,6 +212,12 @@ func Execute() error {
 type sendFn func(command string, params interface{}) (*client.CommandResponse, error)
 
 func printResponse(resp *client.CommandResponse) {
+	defer func() {
+		if line := metaLine(resp.Meta, flagMeta); line != "" {
+			fmt.Fprint(os.Stderr, line)
+		}
+	}()
+
 	if !resp.Success {
 		msg := resp.Message
 		if msg == "" {
@@ -239,6 +247,16 @@ func printResponse(resp *client.CommandResponse) {
 	} else if resp.Message != "" {
 		fmt.Println(resp.Message)
 	}
+}
+
+// metaLine reports how the connector served a call (exec says whether it compiled the
+// snippet or reused a cached one). Off unless --meta: agents commonly pipe exec through
+// '2>&1 | tail -1', where any extra line lands in place of the result (#32).
+func metaLine(meta json.RawMessage, enabled bool) string {
+	if !enabled || len(meta) == 0 || string(meta) == "null" {
+		return ""
+	}
+	return "meta: " + string(meta) + "\n"
 }
 
 // parseSubFlags parses --key value and --flag (boolean) pairs from subcommand args.
@@ -377,7 +395,7 @@ func splitArgs(args []string) (flags, commands []string) {
 	command := ""
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
-		case "--ignore-version-mismatch":
+		case "--ignore-version-mismatch", "--meta":
 			flags = append(flags, args[i])
 		case "--port", "--project":
 			flags = append(flags, args[i])
@@ -592,6 +610,7 @@ Global Options:
   --timeout <ms>      Request timeout in ms (default: 120000)
   --ignore-version-mismatch
                       Run even when CLI and connector versions differ
+  --meta              Print the response's meta (how the call was served) to stderr
 
 Use "unity-cli <command> --help" for more information about a command.
 
@@ -732,6 +751,7 @@ Options:
                        (default 30000; 0 or negative waits forever)
   --csc <path>         Path to csc compiler (csc.dll or csc.exe). Auto-detected if omitted.
   --dotnet <path>      Path to dotnet runtime. Auto-detected if omitted.
+  --meta               Print the response's meta (compile cache state, timing) to stderr.
 
 Default usings: System, System.Collections, System.Collections.Generic,
   System.IO, System.Linq, System.Reflection, System.Threading.Tasks, UnityEngine,
@@ -746,6 +766,14 @@ Examples:
   unity-cli exec "return World.All.Count;" --usings Unity.Entities
   unity-cli exec "await Task.Delay(100); return 1;"
   unity-cli exec "return Task.Run(() => AssetDatabase.Refresh());" --await_timeout 60000
+
+Compile cache:
+  The snippet is compiled by csc in a subprocess without freezing the editor, and an
+  identical call (same body, same --usings, same reference set) reuses the assembly that
+  is already loaded instead of compiling again. The response carries that as
+  meta: {"compile":"compiled|cached","compile_ms":N,"reference_assemblies":N};
+  'unity-cli exec --meta ...' prints it to stderr (off by default so '2>&1' pipelines
+  keep seeing only the result).
 
 Async:
   'await' works in the body, and a Task you return is awaited for you — the response

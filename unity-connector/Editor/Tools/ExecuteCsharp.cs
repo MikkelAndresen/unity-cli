@@ -16,6 +16,32 @@ namespace UnityCliConnector.Tools
     [UnityCliTool(Name = "exec", Description = "Execute arbitrary C# code at runtime. Full access to Unity and all loaded assemblies.")]
     public static class ExecuteCsharp
     {
+        // The 30000 mirrors the csc wait the old synchronous compile used, so a slow
+        // compile still answers instead of hanging the request.
+        private const int CompileTimeoutMs = 30000;
+
+        private const string SourceTypeName = "__CliDynamic";
+
+        // An off-main-thread await only resumes on the editor thread while this domain's
+        // synchronization context is pumping; a reload mid-await leaves the continuation on
+        // a thread-pool thread, where invoking the snippet would throw inside every Unity
+        // API it touches.
+        private const string ReloadedMessage =
+            "The editor reloaded during the compile, so the snippet never ran. Re-issue the command.";
+
+        // Snippet assemblies are named with this prefix so they can be excluded from the
+        // reference list. They are byte-loaded (empty Location) and so already drop out of
+        // it, but if a Unity version ever reports a location for them, referencing an
+        // earlier snippet would grow both the .rsp list and every later snippet's cache key.
+        private const string ExecAssemblyPrefix = "unity-cli-exec-";
+
+        // csc and dotnet live somewhere inside the Unity install, so finding them means a
+        // full-tree walk (measured 1.1 s per walk on this host; exec used to pay two of them
+        // per call, on the main thread). Resolved once per domain and off the main thread.
+        private static string s_CompilerMemoKey;
+        private static string s_CscPath;
+        private static string s_DotnetPath;
+
         private static readonly string[] DefaultUsings =
         {
             "System",
@@ -102,7 +128,7 @@ namespace UnityCliConnector.Tools
                 sb.AppendLine($"using {u};");
 
             sb.AppendLine();
-            sb.AppendLine("public static class __CliDynamic {");
+            sb.AppendLine($"public static class {SourceTypeName} {{");
             switch (kind)
             {
                 case BodyKind.Iterator:
@@ -121,170 +147,245 @@ namespace UnityCliConnector.Tools
             return sb.ToString();
         }
 
+        /// <summary>
+        /// Reference set for the snippet compile, from this domain's loadable assemblies.
+        /// Dynamic and byte-loaded (in-memory) assemblies have no usable location, and
+        /// previous exec output is excluded by name: both would otherwise make the .rsp
+        /// list — and so every later snippet's cache key — grow with the exec count.
+        /// Sorted so the .rsp order, and therefore the key, does not depend on load order.
+        /// </summary>
+        private static IReadOnlyList<string> CollectReferences()
+        {
+            var pairs = new List<(string Name, string Location)>();
+            var names = new HashSet<string>();
+
+            foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
+            {
+                try
+                {
+                    if (asm.IsDynamic || string.IsNullOrEmpty(asm.Location)) continue;
+                    var name = asm.GetName().Name;
+                    if (string.IsNullOrEmpty(name) || !names.Add(name)) continue;
+                    if (name.StartsWith(ExecAssemblyPrefix, StringComparison.Ordinal)) continue;
+                    pairs.Add((name, asm.Location));
+                }
+                catch (Exception ex) when (ex is NotSupportedException || ex is InvalidOperationException)
+                {
+                    // Location throws for dynamic modules; one unreadable reference is no
+                    // reason to drop the rest of the set.
+                }
+            }
+
+            pairs.Sort((a, b) => string.CompareOrdinal(a.Name, b.Name));
+            var locations = new List<string>(pairs.Count);
+            for (var i = 0; i < pairs.Count; i++) locations.Add(pairs[i].Location);
+            return locations;
+        }
+
+        // The third constructor argument, not the second: `data` stays the tool's result
+        // payload, so a caller parsing it sees the same shape as before the metadata existed.
+        private static object CompileMeta(string state, long compileMs, int referenceCount)
+            => new { compile = state, compile_ms = compileMs, reference_assemblies = referenceCount };
+
         private static async Task<object> CompileAndExecute(string source, string cscOverride = null,
             string dotnetOverride = null, int awaitTimeoutMs = ExecAwait.DefaultTimeoutMs)
         {
-            var utf8 = new UTF8Encoding(false);
-            var tmpDir = Path.Combine(Path.GetTempPath(), "unity-cli-exec");
-            Directory.CreateDirectory(tmpDir);
+            // Compiler discovery and the reference set read Unity APIs and this domain's
+            // assembly list, so both are taken before anything is awaited.
+            var contentsPath = EditorApplication.applicationContentsPath;
+            var isWindows = Application.platform == RuntimePlatform.WindowsEditor;
+            var references = CollectReferences();
 
-            var id = Guid.NewGuid().ToString("N").Substring(0, 8);
-            var srcFile = Path.Combine(tmpDir, $"{id}.cs");
-            var outFile = Path.Combine(tmpDir, $"{id}.dll");
-            var rspFile = Path.Combine(tmpDir, $"{id}.rsp");
+            var resolved = await ResolveCompilerAsync(cscOverride, dotnetOverride, contentsPath, isWindows);
+            if (resolved.Error != null)
+                return new ErrorResponse(resolved.Error)
+                    { meta = CompileMeta("missing_compiler", 0, references.Count) };
+            if (!MainThread.IsCurrent)
+                return new ErrorResponse(ReloadedMessage)
+                    { meta = CompileMeta("interrupted", 0, references.Count) };
 
+            var csc = resolved.Csc;
+            var dotnet = resolved.Dotnet;
+            var key = ExecCompileCache.KeyFor(source, csc, dotnet, references);
+
+            string compileState;
+            long compileMs = 0;
+            MethodInfo method;
+
+            if (ExecCompileCache.TryGet(key, out var cached))
+            {
+                method = cached.Method;
+                compileState = "cached";
+            }
+            else
+            {
+                var id = ExecAssemblyPrefix + Guid.NewGuid().ToString("N").Substring(0, 12);
+                var sw = Stopwatch.StartNew();
+                var compiled = await ExecCompiler.CompileAsync(source, references, csc, dotnet, id, CompileTimeoutMs);
+                compileMs = sw.ElapsedMilliseconds;
+
+                if (compiled.TimedOut)
+                    return new ErrorResponse($"Compile timed out after {compileMs}ms.")
+                        { meta = CompileMeta("timeout", compileMs, references.Count) };
+
+                if (!compiled.Ok)
+                    return new ErrorResponse($"Compile error:\n{FormatErrors(compiled.Diagnostics)}")
+                        { meta = CompileMeta("failed", compileMs, references.Count) };
+
+                // See ReloadedMessage: the compile finished, but not on the thread that may
+                // load an assembly and run Unity APIs.
+                if (!MainThread.IsCurrent)
+                    return new ErrorResponse(ReloadedMessage)
+                        { meta = CompileMeta("interrupted", compileMs, references.Count) };
+
+                var assembly = Assembly.Load(compiled.Bytes);
+                method = assembly.GetType(SourceTypeName)?.GetMethod("Execute");
+                if (method == null)
+                    return new ErrorResponse("Internal error: compiled type or method not found.")
+                        { meta = CompileMeta("compiled", compileMs, references.Count) };
+
+                ExecCompileCache.Put(key, new CompiledSnippet(assembly, method));
+                compileState = "compiled";
+            }
+
+            object result;
             try
             {
-                File.WriteAllText(srcFile, source, utf8);
-
-                var rsp = new StringBuilder();
-                rsp.AppendLine("-target:library");
-                rsp.AppendLine($"-out:\"{outFile}\"");
-                rsp.AppendLine("-nologo");
-                rsp.AppendLine("-nowarn:0105,1701,1702");
-                rsp.AppendLine("-langversion:latest");
-                rsp.AppendLine($"\"{srcFile}\"");
-
-                var added = new HashSet<string>();
-                foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
-                {
-                    try
-                    {
-                        if (asm.IsDynamic || string.IsNullOrEmpty(asm.Location)) continue;
-                        if (!added.Add(asm.GetName().Name)) continue;
-                        rsp.AppendLine($"-r:\"{asm.Location}\"");
-                    }
-                    catch { }
-                }
-
-                File.WriteAllText(rspFile, rsp.ToString(), utf8);
-
-                var rspArg = $"@\"{rspFile}\"";
-                var csc = FindCsc(cscOverride);
-                string exe, args;
-
-                if (csc != null && csc.EndsWith(".dll"))
-                {
-                    var dotnet = FindDotnet(dotnetOverride);
-                    if (dotnet == null)
-                        return new ErrorResponse(
-                            "Cannot find dotnet runtime under: " +
-                            EditorApplication.applicationContentsPath +
-                            "\nSpecify the path manually with --dotnet <path>");
-                    exe = dotnet;
-                    args = $"exec \"{csc}\" {rspArg}";
-                }
-                else if (csc != null)
-                {
-                    exe = csc;
-                    args = rspArg;
-                }
-                else
-                {
-                    return new ErrorResponse(
-                        "Cannot find csc compiler under: " +
-                        EditorApplication.applicationContentsPath +
-                        "\nSpecify the path manually with --csc <path-to-csc.dll-or-csc.exe>");
-                }
-
-                var psi = new ProcessStartInfo
-                {
-                    FileName = exe,
-                    Arguments = args,
-                    UseShellExecute = false,
-                    RedirectStandardOutput = true,
-                    RedirectStandardError = true,
-                    CreateNoWindow = true,
-                    StandardOutputEncoding = Encoding.UTF8,
-                    StandardErrorEncoding = Encoding.UTF8,
-                };
-
-                using (var proc = Process.Start(psi))
-                {
-                    var stdout = proc.StandardOutput.ReadToEnd();
-                    var stderr = proc.StandardError.ReadToEnd();
-                    proc.WaitForExit(30000);
-
-                    if (proc.ExitCode != 0)
-                    {
-                        var output = string.IsNullOrEmpty(stderr) ? stdout : stderr;
-                        return new ErrorResponse($"Compile error:\n{FormatErrors(output)}");
-                    }
-                }
-
-                var bytes = File.ReadAllBytes(outFile);
-                var compiled = Assembly.Load(bytes);
-                var method = compiled.GetType("__CliDynamic")?.GetMethod("Execute");
-                if (method == null)
-                    return new ErrorResponse("Internal error: compiled type or method not found.");
-
-                object result;
-                try
-                {
-                    result = method.Invoke(null, null);
-                }
-                catch (TargetInvocationException tie)
-                {
-                    var inner = tie.InnerException ?? tie;
-                    return new ErrorResponse($"Runtime error: {inner.GetType().Name}: {inner.Message}");
-                }
-
-                // An async body reports its exceptions on the returned Task, not as a
-                // TargetInvocationException, so both paths have to be handled.
-                var outcome = await ExecAwait.ResolveAsync(result, awaitTimeoutMs);
-
-                if (outcome.Error != null)
-                    return new ErrorResponse($"Runtime error: {outcome.Error.GetType().Name}: {outcome.Error.Message}");
-
-                if (outcome.TimedOut)
-                {
-                    var budget = awaitTimeoutMs <= 0
-                        ? "no timeout is set"
-                        : $"await_timeout of {awaitTimeoutMs}ms is set";
-                    return new ErrorResponse(
-                        $"exec timed out with the returned operation still unfinished (status: {outcome.Status}, " +
-                        $"steps: {outcome.Steps}, {budget}). The operation is still running in the editor and its " +
-                        "result is not observable from this response; a domain reload would also drop it silently. " +
-                        "Raise --await_timeout, or park the result somewhere durable (static field, ScriptableObject) " +
-                        "and read it back with a second exec.",
-                        new
-                        {
-                            timed_out = true,
-                            status = outcome.Status,
-                            steps = outcome.Steps,
-                            await_timeout_ms = awaitTimeoutMs,
-                        });
-                }
-
-                var message = outcome.Steps > 0
-                    ? $"OK (routine completed in {outcome.Steps} steps)"
-                    : "OK";
-                return new SuccessResponse(message, Serialize(outcome.Value, 0));
+                result = method.Invoke(null, null);
             }
-            finally
+            catch (TargetInvocationException tie)
             {
-                try { File.Delete(srcFile); } catch { }
-                try { File.Delete(outFile); } catch { }
-                try { File.Delete(rspFile); } catch { }
+                var inner = tie.InnerException ?? tie;
+                return new ErrorResponse($"Runtime error: {inner.GetType().Name}: {inner.Message}")
+                    { meta = CompileMeta(compileState, compileMs, references.Count) };
             }
+
+            // An async body reports its exceptions on the returned Task, not as a
+            // TargetInvocationException, so both paths have to be handled.
+            var outcome = await ExecAwait.ResolveAsync(result, awaitTimeoutMs);
+
+            if (outcome.Error != null)
+                return new ErrorResponse($"Runtime error: {outcome.Error.GetType().Name}: {outcome.Error.Message}")
+                    { meta = CompileMeta(compileState, compileMs, references.Count) };
+
+            if (outcome.TimedOut)
+            {
+                var budget = awaitTimeoutMs <= 0
+                    ? "no timeout is set"
+                    : $"await_timeout of {awaitTimeoutMs}ms is set";
+                return new ErrorResponse(
+                    $"exec timed out with the returned operation still unfinished (status: {outcome.Status}, " +
+                    $"steps: {outcome.Steps}, {budget}). The operation is still running in the editor and its " +
+                    "result is not observable from this response; a domain reload would also drop it silently. " +
+                    "Raise --await_timeout, or park the result somewhere durable (static field, ScriptableObject) " +
+                    "and read it back with a second exec.",
+                    new
+                    {
+                        timed_out = true,
+                        status = outcome.Status,
+                        steps = outcome.Steps,
+                        await_timeout_ms = awaitTimeoutMs,
+                    },
+                    CompileMeta(compileState, compileMs, references.Count));
+            }
+
+            var message = outcome.Steps > 0
+                ? $"OK (routine completed in {outcome.Steps} steps)"
+                : "OK";
+            return new SuccessResponse(message, Serialize(outcome.Value, 0),
+                CompileMeta(compileState, compileMs, references.Count));
         }
 
-        private static string FindCsc(string cscOverride = null)
+        /// <summary>
+        /// Resolves the compiler to run: the Unity-install walk happens at most once per
+        /// domain and never on the main thread. Only the reads that need the main thread
+        /// (applicationContentsPath, Application.platform) stay there; their values come in.
+        /// </summary>
+        private static async Task<CompilerPaths> ResolveCompilerAsync(string cscOverride, string dotnetOverride,
+            string contentsPath, bool isWindowsEditor)
+        {
+            var memoKey = (cscOverride ?? string.Empty) + "\n" + (dotnetOverride ?? string.Empty);
+            if (s_CompilerMemoKey != memoKey)
+            {
+                s_CscPath = await Task.Run(
+                    () => FindCscFile(cscOverride, contentsPath, isWindowsEditor)).ConfigureAwait(false);
+                s_DotnetPath = s_CscPath != null && s_CscPath.EndsWith(".dll", StringComparison.OrdinalIgnoreCase)
+                    ? await Task.Run(() => FindDotnetFile(dotnetOverride, contentsPath, isWindowsEditor))
+                        .ConfigureAwait(false)
+                    : null;
+                s_CompilerMemoKey = memoKey;
+            }
+
+            if (s_CscPath == null)
+                return CompilerPaths.Fail(
+                    "Cannot find csc compiler under: " + contentsPath +
+                    "\nSpecify the path manually with --csc <path-to-csc.dll-or-csc.exe>");
+
+            if (s_CscPath.EndsWith(".dll", StringComparison.OrdinalIgnoreCase) && s_DotnetPath == null)
+                return CompilerPaths.Fail(
+                    "Cannot find dotnet runtime under: " + contentsPath +
+                    "\nSpecify the path manually with --dotnet <path>");
+
+            return CompilerPaths.Ok(s_CscPath, s_DotnetPath);
+        }
+
+        readonly struct CompilerPaths
+        {
+            internal readonly string Csc;
+            /// Null when csc is an executable and so needs no host runtime.
+            internal readonly string Dotnet;
+            internal readonly string Error;
+
+            CompilerPaths(string csc, string dotnet, string error)
+            {
+                Csc = csc;
+                Dotnet = dotnet;
+                Error = error;
+            }
+
+            internal static CompilerPaths Ok(string csc, string dotnet) => new CompilerPaths(csc, dotnet, null);
+            internal static CompilerPaths Fail(string error) => new CompilerPaths(null, null, error);
+        }
+
+        private static string FindCscFile(string cscOverride, string contentsPath, bool isWindowsEditor)
         {
             if (!string.IsNullOrEmpty(cscOverride))
                 return cscOverride;
 
-            var content = EditorApplication.applicationContentsPath;
-            var cscDll = SearchFile(content, "csc.dll");
+            var cscDll = SearchFile(contentsPath, "csc.dll");
             if (cscDll != null) return cscDll;
 
-            if (Application.platform == RuntimePlatform.WindowsEditor)
+            if (isWindowsEditor)
             {
-                var cscExe = SearchFile(content, "csc.exe");
+                var cscExe = SearchFile(contentsPath, "csc.exe");
                 if (cscExe != null) return cscExe;
             }
 
             return null;
+        }
+
+        private static string FindDotnetFile(string dotnetOverride, string contentsPath, bool isWindowsEditor)
+        {
+            if (!string.IsNullOrEmpty(dotnetOverride))
+                return dotnetOverride;
+
+            var name = "dotnet" + (isWindowsEditor ? ".exe" : "");
+            var found = SearchFile(contentsPath, name);
+            if (found != null) return found;
+
+            if (!isWindowsEditor)
+            {
+                var macPaths = new[]
+                {
+                    "/usr/local/share/dotnet/dotnet",
+                    "/opt/homebrew/bin/dotnet",
+                    "/usr/local/bin/dotnet",
+                };
+                foreach (var p in macPaths)
+                    if (File.Exists(p)) return p;
+            }
+
+            return name;
         }
 
         private static string SearchFile(string dir, string name)
@@ -298,30 +399,6 @@ namespace UnityCliConnector.Tools
             }
             catch { }
             return null;
-        }
-
-        private static string FindDotnet(string dotnetOverride = null)
-        {
-            if (!string.IsNullOrEmpty(dotnetOverride))
-                return dotnetOverride;
-
-            var name = "dotnet" + (Application.platform == RuntimePlatform.WindowsEditor ? ".exe" : "");
-            var found = SearchFile(EditorApplication.applicationContentsPath, name);
-            if (found != null) return found;
-
-            if (Application.platform != RuntimePlatform.WindowsEditor)
-            {
-                var macPaths = new[]
-                {
-                    "/usr/local/share/dotnet/dotnet",
-                    "/opt/homebrew/bin/dotnet",
-                    "/usr/local/bin/dotnet",
-                };
-                foreach (var p in macPaths)
-                    if (File.Exists(p)) return p;
-            }
-
-            return name;
         }
 
         private static string FormatErrors(string raw)

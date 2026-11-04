@@ -80,6 +80,9 @@ type CommandResponse struct {
 	Success bool            `json:"success"`
 	Message string          `json:"message"`
 	Data    json.RawMessage `json:"data,omitempty"`
+	// Meta is how the call was served rather than what it returned (exec reports
+	// compile cache state here). The CLI prints it only with --meta.
+	Meta json.RawMessage `json:"meta,omitempty"`
 }
 
 // isProcessDead returns true only when the process is confirmed to not exist.
