@@ -40,7 +40,6 @@ func editorCmd(ctx context.Context, args []string, send sendFn, resolve instance
 		return send("manage_editor", map[string]interface{}{"action": "pause"})
 
 	case "refresh":
-		_, compile := flags["compile"]
 		_, force := flags["force"]
 		_, keepConsole := flags["keep-console"]
 		params := map[string]interface{}{}
@@ -48,14 +47,33 @@ func editorCmd(ctx context.Context, args []string, send sendFn, resolve instance
 			params["force"] = true
 			params["mode"] = "force"
 		}
-		if compile {
-			params["compile"] = "request"
+		if raw, wanted := flags["compile"]; wanted {
+			mode, err := refreshCompileMode(raw)
+			if err != nil {
+				return nil, err
+			}
+			params["compile"] = mode
 			return editorRefreshCompile(send, resolve, params, keepConsole, os.Stderr)
 		}
 		return send("refresh_unity", params)
 
 	default:
 		return nil, fmt.Errorf("unknown editor action: %s\nAvailable: play, stop, pause, refresh, quit, restart", action)
+	}
+}
+
+// refreshCompileMode reads the --compile spelling: a bare --compile asks Unity for its normal script
+// compilation, --compile clean also discards Unity's compiled-assembly cache (Bee), the mode the
+// stale-assembly retry in editorRefreshCompile sends. An unrecognised value fails here rather than
+// reaching the connector, where an unknown compile mode means "don't compile".
+func refreshCompileMode(raw string) (string, error) {
+	switch strings.ToLower(raw) {
+	case "true", "request":
+		return "request", nil
+	case "clean":
+		return "clean", nil
+	default:
+		return "", fmt.Errorf(`editor refresh --compile takes no value or "clean" (discard Unity's compiled-assembly cache first), got %q`, raw)
 	}
 }
 
@@ -110,10 +128,54 @@ func editorRefreshCompile(send sendFn, resolve instanceResolver, params map[stri
 	if err != nil {
 		return nil, fmt.Errorf("compile: %w", err)
 	}
-	total := findings.Total
 
+	// A compile can finish clean while a DLL is still older than its sources: Unity's Bee cache
+	// believed the assembly was unchanged. Ask once for a clean-cache rebuild, then report the
+	// result as-is; repeating it would only burn another full compile.
+	cleanRetry := false
+	if reportFieldBool(resp.Data, "clean_compile_supported") && staleAssemblies(findings) > 0 &&
+		!outcome.TimedOut && !outcome.HasErrors && findings.Total == 0 {
+		cleanRetry = true
+		retryParams := map[string]interface{}{}
+		for k, v := range params {
+			retryParams[k] = v
+		}
+		retryParams["compile"] = "clean"
+		retryResp, retryErr := send("refresh_unity", retryParams)
+		if retryErr != nil {
+			return nil, retryErr
+		}
+		if !retryResp.Success {
+			return retryResp, nil
+		}
+		resp = retryResp
+		baseline = compileBaseline{}
+		if v, ok := reportFieldInt(resp.Data, "compile_finished_at"); ok {
+			baseline.FinishedAt = v
+		}
+		if current, rerr := resolve(); rerr == nil && current != nil {
+			baseline.PID = current.PID
+		}
+		outcome, err = waitForCompileTo(resolve, logw, "editor refresh --compile (clean retry)", baseline)
+		if err != nil {
+			return nil, err
+		}
+		findings, err = compileReportDiagnostics(send, outcome.HasErrors)
+		if err != nil {
+			return nil, fmt.Errorf("clean retry: %w", err)
+		}
+	}
+
+	total := findings.Total
 	succeeded := !outcome.TimedOut && !outcome.HasErrors && total == 0
 	notes := compileReportNotes(outcome, findings.Source, findings.Provenance)
+	if cleanRetry {
+		if staleAssemblies(findings) > 0 {
+			notes = append(notes, "assemblies were still stale after one CleanBuildCache rebuild; the DLLs on disk do not match the sources")
+		} else {
+			notes = append(notes, "the first compile left assemblies stale; one CleanBuildCache rebuild fixed them")
+		}
+	}
 	if err := attachCompileReport(resp, outcome, succeeded, findings, notes); err != nil {
 		return nil, err
 	}
@@ -336,6 +398,23 @@ func attachCompileReport(resp *client.CommandResponse, outcome compileOutcome, s
 	data["errors"] = findings.Diags
 	data["timed_out"] = outcome.TimedOut
 	data["elapsed_ms"] = outcome.Elapsed.Milliseconds()
+	if findings.Provenance != nil {
+		p := findings.Provenance
+		data["stale_after_compile"] = p.StaleAssemblyCount > 0
+		// The refresh reply's own stale_assembly_* fields were measured before the compile was even
+		// requested. Left in place they contradict the report they sit next to ("stale_after_compile:
+		// false" plus a list of stale assemblies), so the post-compile numbers overwrite them.
+		assemblies := p.StaleAssemblies
+		if assemblies == nil {
+			assemblies = []staleAssembly{}
+		}
+		data["stale_assembly_count"] = p.StaleAssemblyCount
+		data["stale_assemblies"] = assemblies
+		data["stale_assembly_line"] = p.StaleAssemblyLine
+		data["stale_assembly_scan_complete"] = p.StaleAssemblyScanComplete
+		data["stale_assembly_covered_count"] = p.StaleAssemblyCoveredCount
+		data["stale_assembly_covered_line"] = p.StaleAssemblyCoveredLine
+	}
 	if len(findings.ProvenanceJSON) > 0 {
 		data["provenance"] = findings.ProvenanceJSON
 		if findings.Provenance != nil {
@@ -355,6 +434,31 @@ func attachCompileReport(resp *client.CommandResponse, outcome compileOutcome, s
 	}
 	resp.Data = body
 	return nil
+}
+
+func staleAssemblies(findings compileFindings) int {
+	if findings.Provenance == nil {
+		return 0
+	}
+	return findings.Provenance.StaleAssemblyCount
+}
+
+// reportFieldBool reads one boolean from a tool response's data, telling an absent capability
+// (older connector) apart from an explicit false.
+func reportFieldBool(data json.RawMessage, key string) bool {
+	if len(data) == 0 {
+		return false
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil {
+		return false
+	}
+	raw, ok := fields[key]
+	if !ok {
+		return false
+	}
+	var b bool
+	return json.Unmarshal(raw, &b) == nil && b
 }
 
 // reportFieldInt reads one integer from a tool response's data. It reports whether the key was

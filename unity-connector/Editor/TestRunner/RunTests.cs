@@ -35,6 +35,9 @@ namespace UnityCliConnector.TestRunner
 
             [ToolParameter("Save dirty open scenes before running tests")]
             public bool AutoSaveScenes { get; set; }
+
+            [ToolParameter("Run tests even when an assembly under test is older than its sources")]
+            public bool AllowStale { get; set; }
         }
 
         public static Task<object> HandleCommand(JObject @params)
@@ -59,6 +62,14 @@ namespace UnityCliConnector.TestRunner
 
             var filter = p.Get("filter", null);
             var assemblies = ParseAssemblies(p.Get("assembly", null));
+            var allowStale = p.GetBool("allowStale") || p.GetBool("allow_stale");
+            if (!allowStale)
+            {
+                var only = assemblies == null ? null : new HashSet<string>(assemblies);
+                var stale = AssemblyStaleness.ScanProject(AssemblyStaleness.DefaultBudgetMs, only);
+                if (stale.StaleCount > 0)
+                    return Task.FromResult<object>(StaleAssemblyBlock(stale));
+            }
             var dirtySceneResult = PrepareDirtyScenes(
                 p.GetBool("allowDirtyScenes") || p.GetBool("allow_dirty_scenes"),
                 p.GetBool("autoSaveScenes") || p.GetBool("auto_save_scenes"));
@@ -119,6 +130,23 @@ namespace UnityCliConnector.TestRunner
 
             api.RegisterCallbacks(callbacks);
             api.Execute(new ExecutionSettings(BuildFilter(TestMode.PlayMode, filter, assemblies)));
+        }
+
+        /// A stale test DLL runs old code and looks exactly like a real result. Refuse by default;
+        /// --allow-stale is for a deliberately old assembly (e.g. bisecting a test runner change).
+        private static object StaleAssemblyBlock(AssemblyStaleness.ScanResult scan)
+        {
+            var line = AssemblyStaleness.FormatLine(scan);
+            var message = line + " Tests were not run; pass --allow-stale to run them anyway.";
+            return new ErrorResponse(message, new
+            {
+                blocked = "stale-assembly",
+                message,
+                stale_assembly_count = scan.StaleCount,
+                stale_assemblies = AssemblyStaleness.ToPayload(scan),
+                stale_assembly_line = line,
+                stale_assembly_scan_complete = scan.Complete,
+            });
         }
 
         private static object PrepareDirtyScenes(bool allowDirtyScenes, bool autoSaveScenes)

@@ -21,7 +21,7 @@ namespace UnityCliConnector.Tools
             [ToolParameter("Scope: all (default) or specific path")]
             public string Scope { get; set; }
 
-            [ToolParameter("Compile mode: none (default) or request")]
+            [ToolParameter("Compile mode: none (default), request, or clean (discard Unity's compiled-assembly cache first)")]
             public string Compile { get; set; }
         }
 
@@ -31,7 +31,9 @@ namespace UnityCliConnector.Tools
             string mode = p.Get("mode", "if_dirty");
             string scope = p.Get("scope", "all");
             string compile = p.Get("compile", "none");
-            bool force = p.GetBool("force");
+            // mode:"force" and force:true are the same intent; echo whichever was actually done, so
+            // a caller who used mode:"force" no longer reads back force:false.
+            bool force = p.GetBool("force") || string.Equals(mode, "force", StringComparison.OrdinalIgnoreCase);
 
             bool compileRequested = false;
             // Echoed so the CLI has a request-time baseline: a compile can finish before its first
@@ -47,27 +49,44 @@ namespace UnityCliConnector.Tools
                 return new ErrorResponse("Cannot refresh while Unity is in or entering play mode. Exit play mode first, or pass --force if this is intentional.");
             }
 
-            AssetDatabase.Refresh(string.Equals(mode, "force", StringComparison.OrdinalIgnoreCase)
+            AssetDatabase.Refresh(force
                 ? ImportAssetOptions.ForceUpdate | ImportAssetOptions.ForceSynchronousImport
                 : ImportAssetOptions.ForceSynchronousImport);
 
-            if (string.Equals(compile, "request", StringComparison.OrdinalIgnoreCase))
+            bool clean = string.Equals(compile, "clean", StringComparison.OrdinalIgnoreCase);
+            if (string.Equals(compile, "request", StringComparison.OrdinalIgnoreCase) || clean)
             {
                 Heartbeat.MarkCompileRequested();
                 // RequestScriptCompilation is fire-and-forget here: the domain reload it triggers
                 // drops the HTTP connection, so the outcome is polled from the heartbeat instead.
+#if UNITY_2021_1_OR_NEWER
+                if (clean) CompilationPipeline.RequestScriptCompilation(RequestScriptCompilationOptions.CleanBuildCache);
+                else CompilationPipeline.RequestScriptCompilation();
+#else
                 CompilationPipeline.RequestScriptCompilation();
+#endif
                 compileRequested = true;
             }
 
+            // Before the compile this is the state the request starts from; the post-compile answer
+            // comes from CompileProvenance in compile_status/compile_diagnostics.
+            var stale = AssemblyStaleness.ScanProject(AssemblyStaleness.DefaultBudgetMs);
             return new SuccessResponse("Refresh requested.", new
             {
                 refresh_triggered = true,
                 compile_requested = compileRequested,
+                // The CLI may ask for one CleanBuildCache retry after a compile left a stale DLL.
+                clean_compile_supported = true,
                 compile_finished_at = compileFinishedBefore,
                 force = force,
                 warning = warning,
                 dirty_scenes = dirtyScenes,
+                stale_assembly_count = stale.StaleCount,
+                stale_assemblies = AssemblyStaleness.ToPayload(stale),
+                stale_assembly_line = AssemblyStaleness.FormatLine(stale),
+                stale_assembly_scan_complete = stale.Complete,
+                stale_assembly_covered_count = stale.CoveredCount,
+                stale_assembly_covered_line = AssemblyStaleness.FormatCoveredLine(stale),
             });
         }
 

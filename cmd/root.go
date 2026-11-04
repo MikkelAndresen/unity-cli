@@ -625,7 +625,9 @@ Editor Control:
   editor stop [--no-wait]       Exit play mode; answers once the editor reports Edit mode
   editor pause                  Toggle pause/resume (play mode only)
   editor refresh [--force]      Refresh asset database (blocked in play mode unless forced)
-  editor refresh --compile      Recompile scripts and wait until done
+  editor refresh --compile [clean]
+                                Recompile scripts and wait until done; "clean" also discards
+                                Unity's compiled-assembly cache
   editor quit [--save|--discard] [--force]
                                 Quit Unity and wait until the process has exited
   editor restart [--clean] [--save|--discard] [--force] [--editor-path <exe>]
@@ -704,6 +706,7 @@ Tests:
   test --allow-dirty-scenes       Run even when open scenes have unsaved changes
   test --auto-save-scenes         Save dirty open scenes before running tests
   test --assembly <a,b>           Only tests in these assemblies
+  test --allow-stale              Run even when an assembly is older than its sources
 
 API lookup (reflection over the assemblies the editor loaded):
   api <Type>                  Kind, namespace, assembly, base, interfaces, member summary
@@ -722,6 +725,7 @@ Verify (compile + tests, brief output for agents):
   verify --no-tests               Stop after the compile
   verify --assembly <a,b>         Only these test assemblies (also --filter, --mode)
   verify --no-burst               Skip the Burst step
+  verify --allow-stale            Run tests even when an assembly is older than its sources
 
 Wait / compile provenance (what a result covers):
   wait                            Block until the editor is idle, then print its state + compile line
@@ -732,6 +736,10 @@ Wait / compile provenance (what a result covers):
   Every compile result carries one provenance line:
     compiled 14:02:11 (3 s ago, took 2.2 s) · 1 source file changed since previous compile · rebuilt: Game.Tests.Editor
     stale: Assets/Foo.cs modified after this compile — run verify again
+    stale assembly: Game.Tests.dll (built 14:01:50) is older than Assets/Game/Tests.cs (14:04:02) — run unity-cli editor refresh --compile
+
+  A stale assembly means the DLL a test run would load is older than its sources; verify and test
+  refuse by default, because old code answers exactly like current code. --allow-stale overrides it.
 
   An error that names something the compiler could not find, or an API that is obsolete, prints a
   hint under it with the closest real answer from the loaded assemblies:
@@ -909,12 +917,17 @@ Subcommands:
   pause               Toggle pause. Only works during play mode.
   refresh             Refresh AssetDatabase (reimport changed assets).
                       Blocked in play mode unless --force is set.
-    --compile         Recompile scripts and wait until compilation finishes.
+    --compile [clean] Recompile scripts and wait until compilation finishes.
+                      "clean" also discards Unity's compiled-assembly cache (Bee) — the hammer for a
+                      cache you believe is lying, though it can still leave Library/ScriptAssemblies
+                      mtimes untouched because Bee restores its cached node output.
                       Answers with one report: compile_requested, compile_succeeded,
                       error_count, errors[], timed_out, elapsed_ms, plus nothing_to_compile
                       when the scripts were already up to date. The report also carries the
                       compile provenance (provenance, provenance_line, and stale_line when a
                       source file was written after the compile), so it says which edit it covers.
+                      If an assembly is still older than its sources, one CleanBuildCache rebuild
+                      is requested and stale_after_compile reports whether that fixed it.
                       Exit 1 when the compile failed or timed out; the report is still printed.
     --keep-console    With --compile, don't clear the console first (the default clear keeps
                       stale errors from a previous compile out of the report).
@@ -1210,13 +1223,16 @@ Options:
   --assembly <a,b>              Only tests in these assemblies (comma-separated)
   --allow-dirty-scenes          Run even when open scenes have unsaved changes
   --auto-save-scenes            Save dirty open scenes before running tests
+  --allow-stale                 Run even when an assembly under test is older than its sources
 
 Tests legitimately run for minutes, so this command's invocation budget defaults to 30 minutes
 instead of the global 120 s. --timeout <ms> overrides it; --timeout 0 means no deadline.
 
 EditMode tests hold the connection open and return results directly.
 PlayMode tests return immediately and poll a results file (domain reload safe).
-By default, tests are blocked when any open scene has unsaved changes.
+By default, tests are blocked when any open scene has unsaved changes, and when a project assembly
+is older than its sources (a stale DLL runs old code). Fix that with
+'unity-cli editor refresh --compile', or pass --allow-stale deliberately.
 
 Requires the Unity Test Framework package (com.unity.test-framework).
 
@@ -1255,11 +1271,17 @@ one. verify prints the connector's provenance line after the compile verdict:
   compile: ok
   compiled 14:02:11 (3 s ago, took 2.2 s) · 1 source file changed since previous compile · rebuilt: Game.Tests.Editor
   stale: Assets/Foo.cs modified after this compile — run verify again
+  stale assembly: Game.Tests.dll (built 14:01:50) is older than Assets/Game/Tests.cs (14:04:02) — run unity-cli editor refresh --compile
+  not stale: Game.Tests.dll (built 14:01:50) is older than Assets/Game/Tests.cs (14:04:02), but the compile that started 14:05:10 read that source and kept the DLL; a moved mtime alone does not mean the DLL is out of date
 
 The stale line means a source file under Assets/ or a file:/embedded package was written after that
-compile: the edit is in the project but not in the result. --json carries the same fields under
-compile.provenance (unix ms and ISO timestamps). See 'unity-cli wait --help' to block on that
-instead of reading it.
+compile: the edit is in the project but not in the result. A stale assembly means the DLL the tests
+would load is older than its sources; verify refuses to run tests until a clean refresh, unless
+--allow-stale is passed. The "not stale" line is the opposite case: Unity does not rewrite a DLL whose
+contents it considers current, so a source whose timestamp merely moved (touch, re-checkout) stays
+older than its DLL even though a compile read it — it is reported, and the tests run. --json carries
+the same fields under compile.provenance (unix ms and ISO timestamps). See 'unity-cli wait --help' to
+block on that instead of reading it.
 
 Options:
   --no-tests                    Stop after the compile
@@ -1270,6 +1292,7 @@ Options:
   --mode <EditMode|PlayMode>    Test mode (default: EditMode)
   --max <n>                     List at most n errors and n failures (default 20)
   --keep-console                Don't clear the console first
+  --allow-stale                 Run tests even when an assembly is older than its sources
   --json                        One JSON object instead of text
 
 verify runs the tests, so its invocation budget defaults to 30 minutes instead of the global
@@ -1278,7 +1301,7 @@ when you set it explicitly.
 
 Exit codes:
   0  compiles, Burst is quiet, and every test passes
-  1  compile errors, Burst errors, failing tests, or no test ran
+  1  compile errors, Burst errors, stale assemblies, failing tests, or no test ran
   2  the editor could not answer: not running, timed out, or blocked by a
      modal dialog (named, with the command that answers it)
 
