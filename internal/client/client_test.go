@@ -2,6 +2,9 @@ package client
 
 import (
 	"encoding/json"
+	"fmt"
+	"io"
+	"net"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -371,5 +374,99 @@ func TestDiscoverInstance_PortFlagRequiresActiveInstance(t *testing.T) {
 
 	if _, err := DiscoverInstance("", 8091); err == nil {
 		t.Fatal("expected error for port without an active instance file")
+	}
+}
+
+// TestDiscoverInstance_ProjectPicksFreshestHeartbeat covers a project with two heartbeat records:
+// an old one (a pre-#14 worker's, or one written under a different path hash) sorted first on disk and
+// the editor's current one written later. Discovery must follow the newer beat, not the first match.
+func TestDiscoverInstance_ProjectPicksFreshestHeartbeat(t *testing.T) {
+	stubIsProcessDead(t, map[int]bool{})
+
+	home := writeInstanceFiles(t, map[string]Instance{
+		"aaa_old.json": {
+			State:       "ready",
+			ProjectPath: "/projects/current",
+			Port:        8090,
+			PID:         100,
+			Timestamp:   1000,
+		},
+		"zzz_new.json": {
+			State:       "ready",
+			ProjectPath: "/projects/current",
+			Port:        8091,
+			PID:         200,
+			Timestamp:   2000,
+		},
+	})
+	t.Setenv("HOME", home)
+
+	got, err := DiscoverInstance("/projects/current", 0)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got.Port != 8091 || got.Timestamp != 2000 {
+		t.Fatalf("got port %d timestamp %d, want the newest beat on 8091", got.Port, got.Timestamp)
+	}
+}
+
+// TestReconnectInstance_FollowsTheNewestLiveProjectFile: the retry target is the newest non-stopped
+// record, even when a stopped file is newer, and a record from another project is never chosen.
+func TestReconnectInstance_FollowsTheNewestLiveProjectFile(t *testing.T) {
+	home := writeInstanceFiles(t, map[string]Instance{
+		"new_stopped.json": {
+			State:       "stopped",
+			ProjectPath: "/projects/current",
+			Port:        8092,
+			PID:         200,
+			Timestamp:   5000,
+		},
+		"other.json": {
+			State:       "ready",
+			ProjectPath: "/projects/other",
+			Port:        8093,
+			PID:         300,
+			Timestamp:   6000,
+		},
+		"old.json": {
+			State:       "ready",
+			ProjectPath: "/projects/current",
+			Port:        8090,
+			PID:         100,
+			Timestamp:   1000,
+		},
+		"current.json": {
+			State:       "ready",
+			ProjectPath: "/projects/current",
+			Port:        8091,
+			PID:         100,
+			Timestamp:   2000,
+		},
+	})
+	t.Setenv("HOME", home)
+
+	got := ReconnectInstance(&Instance{State: "ready", ProjectPath: "/projects/current", Port: 8090, PID: 100, Timestamp: 1000})
+	if got == nil || got.Port != 8091 {
+		t.Fatalf("ReconnectInstance = %+v, want the live 8091 heartbeat", got)
+	}
+}
+
+func TestRequestNotDelivered(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	port := ln.Addr().(*net.TCPAddr).Port
+	_ = ln.Close()
+
+	_, refused := net.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", port))
+	if refused == nil {
+		t.Fatal("expected the dial to a closed port to fail")
+	}
+	if !RequestNotDelivered(refused) {
+		t.Errorf("a refused dial must count as not delivered: %v", refused)
+	}
+	if RequestNotDelivered(io.EOF) {
+		t.Error("EOF after a connection was established must not count as not delivered")
 	}
 }

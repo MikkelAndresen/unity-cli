@@ -7,11 +7,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -245,33 +247,55 @@ func DiscoverInstance(project string, port int) (*Instance, error) {
 	}
 
 	if project != "" {
-		for _, inst := range alive {
-			if projectMatches(inst.ProjectPath, project) {
-				return &inst, nil
-			}
+		best := newestMatching(alive, func(inst Instance) bool {
+			return projectMatches(inst.ProjectPath, project)
+		})
+		if best == nil {
+			return nil, fmt.Errorf("no Unity instance found for project: %s", project)
 		}
-		return nil, fmt.Errorf("no Unity instance found for project: %s", project)
+		return best, nil
 	}
 
 	// Try to match by current working directory before falling back to timestamp
 	if cwd, err := os.Getwd(); err == nil {
 		cwdNorm := filepath.ToSlash(cwd)
-		for _, inst := range alive {
+		if best := newestMatching(alive, func(inst Instance) bool {
 			projNorm := filepath.ToSlash(inst.ProjectPath)
-			if cwdNorm == projNorm || strings.HasPrefix(cwdNorm, projNorm+"/") {
-				return &inst, nil
-			}
+			return cwdNorm == projNorm || strings.HasPrefix(cwdNorm, projNorm+"/")
+		}); best != nil {
+			return best, nil
 		}
 	}
 
 	// Return the most recently updated
-	best := alive[0]
-	for _, inst := range alive[1:] {
-		if inst.Timestamp > best.Timestamp {
+	return newestMatching(alive, func(Instance) bool { return true }), nil
+}
+
+// newestMatching returns the newest heartbeat matching keep, or nil when none does. Readiness is
+// decided by the caller; a stale file with a newer write must not hide the heartbeat that replaced it.
+func newestMatching(instances []Instance, keep func(Instance) bool) *Instance {
+	var best *Instance
+	for i := range instances {
+		inst := &instances[i]
+		if !keep(*inst) {
+			continue
+		}
+		if best == nil || inst.Timestamp > best.Timestamp {
 			best = inst
 		}
 	}
-	return &best, nil
+	return best
+}
+
+// RequestNotDelivered reports whether the transport failed before a listener could read the request: a
+// dial failure (connection refused, no route) rather than a connection that died after the request was
+// written. Only the former is safe to resend whatever the command.
+func RequestNotDelivered(err error) bool {
+	var opErr *net.OpError
+	if errors.As(err, &opErr) && opErr.Op == "dial" {
+		return true
+	}
+	return errors.Is(err, syscall.ECONNREFUSED)
 }
 
 func Send(inst *Instance, command string, params interface{}, timeoutMs int) (*CommandResponse, error) {

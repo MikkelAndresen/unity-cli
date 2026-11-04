@@ -234,6 +234,38 @@ func findStaleHeartbeat(project string, port int) (*Instance, string) {
 	return best, bestFile
 }
 
+// ReconnectInstance returns the heartbeat a request should be retried against after a reload or port
+// change: the newest non-stopped record for the same project (or port when the project is unknown).
+// It reads past ScanInstances so a heartbeat the scan is about to prune is still visible as the old
+// record, never as the retry target. A matching pid wins a timestamp tie.
+func ReconnectInstance(old *Instance) *Instance {
+	if old == nil {
+		return nil
+	}
+
+	files, _ := rawInstanceFiles()
+	var best *Instance
+	for _, f := range files {
+		inst := f.Instance
+		if inst.State == "stopped" || inst.Timestamp <= 0 {
+			continue
+		}
+		if old.ProjectPath != "" {
+			if !projectMatches(inst.ProjectPath, old.ProjectPath) {
+				continue
+			}
+		} else if inst.Port != old.Port {
+			continue
+		}
+		if best == nil || inst.Timestamp > best.Timestamp ||
+			(inst.Timestamp == best.Timestamp && inst.PID == old.PID && best.PID != old.PID) {
+			beat := inst
+			best = &beat
+		}
+	}
+	return best
+}
+
 func projectMatches(projectPath, needle string) bool {
 	return strings.Contains(filepath.ToSlash(projectPath), filepath.ToSlash(needle))
 }

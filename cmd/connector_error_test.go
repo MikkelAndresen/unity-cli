@@ -31,6 +31,13 @@ func TestConnectorErrorHint(t *testing.T) {
 			want: "the command did not reach a tool handler",
 		},
 		{
+			name: "the compile gate refused before dispatch",
+			resp: &client.CommandResponse{Success: false,
+				Message: "Editor is currently compiling — retry shortly.",
+				Data:    json.RawMessage(`{"code":"compiling","started":false,"compiling":true}`)},
+			want: "the command did not run; the editor is still compiling",
+		},
+		{
 			name: "the command was running when the reload came",
 			resp: &client.CommandResponse{Success: false,
 				Message: "exec had already started when Unity stopped answering (the domain is reloading)",

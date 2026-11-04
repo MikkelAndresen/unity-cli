@@ -18,3 +18,19 @@ func ConnectorErrorCode(resp *CommandResponse) string {
 	}
 	return probe.Code
 }
+
+// ConnectorResponseStarted reports the connector's `started` flag from a failed response's data.
+// ok is false when the field is absent or not a boolean; only an explicit false proves that the
+// tool handler was never entered, so only that value lets the CLI repeat a state-changing command.
+func ConnectorResponseStarted(resp *CommandResponse) (started bool, ok bool) {
+	if resp == nil || len(resp.Data) == 0 || string(resp.Data) == "null" {
+		return false, false
+	}
+	var probe struct {
+		Started *bool `json:"started"`
+	}
+	if err := json.Unmarshal(resp.Data, &probe); err != nil || probe.Started == nil {
+		return false, false
+	}
+	return *probe.Started, true
+}
