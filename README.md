@@ -154,6 +154,7 @@ Before compiling or reloading, the Connector records the state (`compiling`, `re
 | `screenshot` | Capture scene/game view as PNG |
 | `profiler` | Read profiler hierarchy, control recording |
 | `modal` | Inspect and answer a modal dialog blocking the editor (macOS) |
+| `dialogs` | List or click Unity's windows from outside the editor — startup dialogs, no connector (macOS host) |
 | `list` | Show all available tools with parameter schemas |
 | `status` | Show Unity Editor connection state |
 | `update` | Self-update the CLI binary |
@@ -401,7 +402,51 @@ unity-cli modal answer --button Cancel --id 27186
 
 A modal dialog (`EditorUtility.DisplayDialog`, save prompts, file panels) freezes Unity's main thread, so normal commands cannot run until someone answers it. While one is open, the heartbeat reports state `modal` together with the dialog's text and buttons. Every other command fails right away with that description instead of hanging. If a command opens a dialog while running, the CLI returns the same error; the command resumes inside Unity once the dialog is answered.
 
-The connector answers the dialog from inside the Unity process by dispatching to the main queue, which AppKit keeps draining during a modal loop. No Accessibility permission is involved, and only Unity's own windows are reachable. Dialogs drawn with IMGUI (`EditorWindow.ShowModal`) have no native buttons; they are listed but cannot be answered. Dialogs shown before the connector loads (e.g. the Safe Mode prompt at startup) are out of reach.
+The connector answers the dialog from inside the Unity process by dispatching to the main queue, which AppKit keeps draining during a modal loop. No Accessibility permission is involved, and only Unity's own windows are reachable. Dialogs drawn with IMGUI (`EditorWindow.ShowModal`) have no native buttons; they are listed but cannot be answered. Dialogs shown before the connector loads (license prompts, Safe Mode, "project already open", package resolution) are out of reach for `modal` — see [Startup Dialogs](#startup-dialogs-macos-host).
+
+### Startup Dialogs (macOS host)
+
+```bash
+# List Unity's windows with their texts and button names (JSON)
+unity-cli --project ~/Work/MyGame dialogs
+
+# Press a button of the dialog you just listed
+unity-cli dialogs --click "Continue"
+
+# Same button title on several windows: name the window
+unity-cli dialogs --click "Don't Save" --window "Save Changes"
+```
+
+`modal` needs the connector, and the connector needs its assembly to have loaded — which is exactly
+when startup dialogs appear. `dialogs` reads the same windows from outside the Unity process with
+AppleScript and System Events (Accessibility), so it works with no connector and no heartbeat.
+It runs only on macOS; on any other system it says so and tells you to run it on the host, because
+an agent sandbox is granted no Accessibility permission.
+
+When no heartbeat answers but the project's `Temp/UnityLockfile` (or a heartbeat that went silent)
+says an editor is open, every command reports the state `editor_starting_or_blocked` instead of
+"no Unity instance found", naming the evidence and its age:
+
+```
+editor_starting_or_blocked: Unity appears open for /Users/me/Work/MyGame (Temp/UnityLockfile, age 42s)
+but the connector has not loaded — it is still importing/compiling, or a startup dialog (license,
+safe mode, "project already open", package resolution) is waiting.
+  Lockfile: /Users/me/Work/MyGame/Temp/UnityLockfile (written 2026-11-04T04:26:32Z)
+  Next:     run 'unity-cli dialogs' on the macOS host to read the dialog's title and buttons,
+            or ask the user to look at the editor.
+```
+
+Windows are narrowed to the requested project by matching the project folder name in the window
+title; when nothing matches, every Unity window is listed, because startup dialogs rarely name the
+project. If Accessibility is missing, the error names the exact grant (System Settings → Privacy &
+Security → Accessibility, for `/usr/bin/osascript` and the app running the command). Button matching
+is exact-title first, then case- and apostrophe-insensitive, and an ambiguous title is reported
+instead of clicking a possibly-wrong dialog.
+
+Windows Unity draws itself (IMGUI panels, some Safe Mode prompts) expose no native buttons to
+Accessibility: `dialogs` lists their title and texts, but there is nothing to click, and only a
+human can answer them. Static texts are capped at 12 per window (`texts_total` reports the real
+count) so an editor window does not flood the output.
 
 ### List Tools
 
@@ -431,7 +476,7 @@ unity-cli status
 #   PID:     12345
 ```
 
-The CLI also checks Unity's state automatically before sending any command. If Unity is busy (compiling, reloading), it waits for Unity to become responsive. If a modal dialog is open (state `modal`), it fails immediately and shows the dialog; see [Modal Dialogs](#modal-dialogs-macos).
+The CLI also checks Unity's state automatically before sending any command. If Unity is busy (compiling, reloading), it waits for Unity to become responsive. If a modal dialog is open (state `modal`), it fails immediately and shows the dialog; see [Modal Dialogs](#modal-dialogs-macos). If nothing answers but the project looks open (`Temp/UnityLockfile`, or a heartbeat that went silent), the state is `editor_starting_or_blocked`; see [Startup Dialogs](#startup-dialogs-macos-host).
 
 ## Global Options
 

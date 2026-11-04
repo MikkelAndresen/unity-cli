@@ -22,7 +22,7 @@ func statusCmd(inst *client.Instance) error {
 
 	age := time.Since(time.UnixMilli(status.Timestamp))
 	if age > 3*time.Second {
-		fmt.Fprintf(os.Stderr, "Unity (port %d): not responding (last heartbeat %s ago)\n", status.Port, age.Truncate(time.Second))
+		fmt.Fprint(os.Stderr, staleHeartbeatReport(status, age, client.FindEditorEvidence(status.ProjectPath, status.Port)))
 		return checkConnectorVersion(status, Version, flagIgnoreVersionMismatch)
 	}
 
@@ -35,6 +35,17 @@ func statusCmd(inst *client.Instance) error {
 		fmt.Print(describeModal(status.Modal))
 	}
 	return checkConnectorVersion(status, Version, flagIgnoreVersionMismatch)
+}
+
+// staleHeartbeatReport is what status prints once the heartbeat stops arriving. The evidence line
+// is the difference between "Unity is not running" and "Unity is open with no connector loaded".
+func staleHeartbeatReport(status *client.Instance, age time.Duration, ev *client.EditorEvidence) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "Unity (port %d): not responding (last heartbeat %s ago)\n", status.Port, age.Truncate(time.Second))
+	if ev.Found() {
+		fmt.Fprintf(&b, "%s\n", evidenceHint(ev))
+	}
+	return b.String()
 }
 
 func discoverStatusInstance(project string, port int) (*client.Instance, error) {
