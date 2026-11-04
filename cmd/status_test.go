@@ -230,6 +230,40 @@ func TestWaitForAlive_FollowsResolverPortChange(t *testing.T) {
 	}
 }
 
+func TestWaitForAlive_DoesNotReturnWhileTheConnectorIsStarting(t *testing.T) {
+	origPollInterval := statusPollInterval
+	statusPollInterval = 5 * time.Millisecond
+	t.Cleanup(func() { statusPollInterval = origPollInterval })
+
+	project := "/work/FoW"
+	callCount := 0
+	resolve := func() (*client.Instance, error) {
+		callCount++
+		state := "starting"
+		if callCount >= 3 {
+			state = "ready"
+		}
+		return &client.Instance{
+			State:       state,
+			ProjectPath: project,
+			Port:        8090,
+			// The startup beater refreshes the timestamp while the state stays "starting".
+			Timestamp: time.Now().Add(time.Duration(callCount) * time.Millisecond).UnixMilli(),
+		}, nil
+	}
+
+	inst, err := waitForAlive(resolve, 200)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if inst.State != "ready" {
+		t.Fatalf("state = %q, want ready", inst.State)
+	}
+	if callCount < 3 {
+		t.Fatalf("expected to wait through the starting beats, got %d call(s)", callCount)
+	}
+}
+
 func TestWaitForCompile_ReadyHeartbeatIsNotEvidence(t *testing.T) {
 	compileTestBudgets(t)
 	// The heartbeat was already "ready" and its compile clock never moves: polling must not

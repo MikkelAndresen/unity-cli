@@ -117,6 +117,10 @@ namespace UnityCliConnector
 
                 _ = ListenLoop(listener, cts);
 
+                // The socket is up before the main thread has ticked (a cold import can take
+                // minutes), so publish a heartbeat now rather than leaving the daemon with none.
+                Heartbeat.OnListenerStarted();
+
                 Debug.Log($"[UnityCliConnector] HTTP server started on port {port}");
                 return true;
             }

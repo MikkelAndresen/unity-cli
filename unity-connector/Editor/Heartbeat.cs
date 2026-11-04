@@ -18,6 +18,9 @@ namespace UnityCliConnector
             Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".unity-cli", "instances");
 
         static double s_LastWrite;
+        // Keeps "starting" fresh while the main thread has not ticked yet (a large import can hold
+        // it for longer than the CLI's silence threshold). Disposed by the first Tick.
+        static Timer s_StartupBeater;
         const double INTERVAL = 0.5;
         const string CONNECTOR_VERSION = "0.7.0";
         static string s_ForcedState;
@@ -53,13 +56,63 @@ namespace UnityCliConnector
             EditorApplication.update += Tick;
             EditorApplication.quitting += Cleanup;
             AssemblyReloadEvents.beforeAssemblyReload += OnBeforeAssemblyReload;
-            AssemblyReloadEvents.afterAssemblyReload += () => { s_ForcedState = null; s_LastWrite = 0; };
+            AssemblyReloadEvents.afterAssemblyReload += OnAfterAssemblyReload;
             EditorApplication.playModeStateChanged += OnPlayModeChanged;
         }
 
         static void OnBeforeAssemblyReload()
         {
+            StopStartupBeater();
             WriteState("reloading");
+        }
+
+        static void OnAfterAssemblyReload()
+        {
+            s_ForcedState = null;
+            s_LastWrite = 0;
+            // InitializeOnLoad order is not guaranteed: HttpServer.Start may have run first, in which
+            // case this is the write that puts the new session's first heartbeat on disk.
+            if (HttpServer.IsRunning) OnListenerStarted();
+        }
+
+        /// <summary>
+        /// Publishes a heartbeat as soon as the listener is up. The listener starts before
+        /// EditorApplication.update does any useful work on a cold import, and until the first tick
+        /// the old Tick early-return left the daemon with no heartbeat at all ("state None") even
+        /// though the socket was answering. The first tick replaces "starting" with the real state.
+        /// </summary>
+        internal static void OnListenerStarted()
+        {
+            if (s_LastWrite == 0)
+            {
+                WriteState("starting");
+                StartStartupBeater();
+            }
+            else
+            {
+                Write();
+            }
+        }
+
+        static void StartStartupBeater()
+        {
+            StopStartupBeater();
+            s_StartupBeater = new Timer(_ =>
+            {
+                if (s_LastWrite != 0)
+                {
+                    StopStartupBeater();
+                    return;
+                }
+                WriteFromAnyThread();
+            }, null, 500, 500);
+        }
+
+        static void StopStartupBeater()
+        {
+            var timer = s_StartupBeater;
+            s_StartupBeater = null;
+            timer?.Dispose();
         }
 
         static void OnPlayModeChanged(PlayModeStateChange change)
@@ -114,6 +167,7 @@ namespace UnityCliConnector
         static void Tick()
         {
             if (!HttpServer.IsRunning) return;
+            StopStartupBeater();
 
             var now = EditorApplication.timeSinceStartup;
             if (now - s_LastWrite < INTERVAL) return;
@@ -133,10 +187,21 @@ namespace UnityCliConnector
             Write();
         }
 
+        // The hash key must match internal/editor/heartbeat.go: forward slashes, no trailing
+        // separator. Application.dataPath already has that shape on macOS; normalizing here keeps
+        // the other platforms (and a path passed with a trailing separator) on the same rule.
+        static string ProjectRoot()
+        {
+            return Application.dataPath
+                .Replace('\\', '/')
+                .Replace("/Assets", "")
+                .TrimEnd('/');
+        }
+
         static string GetFilePath()
         {
             if (s_FilePath != null) return s_FilePath;
-            var projectPath = Application.dataPath.Replace("/Assets", "");
+            var projectPath = ProjectRoot();
             using var md5 = MD5.Create();
             var hash = BitConverter.ToString(md5.ComputeHash(Encoding.UTF8.GetBytes(projectPath)))
                 .Replace("-", "").Substring(0, 16).ToLower();
@@ -148,7 +213,7 @@ namespace UnityCliConnector
         {
             if (s_ProjectPath == null)
             {
-                s_ProjectPath = Application.dataPath.Replace("/Assets", "");
+                s_ProjectPath = ProjectRoot();
                 s_UnityVersion = Application.unityVersion;
                 s_Pid = System.Diagnostics.Process.GetCurrentProcess().Id;
                 GetFilePath();
@@ -242,6 +307,7 @@ namespace UnityCliConnector
 
         public static void MarkStopped()
         {
+            StopStartupBeater();
             s_ForcedState = "stopped";
             Write();
         }

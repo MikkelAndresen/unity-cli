@@ -103,6 +103,21 @@ func TestWait_IdleEditorAnswersAtOnceWithProvenance(t *testing.T) {
 	}
 }
 
+func TestWait_BlocksWhileTheConnectorIsStarting(t *testing.T) {
+	f := &fakeWait{t: t, prov: prov(provLine, 0), states: []client.Instance{
+		{State: "starting", CompileFinishedAt: 1000},
+		{State: "starting", CompileFinishedAt: 1000},
+		{State: "ready", CompileFinishedAt: 1000},
+	}}
+	code, out := f.run()
+	if code != waitIdle {
+		t.Fatalf("exit = %d, want 0; output:\n%s", code, out)
+	}
+	if !strings.HasPrefix(out, "Unity (port 8090): ready\n") {
+		t.Errorf("output = %q, want the settled ready state", out)
+	}
+}
+
 func TestWait_BlocksUntilTheEditorStopsWorking(t *testing.T) {
 	f := &fakeWait{t: t, prov: prov(provLine, 0), states: []client.Instance{
 		{State: "compiling", CompileFinishedAt: 1000},
@@ -295,6 +310,7 @@ func TestIsIdleState(t *testing.T) {
 		"ready":             true,
 		"playing":           true,
 		"paused":            true,
+		"starting":          false,
 		"compiling":         false,
 		"refreshing":        false,
 		"reloading":         false,

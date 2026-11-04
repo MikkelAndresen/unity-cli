@@ -57,13 +57,20 @@ type waitResult struct {
 
 // isIdleState is the heartbeat saying the editor is not mid-operation: it can answer a command and
 // nothing is about to change what a compile result covers. Play mode counts as idle — waiting for
-// someone to stop play mode is not what this command is for.
+// someone to stop play mode is not what this command is for. "starting" is the listener's first
+// heartbeat before the main thread has ticked; it is alive but not idle.
 func isIdleState(state string) bool {
 	switch state {
 	case "ready", "playing", "paused":
 		return true
 	}
 	return false
+}
+
+// isStartingState is the connector's first heartbeat of a session: HttpServer is listening, but the
+// editor has not run an update tick yet, so it is not ready to answer a command.
+func isStartingState(state string) bool {
+	return state == "starting"
 }
 
 // waitCmd blocks until the editor stops reporting work in progress, then reports the editor state
