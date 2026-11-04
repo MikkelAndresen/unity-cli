@@ -14,6 +14,7 @@ cmd/                  # Go CLI — thin passthrough layer
   wait.go             # wait command: block until the heartbeat is idle, then report compile provenance
   provenance.go       # compileProvenance payload shared by verify, editor refresh --compile and wait
   status.go           # status, waitForAlive, heartbeat reading
+  signals.go          # SIGINT/SIGTERM/SIGALRM/SIGHUP handling; signals_unix.go/signals_windows.go
   evidence.go         # editor_starting_or_blocked: the startup-dialog report built from on-disk evidence
   dialogs.go          # dialogs command (macOS only): list/click Unity windows with AppleScript
   update.go           # self-update from GitHub releases

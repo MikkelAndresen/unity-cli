@@ -2,12 +2,15 @@ package client
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -258,6 +261,45 @@ func DiscoverInstance(project string, port int) (*Instance, error) {
 }
 
 func Send(inst *Instance, command string, params interface{}, timeoutMs int) (*CommandResponse, error) {
+	return SendContext(context.Background(), inst, command, params, timeoutMs)
+}
+
+// RequestTimeoutError is a client-side deadline expiring. It is deliberately not a connection
+// failure: the editor is healthy and may still be running the command, so saying "cannot connect"
+// sends the caller into a reconnect loop instead of waiting for the result.
+type RequestTimeoutError struct {
+	Command string
+	Budget  time.Duration
+}
+
+func (e *RequestTimeoutError) Error() string {
+	return fmt.Sprintf("timed out after %s waiting for Unity to answer %s (the editor may still be running it)", formatBudget(e.Budget), e.Command)
+}
+
+// formatBudget keeps a context deadline's nanosecond remainder out of the message: callers passed
+// a whole number of milliseconds, and "1.947998375s" reads like a bug rather than a budget.
+func formatBudget(d time.Duration) string {
+	if d <= 0 {
+		return "0s"
+	}
+	if d < time.Second {
+		return ceilDuration(d, 10*time.Millisecond).String()
+	}
+	return strconv.FormatFloat(ceilDuration(d, 100*time.Millisecond).Seconds(), 'f', -1, 64) + "s"
+}
+
+// ceilDuration keeps a rounding-down remainder from making a 2000 ms budget read as 1.9s.
+func ceilDuration(d, step time.Duration) time.Duration {
+	return ((d + step - 1) / step) * step
+}
+
+// Timeout reports the deadline as a timeout for callers that type-assert net.Error.
+func (e *RequestTimeoutError) Timeout() bool { return true }
+
+// SendContext posts one command, bounded by timeoutMs and by the caller's context. A context
+// deadline shared by discovery, wait-for-alive and this request is what keeps one invocation from
+// spending the budget twice; a canceled context is a caller interrupt, not a timeout or a crash.
+func SendContext(ctx context.Context, inst *Instance, command string, params interface{}, timeoutMs int) (*CommandResponse, error) {
 	if params == nil {
 		params = map[string]interface{}{}
 	}
@@ -268,13 +310,36 @@ func Send(inst *Instance, command string, params interface{}, timeoutMs int) (*C
 	}
 
 	url := fmt.Sprintf("http://127.0.0.1:%d/command", inst.Port)
-	httpClient := &http.Client{Timeout: time.Duration(timeoutMs) * time.Millisecond}
+	budget := time.Duration(timeoutMs) * time.Millisecond
+	if budget > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, budget)
+		defer cancel()
+	}
+	// The parent (one invocation, several requests) may expire before this request's own budget.
+	if deadline, ok := ctx.Deadline(); ok {
+		if remaining := time.Until(deadline); remaining > 0 && (budget == 0 || remaining < budget) {
+			budget = remaining
+		}
+	}
+
 	// The moment the request left, not now: crash artifacts are matched against it so that a dump from
 	// an earlier crash is not blamed on this request.
 	start := time.Now()
 
-	resp, err := httpClient.Post(url, "application/json", bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
+		return nil, err
+	}
+	httpClient := &http.Client{}
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		if ctx.Err() == context.Canceled {
+			return nil, fmt.Errorf("request for %s cancelled: %w", command, ctx.Err())
+		}
+		if ctx.Err() == context.DeadlineExceeded || isTimeoutError(err) {
+			return nil, &RequestTimeoutError{Command: command, Budget: budget}
+		}
 		return nil, explainDroppedConnection(command, inst, start, err)
 	}
 	defer resp.Body.Close()
@@ -307,4 +372,14 @@ func Send(inst *Instance, command string, params interface{}, timeoutMs int) (*C
 	}
 
 	return &result, nil
+}
+
+// isTimeoutError reports a transport deadline without swallowing a canceled request: cancellation
+// is decided by the context first, in SendContext.
+func isTimeoutError(err error) bool {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	var timeout interface{ Timeout() bool }
+	return errors.As(err, &timeout) && timeout.Timeout()
 }

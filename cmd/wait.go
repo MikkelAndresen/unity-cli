@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -70,7 +71,7 @@ func isIdleState(state string) bool {
 // is newer than that. --compile additionally requires proof that the compile covers the caller's
 // edit — either a compilation finished after wait started, or no source file is newer than the last
 // one.
-func waitCmd(args []string, send sendFn, resolve instanceResolver, out io.Writer) int {
+func waitCmd(ctx context.Context, args []string, send sendFn, resolve instanceResolver, out io.Writer) int {
 	flags, err := parseSubFlags(args)
 	if err != nil {
 		_, _ = fmt.Fprintf(out, "wait: %v\n", err)
@@ -222,7 +223,11 @@ func waitCmd(args []string, send sendFn, resolve instanceResolver, out io.Writer
 			askProvenance(true)
 			return finish(waitTimedOut)
 		}
-		time.Sleep(statusPollInterval)
+		select {
+		case <-ctx.Done():
+			return noReply("wait cancelled: %v", ctx.Err())
+		case <-time.After(statusPollInterval):
+		}
 	}
 }
 

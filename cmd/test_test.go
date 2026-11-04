@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"context"
 	"testing"
 
 	"github.com/youngwoocho02/unity-cli/internal/client"
@@ -20,7 +21,7 @@ func TestTestCmd_ForwardsDirtySceneOptions(t *testing.T) {
 		return &client.CommandResponse{Success: true}, nil
 	}
 
-	resp, err := testCmd([]string{"--allow-dirty-scenes", "--auto-save-scenes"}, send, 0)
+	resp, err := testCmd(context.Background(), []string{"--allow-dirty-scenes", "--auto-save-scenes"}, send, 0)
 	if err != nil {
 		t.Fatalf("testCmd returned error: %v", err)
 	}

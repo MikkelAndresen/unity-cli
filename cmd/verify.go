@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -81,9 +82,9 @@ type verifyBurst struct {
 const defaultBurstWaitSeconds = 60
 
 // verifyCmd checks that the project compiles and its tests pass, in one call and with output short
-// enough for an agent's context. testSend carries no request timeout (test runs can be long); port
+// enough for an agent's context. ctx carries the invocation's long default budget (30 minutes); port
 // is where PlayMode results are polled.
-func verifyCmd(args []string, send, testSend sendFn, resolve instanceResolver, port int, out io.Writer) int {
+func verifyCmd(ctx context.Context, args []string, send, testSend sendFn, resolve instanceResolver, port int, out io.Writer) int {
 	flags, err := parseSubFlags(args)
 	if err != nil {
 		_, _ = fmt.Fprintln(out, err)
@@ -198,7 +199,7 @@ func verifyCmd(args []string, send, testSend sendFn, resolve instanceResolver, p
 			testArgs = append(testArgs, "--"+k, v)
 		}
 	}
-	tresp, err := testCmd(testArgs, testSend, port)
+	tresp, err := testCmd(ctx, testArgs, testSend, port)
 	if err != nil {
 		return noReply("tests: %v", err)
 	}

@@ -605,6 +605,8 @@ unity-cli test --assembly MyGame.Tests.Editor
 
 Requires the Unity Test Framework package. Tests are blocked by default when any open scene has unsaved changes. Use `--auto-save-scenes` to save them first, or `--allow-dirty-scenes` to run anyway. PlayMode tests trigger a domain reload — the CLI polls for results automatically.
 
+Tests run for minutes, so `test`'s invocation budget defaults to 30 minutes instead of the global 120 s. `--timeout <ms>` overrides it, and `--timeout 0` means no deadline; a run that exceeds the budget is reported as a client deadline, not as a lost editor.
+
 ### Verify
 
 Check that the project compiles and its tests pass in one call, with output brief enough for an agent's context.
@@ -655,6 +657,8 @@ The `compiled ...` line is the [compile provenance](#compile-provenance-and-wait
 Burst errors print like compile errors and fail verify (exit 1) before the tests run; `--burst-wait <seconds>` bounds how long verify waits for Burst to go idle (default 60, keep `--timeout` above it). A Burst check that cannot run — no `burst_status` tool because Burst is not installed, or the editor wouldn't answer — prints nothing or a note and leaves the verdict alone.
 
 `verify` clears the console first (a Burst error stays there after its code changes; Burst logs a live one again on the next compile; `--keep-console` skips the clear), refreshes and compiles, and lists this compile's errors from the connector's `compile_diagnostics` tool, leaving out `Library/` and `PackageCache/` unless nothing else failed. It then saves dirty open scenes and runs the tests, printing `passed/total` and the first line of each failure (`--max` caps both lists, default 20). Exit code 0 means it compiles, Burst is quiet and every test passed; 1 means compile errors, Burst errors, failing tests or no test ran; 2 means the editor couldn't answer: not running, timed out, or blocked by a modal dialog, which is named along with the command that answers it. Connectors before 0.7.0 have no `compile_diagnostics` and ignore `--assembly`; `verify` then lists console errors and says so.
+
+`verify` runs the tests, so its invocation budget defaults to 30 minutes instead of the global 120 s. `--timeout <ms>` overrides it (`--timeout 0` means no deadline); when you set it explicitly, keep it above `--burst-wait`.
 
 ### Compile provenance, and `wait`
 
@@ -932,7 +936,7 @@ can decide there; the verdict always prints which evidence it used.
 |------|-------------|---------|
 | `--port <N>` | Select Unity instance by active heartbeat port | auto |
 | `--project <path>` | Select Unity instance by project path | latest |
-| `--timeout <ms>` | HTTP request timeout | 120000 |
+| `--timeout <ms>` | One budget per invocation, shared by discovery, waiting for a fresh heartbeat, and the request. A client deadline is reported as `timed out ... (the editor may still be running it)`, not as a connection failure. `test`, `verify` and `editor refresh --compile` default to 1800000 (30 min); an explicit `0` means no deadline. `wait --timeout` and build polling keep their own budgets. | 120000 |
 | `--ignore-version-mismatch` | Suppress the version-drift warning (and the refusal for a connector older than 0.7.0) | false |
 | `--meta` | Print the response's `meta` (how the call was served, e.g. `exec`'s compile cache state) to stderr | false |
 
