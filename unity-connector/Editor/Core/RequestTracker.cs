@@ -234,12 +234,13 @@ namespace UnityCliConnector
         /// or quit already under way). Accepting it would be a promise nobody can keep: the queue it
         /// joins is about to be wiped and its ticket would never be answered.
         /// </summary>
-        public static ErrorResponse BuildRefusedError(string command, string why)
+        public static ErrorResponse BuildRefusedError(string command, string why, bool quitting = false)
         {
             var message = $"{command} did not run: Unity is not taking new main-thread commands ({why}). "
-                + "Retry it once Unity answers again.";
-            var diag = new BusyDiagnostics("reloading", Running?.Command, Running?.WaitedMs ?? 0, PendingCount, null);
-            return new ErrorResponse(message, new RequestFailureInfo(ErrorCodes.DomainReload, command, 0, 0, diag, false));
+                + (quitting ? "The editor is quitting, so nothing was applied." : "Retry it once Unity answers again.");
+            var diag = new BusyDiagnostics(quitting ? "quitting" : "reloading", Running?.Command, Running?.WaitedMs ?? 0, PendingCount, null);
+            return new ErrorResponse(message,
+                new RequestFailureInfo(quitting ? null : ErrorCodes.DomainReload, command, 0, 0, diag, false));
         }
 
         static string FormatSeconds(int ms)

@@ -254,6 +254,20 @@ namespace UnityCliConnector.Tests
         }
 
         [Test]
+        public void BuildRefusedError_DuringQuit_HasNoRetryAdviceAndNoCode()
+        {
+            // The editor is going away: "retry once Unity answers again" would send the caller waiting
+            // for an editor nobody is relaunching.
+            var error = RequestTracker.BuildRefusedError("exec", "the editor is quitting", quitting: true);
+            Assert.That(error.message, Does.Not.Contain("Retry"));
+            Assert.That(error.message, Does.Contain("nothing was applied"));
+
+            var json = JObject.Parse(JsonConvert.SerializeObject(error));
+            Assert.IsNull(json["data"]["code"].Value<string>());
+            Assert.AreEqual(false, json["data"]["started"].Value<bool>());
+        }
+
+        [Test]
         public void AwaitForAnswers_ReturnsOnceEveryAnswerHasBeenWritten()
         {
             var first = RequestTracker.Track(new RequestTicket("exec", 60000));

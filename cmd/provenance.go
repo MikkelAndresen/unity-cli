@@ -102,6 +102,7 @@ func fetchProvenance(send sendFn) (*compileProvenance, json.RawMessage) {
 type compileFindings struct {
 	Diags          []verifyDiag
 	Total          int
+	TotalAtLeast   bool   // Total is a lower bound: the console scan stopped once it had enough entries
 	Source         string // "console" when the connector predates compile_diagnostics
 	Provenance     *compileProvenance
 	ProvenanceJSON json.RawMessage

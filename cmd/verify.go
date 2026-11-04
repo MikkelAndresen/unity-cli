@@ -33,11 +33,12 @@ type verifyDiag struct {
 
 type verifyResult struct {
 	Compile struct {
-		OK         bool            `json:"ok"`
-		Total      int             `json:"total"`
-		Errors     []verifyDiag    `json:"errors,omitempty"`
-		Source     string          `json:"source,omitempty"` // "console" when the connector predates compile_diagnostics
-		Provenance json.RawMessage `json:"provenance,omitempty"`
+		OK           bool            `json:"ok"`
+		Total        int             `json:"total"`
+		TotalAtLeast bool            `json:"total_is_lower_bound,omitempty"`
+		Errors       []verifyDiag    `json:"errors,omitempty"`
+		Source       string          `json:"source,omitempty"` // "console" when the connector predates compile_diagnostics
+		Provenance   json.RawMessage `json:"provenance,omitempty"`
 	} `json:"compile"`
 	Burst *verifyBurst `json:"burst,omitempty"`
 	Tests *struct {
@@ -180,11 +181,11 @@ func verifyCmd(ctx context.Context, args []string, send, testSend sendFn, resolv
 	if err != nil {
 		return noReply("compile: %v", err)
 	}
-	r.Compile.Total, r.Compile.Errors, r.Compile.Source, r.Compile.Provenance =
-		findings.Total, findings.Diags, findings.Source, findings.ProvenanceJSON
+	r.Compile.Total, r.Compile.TotalAtLeast, r.Compile.Errors, r.Compile.Source, r.Compile.Provenance =
+		findings.Total, findings.TotalAtLeast, findings.Diags, findings.Source, findings.ProvenanceJSON
 	r.Compile.OK = findings.Total == 0 && !hasErrors
 	if !asJSON {
-		printCompile(out, r.Compile.OK, findings.Total, findings.Diags, findings.Source, hasErrors)
+		printCompile(out, r.Compile.OK, findings.Total, findings.TotalAtLeast, findings.Diags, findings.Source, hasErrors)
 		printProvenance(out, findings.Provenance)
 	}
 	if outcome.NothingToCompile {
@@ -354,8 +355,8 @@ func verifyDiagnostics(send sendFn, max int, hasErrors bool, wait time.Duration)
 		return compileFindings{}, err
 	}
 	if !supported {
-		consoleDiags, consoleTotal, source, consoleErr := consoleErrors(send, max)
-		return compileFindings{Diags: consoleDiags, Total: consoleTotal, Source: source}, consoleErr
+		consoleDiags, consoleTotal, atLeast, source, consoleErr := consoleErrors(send, max)
+		return compileFindings{Diags: consoleDiags, Total: consoleTotal, TotalAtLeast: atLeast, Source: source}, consoleErr
 	}
 	if found.Total == 0 && hasErrors {
 		if second, _, err2 := query(false); err2 == nil {
@@ -367,52 +368,54 @@ func verifyDiagnostics(send sendFn, max int, hasErrors bool, wait time.Duration)
 	return found, err
 }
 
-func consoleErrors(send sendFn, max int) ([]verifyDiag, int, string, error) {
+func consoleErrors(send sendFn, max int) ([]verifyDiag, int, bool, string, error) {
 	resp, err := send("console", map[string]interface{}{"type": "error", "lines": max, "stacktrace": "none"})
 	if err != nil {
-		return nil, 0, "", err
+		return nil, 0, false, "", err
 	}
-	messages, total := consoleEntryInfo(resp.Data)
+	messages, total, atLeast := consoleEntryInfo(resp.Data)
 	diags := make([]verifyDiag, 0, len(messages))
 	for _, m := range messages {
 		diags = append(diags, verifyDiag{Severity: "error", Message: firstLine(m)})
 	}
-	return diags, total, "console", nil
+	return diags, total, atLeast, "console", nil
 }
 
 // consoleEntryMessages reads the entry list out of a console reply. A bare array is what a
 // connector without caps returns; the capped connector wraps the entries in an object that also
 // carries the truncation counts.
 func consoleEntryMessages(data []byte) []string {
-	messages, _ := consoleEntryInfo(data)
+	messages, _, _ := consoleEntryInfo(data)
 	return messages
 }
 
 // consoleEntryInfo also returns the pre-cap total, so verify does not report a byte- or
-// line-truncated list as the whole error count.
-func consoleEntryInfo(data []byte) ([]string, int) {
+// line-truncated list as the whole error count. atLeast is the connector saying it stopped scanning
+// once --lines entries matched, so the total is only a lower bound.
+func consoleEntryInfo(data []byte) (messages []string, total int, atLeast bool) {
 	if len(data) == 0 {
-		return nil, 0
+		return nil, 0, false
 	}
 	var list []string
 	if err := json.Unmarshal(data, &list); err == nil {
-		return list, len(list)
+		return list, len(list), false
 	}
 	var capped struct {
 		Entries      []string `json:"entries"`
 		EntriesTotal int      `json:"entries_total"`
+		LowerBound   bool     `json:"entries_total_is_lower_bound"`
 	}
 	if err := json.Unmarshal(data, &capped); err != nil {
-		return nil, 0
+		return nil, 0, false
 	}
-	total := capped.EntriesTotal
+	total = capped.EntriesTotal
 	if total < len(capped.Entries) {
 		total = len(capped.Entries)
 	}
-	return capped.Entries, total
+	return capped.Entries, total, capped.LowerBound
 }
 
-func printCompile(out io.Writer, ok bool, total int, diags []verifyDiag, source string, hasErrors bool) {
+func printCompile(out io.Writer, ok bool, total int, atLeast bool, diags []verifyDiag, source string, hasErrors bool) {
 	if ok {
 		_, _ = fmt.Fprintln(out, "compile: ok")
 		return
@@ -425,7 +428,11 @@ func printCompile(out io.Writer, ok bool, total int, diags []verifyDiag, source 
 		_, _ = fmt.Fprintf(out, "compile: failed, but no error was reported%s; see unity-cli console\n", note)
 		return
 	}
-	_, _ = fmt.Fprintf(out, "compile: %d error(s)%s\n", total, note)
+	count := fmt.Sprintf("%d", total)
+	if atLeast {
+		count = "at least " + count
+	}
+	_, _ = fmt.Fprintf(out, "compile: %s error(s)%s\n", count, note)
 	for _, d := range diags {
 		where := ""
 		if d.File != "" {

@@ -171,10 +171,7 @@ func Execute() error {
 	resolveForWait := resolveKeepingEvidence(guardProject, flagPort)
 
 	var alive *client.Instance
-	if category == waitCategory && isStartingState(inst.State) {
-		// wait's own --timeout is the budget for startup, and waitCmd polls "starting" itself.
-		// Holding it in waitForAlive here would spend the global request deadline instead, so
-		// `wait --timeout 2` could sit for two minutes before its own clock even started.
+	if waitOwnsStartup(category, inst.State) {
 		alive = inst
 	} else {
 		alive, err = waitForAliveContext(ctx, resolveForWait, remainingTimeoutMs(ctx, effectiveTimeout))
@@ -1930,4 +1927,11 @@ Verify:
 	default:
 		fmt.Printf("Unknown help topic: %s\n\nUse \"unity-cli --help\" for available commands.\n", topic)
 	}
+}
+
+// waitOwnsStartup: wait's own --timeout is the budget for startup, and waitCmd polls "starting"
+// itself. Holding it in waitForAlive would spend the global request deadline instead, so
+// `wait --timeout 2` could sit for two minutes before its own clock even started.
+func waitOwnsStartup(category, state string) bool {
+	return category == waitCategory && isStartingState(state)
 }

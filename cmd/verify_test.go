@@ -820,3 +820,20 @@ func TestVerify_TruncatedDiagnosticsSaySo(t *testing.T) {
 		t.Errorf("output = %q, want the true total and two listed errors", out)
 	}
 }
+
+// TestConsoleEntryInfo_LowerBound: a connector that stops scanning at --lines says so, and verify must
+// then print "at least N" rather than pass a partial count off as the whole error count.
+func TestConsoleEntryInfo_LowerBound(t *testing.T) {
+	msgs, total, atLeast := consoleEntryInfo([]byte(`{"entries":["a","b"],"entries_total":2,"entries_total_is_lower_bound":true}`))
+	if len(msgs) != 2 || total != 2 || !atLeast {
+		t.Fatalf("got %v %d %v", msgs, total, atLeast)
+	}
+	var out bytes.Buffer
+	printCompile(&out, false, total, atLeast, []verifyDiag{{Message: "a"}, {Message: "b"}}, "console", true)
+	if !strings.Contains(out.String(), "compile: at least 2 error(s)") {
+		t.Errorf("printCompile output:\n%s", out.String())
+	}
+	if _, _, atLeast := consoleEntryInfo([]byte(`["a"]`)); atLeast {
+		t.Error("a bare array is a complete list")
+	}
+}

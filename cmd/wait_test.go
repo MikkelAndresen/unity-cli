@@ -435,3 +435,20 @@ func TestIsIdleState(t *testing.T) {
 		}
 	}
 }
+
+func TestWaitOwnsStartup(t *testing.T) {
+	tests := []struct {
+		category, state string
+		want            bool
+	}{
+		{waitCategory, "starting", true},
+		{waitCategory, "ready", false},
+		{"exec", "starting", false},
+		{"verify", "starting", false},
+	}
+	for _, tt := range tests {
+		if got := waitOwnsStartup(tt.category, tt.state); got != tt.want {
+			t.Errorf("waitOwnsStartup(%q, %q) = %v, want %v", tt.category, tt.state, got, tt.want)
+		}
+	}
+}

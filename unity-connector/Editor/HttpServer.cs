@@ -51,6 +51,7 @@ namespace UnityCliConnector
         // Set as soon as a reload or quit starts: the main-thread queue is going away, so a request
         // accepted after that point could never be answered. Read from the HTTP threads.
         static volatile bool s_RefusingWork;
+        static volatile bool s_Quitting;
 
         static readonly ConcurrentQueue<WorkItem> s_Queue = new();
 
@@ -224,6 +225,7 @@ namespace UnityCliConnector
             var port = s_Port;
             // Refuse new main-thread work before the snapshot: a request tracked after it would never
             // be answered before the listener goes away.
+            s_Quitting = true;
             s_RefusingWork = true;
             // No error code for a quit: the editor is gone, so "wait for it and retry" would be a lie.
             AnswerPending("the editor is quitting", quitting: true);
@@ -393,7 +395,9 @@ namespace UnityCliConnector
                     {
                         // Fail fast rather than queue into a domain that is on its way out; the
                         // caller gets the same code it would get for a dropped request.
-                        result = RequestTracker.BuildRefusedError(command, "a reload or quit is already under way");
+                        result = s_Quitting
+                            ? RequestTracker.BuildRefusedError(command, "the editor is quitting", quitting: true)
+                            : RequestTracker.BuildRefusedError(command, "a domain reload is under way");
                     }
                     else
                     {
@@ -402,7 +406,9 @@ namespace UnityCliConnector
                         // this second read its "answer everything" snapshot would miss this ticket.
                         if (s_RefusingWork)
                         {
-                            result = RequestTracker.BuildRefusedError(command, "a reload or quit is already under way");
+                            result = s_Quitting
+                            ? RequestTracker.BuildRefusedError(command, "the editor is quitting", quitting: true)
+                            : RequestTracker.BuildRefusedError(command, "a domain reload is under way");
                             ticket.TryAnswer(result);
                         }
                         else
