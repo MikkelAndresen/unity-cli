@@ -312,3 +312,17 @@ func TestWaitForCompile_KeepsWaitingWhileCompiling(t *testing.T) {
 		t.Errorf("outcome = %+v, want a timeout that keeps the last seen compile state", out)
 	}
 }
+
+func TestStartingNote_NamesAgeAndFlagsLongStartups(t *testing.T) {
+	short := startingNote(&client.Instance{State: "starting", StartingSince: 1, Timestamp: 1 + 90_000})
+	if !strings.Contains(short, "starting for 1m30s") || strings.Contains(short, "wedged") {
+		t.Errorf("short startup note: %s", short)
+	}
+	long := startingNote(&client.Instance{State: "starting", StartingSince: 1, Timestamp: 1 + int64(longStartup/time.Millisecond) + 1000})
+	if !strings.Contains(long, "wedged") {
+		t.Errorf("long startup should say how to tell an import from a wedge: %s", long)
+	}
+	if old := startingNote(&client.Instance{State: "starting", Timestamp: 5}); strings.Contains(old, "starting for") {
+		t.Errorf("a connector without startingSince has no age to print: %s", old)
+	}
+}

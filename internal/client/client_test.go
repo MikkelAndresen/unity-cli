@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"testing"
+	"time"
 )
 
 // stubIsProcessDead replaces isProcessDead for testing.
@@ -543,5 +544,26 @@ func TestReconnectInstance_EqualTimestampKeepsTheFirstRecord(t *testing.T) {
 	got := ReconnectInstance(&Instance{State: "ready", ProjectPath: "/projects/current", Port: 8090, PID: 100, Timestamp: 1000})
 	if got == nil || got.Timestamp != 1000 || got.Port != 8090 {
 		t.Fatalf("ReconnectInstance = %+v, want the unchanged record", got)
+	}
+}
+
+func TestInstanceStartingFor(t *testing.T) {
+	tests := []struct {
+		name string
+		inst *Instance
+		want time.Duration
+		ok   bool
+	}{
+		{"starting with stamp", &Instance{State: "starting", StartingSince: 1000, Timestamp: 61000}, time.Minute, true},
+		{"ready ignores stamp", &Instance{State: "ready", StartingSince: 1000, Timestamp: 61000}, 0, false},
+		{"old connector", &Instance{State: "starting", Timestamp: 61000}, 0, false},
+		{"beat before stamp", &Instance{State: "starting", StartingSince: 9000, Timestamp: 1000}, 0, false},
+		{"nil", nil, 0, false},
+	}
+	for _, tt := range tests {
+		got, ok := tt.inst.StartingFor()
+		if got != tt.want || ok != tt.ok {
+			t.Errorf("%s: StartingFor() = %v, %v; want %v, %v", tt.name, got, ok, tt.want, tt.ok)
+		}
 	}
 }

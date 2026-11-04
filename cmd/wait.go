@@ -47,6 +47,8 @@ type waitResult struct {
 	CompileWanted bool `json:"compile"`
 	CompileLanded bool `json:"compile_landed,omitempty"`
 	TimedOut      bool `json:"timed_out,omitempty"`
+	// StartingForMs is how long a "starting" editor has been waiting for its first update tick.
+	StartingForMs int64 `json:"starting_for_ms,omitempty"`
 	// Reason says why a wait gave up, which timed_out alone does not: the budget ran out, or the
 	// editor sat idle with uncompiled sources instead of compiling them.
 	Reason     string          `json:"reason,omitempty"`
@@ -133,6 +135,9 @@ func waitCmd(ctx context.Context, args []string, send sendFn, resolve instanceRe
 		_, _ = fmt.Fprintf(out, "Unity (port %d): %s\n", r.Port, r.State)
 		if r.TimedOut {
 			_, _ = fmt.Fprintf(out, "gave up after %s: still %s", time.Since(start).Truncate(time.Second), r.State)
+			if r.StartingForMs > 0 {
+				_, _ = fmt.Fprintf(out, " (for %s)", client.FormatAge(time.Duration(r.StartingForMs)*time.Millisecond))
+			}
 			if r.Reason != "" {
 				_, _ = fmt.Fprintf(out, " — %s", r.Reason)
 			}
@@ -174,6 +179,10 @@ func waitCmd(ctx context.Context, args []string, send sendFn, resolve instanceRe
 			return noReply("%s", modalBlockedError(status, "wait", true))
 		}
 		r.State, r.Port, r.PID = status.State, status.Port, status.PID
+		r.StartingForMs = 0
+		if age, ok := status.StartingFor(); ok {
+			r.StartingForMs = age.Milliseconds()
+		}
 
 		// The editor coming back under a new pid restamps the compile clock too, and that is not
 		// evidence the caller's edit was compiled into anything. Rebase the clock so a compile this

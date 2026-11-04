@@ -31,6 +31,10 @@ type Instance struct {
 	// compilation. The CLI compares it before and after a compile request as evidence that a
 	// compile actually ran; 0 means the connector does not report it.
 	CompileFinishedAt int64 `json:"compileFinishedAt,omitempty"`
+	// StartingSince is the connector's wall-clock ms when its listener came up, published while State
+	// is "starting". The startup beater keeps Timestamp fresh through a long import, so this is the
+	// only way to see how long the editor has been stuck before its first update tick.
+	StartingSince int64 `json:"startingSince,omitempty"`
 	// Modal is set while State is "modal": the dialog blocking Unity's main thread.
 	Modal *ModalDialog `json:"modal,omitempty"`
 	// Build is set while State is "building": the player build job holding Unity's main thread.
@@ -434,4 +438,14 @@ func isTimeoutError(err error) bool {
 	}
 	var timeout interface{ Timeout() bool }
 	return errors.As(err, &timeout) && timeout.Timeout()
+}
+
+// StartingFor is how long the editor has been in its "starting" state, measured on the connector's
+// own clock (Timestamp - StartingSince) so a CLI on another machine needs no agreeing clock. ok is
+// false when the editor is not starting or its connector does not publish StartingSince.
+func (inst *Instance) StartingFor() (time.Duration, bool) {
+	if inst == nil || inst.State != "starting" || inst.StartingSince <= 0 || inst.Timestamp < inst.StartingSince {
+		return 0, false
+	}
+	return time.Duration(inst.Timestamp-inst.StartingSince) * time.Millisecond, true
 }

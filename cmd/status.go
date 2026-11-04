@@ -41,7 +41,7 @@ func statusCmd(inst *client.Instance) error {
 	printVersionSummary(os.Stdout, status)
 	fmt.Printf("  PID:     %d\n", status.PID)
 	if isStartingState(status.State) {
-		fmt.Println("  Note:    the HTTP listener is up; the editor has not run its first update tick yet")
+		fmt.Println("  Note:    " + startingNote(status))
 	}
 	if isModal(status) {
 		fmt.Print(describeModal(status.Modal))
@@ -497,4 +497,21 @@ func compileResultLine(hasErrors bool) string {
 		return "Compilation finished with errors."
 	}
 	return "Compilation complete."
+}
+
+// longStartup is when a "starting" editor stops looking like an ordinary cold import. The beater keeps
+// its heartbeat fresh, so age alone never flags a wedged startup.
+const longStartup = 10 * time.Minute
+
+func startingNote(inst *client.Instance) string {
+	note := "the HTTP listener is up; the editor has not run its first update tick yet"
+	age, ok := inst.StartingFor()
+	if !ok {
+		return note
+	}
+	note = fmt.Sprintf("%s (starting for %s)", note, client.FormatAge(age))
+	if age > longStartup {
+		note += "; a cold import can take this long, but if Logs/Editor.log has stopped growing the main thread is wedged — see 'unity-cli dialogs'"
+	}
+	return note
 }
