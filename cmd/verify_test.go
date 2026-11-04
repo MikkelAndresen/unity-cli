@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"reflect"
@@ -122,7 +123,7 @@ func (f *fakeEditor) run(args ...string) (int, string) {
 	statusPollInterval = time.Millisecond
 	defer func() { statusPollInterval = orig }()
 	var out bytes.Buffer
-	code := verifyCmd(args, f.send, f.send, f.resolve, 0, &out)
+	code := verifyCmd(context.Background(), args, f.send, f.send, f.resolve, 0, &out)
 	return code, out.String()
 }
 

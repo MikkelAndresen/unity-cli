@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -8,6 +9,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/youngwoocho02/unity-cli/internal/client"
 )
@@ -25,7 +27,7 @@ var (
 func Execute() error {
 	flag.IntVar(&flagPort, "port", 0, "Select Unity instance by active heartbeat port")
 	flag.StringVar(&flagProject, "project", "", "Select Unity instance by project path")
-	flag.IntVar(&flagTimeout, "timeout", 120000, "Request timeout in milliseconds")
+	flag.IntVar(&flagTimeout, "timeout", defaultRequestTimeoutMs, "Request timeout in milliseconds")
 	flag.BoolVar(&flagIgnoreVersionMismatch, "ignore-version-mismatch", false, "Run even when CLI and connector versions differ")
 	flag.BoolVar(&flagMeta, "meta", false, "Print the connector's response meta (how the call was served) to stderr")
 
@@ -53,6 +55,9 @@ func Execute() error {
 			return nil
 		}
 	}
+
+	signalCtx, stopSignals := installSignalCancellation()
+	defer stopSignals()
 
 	switch category {
 	case "help", "--help", "-h":
@@ -82,14 +87,41 @@ func Execute() error {
 	// verify and wait report an editor that can't answer as exit code 2, not as a CLI error.
 	noEditor := func(err error) error {
 		if category == "verify" || category == waitCategory {
-			os.Exit(verifyExit(os.Stdout, err))
+			exitNow(verifyExit(os.Stdout, err))
 		}
 		return err
+	}
+
+	explicitTimeout := flagWasSet("timeout")
+	effectiveTimeout := effectiveInvocationTimeout(category, subArgs, explicitTimeout)
+
+	// exec's --await_timeout deliberately outlives the normal request budget, so it must be known
+	// before the one invocation deadline is set. Reading stdin here is safe: this branch is the
+	// only one that consumes it.
+	var execParams map[string]interface{}
+	if category == "exec" {
+		subArgs = readStdinIfPiped(subArgs)
+		var parseErr error
+		execParams, parseErr = buildParams(subArgs, nil)
+		if parseErr != nil {
+			return parseErr
+		}
+		effectiveTimeout = execRequestTimeout(effectiveTimeout, execParams)
+	}
+
+	ctx := signalCtx
+	if hasInvocationDeadline(category) && effectiveTimeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, time.Duration(effectiveTimeout)*time.Millisecond)
+		defer cancel()
 	}
 
 	inst, err := client.DiscoverInstance(flagProject, flagPort)
 	if err != nil {
 		return noEditor(annotateNoEditor(err, flagProject, flagPort))
+	}
+	if err := ctx.Err(); err != nil {
+		return noEditor(invocationDeadlineError(category, effectiveTimeout, err))
 	}
 
 	targetProject := flagProject
@@ -104,7 +136,7 @@ func Execute() error {
 		return client.DiscoverInstance(targetProject, 0)
 	}
 
-	alive, err := waitForAlive(resolve, flagTimeout)
+	alive, err := waitForAliveContext(ctx, resolve, remainingTimeoutMs(ctx, effectiveTimeout))
 	if err != nil {
 		return noEditor(annotateNoEditor(err, targetProject, flagPort))
 	}
@@ -116,7 +148,6 @@ func Execute() error {
 		return noEditor(modalBlockedError(alive, category, false))
 	}
 
-	timeout := flagTimeout
 	send := sendWatchingModal(func(command string, params interface{}) (*client.CommandResponse, error) {
 		inst, err := resolve()
 		if err != nil {
@@ -125,7 +156,7 @@ func Execute() error {
 		if err := gate.check(inst); err != nil {
 			return nil, err
 		}
-		return client.Send(inst, command, params, timeout)
+		return client.SendContext(ctx, inst, command, params, remainingTimeoutMs(ctx, flagTimeout))
 	}, resolve)
 
 	var resp *client.CommandResponse
@@ -142,9 +173,9 @@ func Execute() error {
 			return err
 		}
 		testSend := sendWatchingModal(func(command string, params interface{}) (*client.CommandResponse, error) {
-			return client.Send(currentInst, command, params, 0)
+			return client.SendContext(ctx, currentInst, command, params, remainingTimeoutMs(ctx, 0))
 		}, resolve)
-		resp, err = testCmd(subArgs, testSend, currentInst.Port)
+		resp, err = testCmd(ctx, subArgs, testSend, currentInst.Port)
 	case "build":
 		// Polling a build must survive the build itself: the main thread is inside BuildPlayer for
 		// the whole run, so the wait runs on build_status (served off the main thread) with its own
@@ -154,7 +185,7 @@ func Execute() error {
 			if err != nil {
 				return nil, err
 			}
-			return client.Send(currentInst, command, params, buildStatusRequestMs)
+			return client.SendContext(ctx, currentInst, command, params, buildStatusRequestMs)
 		}, resolve)
 		resp, err = buildCmd(subArgs, send, buildPollSend, resolve, os.Stderr)
 	case "verify":
@@ -163,25 +194,15 @@ func Execute() error {
 			return noEditor(resolveErr)
 		}
 		testSend := sendWatchingModal(func(command string, params interface{}) (*client.CommandResponse, error) {
-			return client.Send(currentInst, command, params, 0)
+			return client.SendContext(ctx, currentInst, command, params, remainingTimeoutMs(ctx, 0))
 		}, resolve)
-		os.Exit(verifyCmd(subArgs, send, testSend, resolve, currentInst.Port, os.Stdout))
+		exitNow(verifyCmd(ctx, subArgs, send, testSend, resolve, currentInst.Port, os.Stdout))
 	case waitCategory:
-		os.Exit(waitCmd(subArgs, send, resolve, os.Stdout))
+		exitNow(waitCmd(ctx, subArgs, send, resolve, os.Stdout))
 	case "exec":
-		subArgs = readStdinIfPiped(subArgs)
-		var params map[string]interface{}
-		params, err = buildParams(subArgs, nil)
-		if err == nil {
-			// The connector waits out --await_timeout before answering. Give it the same
-			// budget plus compile slack so the client is never the one that gives up
-			// first — otherwise a long await reports a Go deadline instead of the
-			// connector's timed_out marker.
-			if t := execRequestTimeout(flagTimeout, params); t > timeout {
-				timeout = t
-			}
-			resp, err = send("exec", params)
-		}
+		// --await_timeout already widened the one invocation budget above, so the client never
+		// gives up before the connector's own timed_out marker.
+		resp, err = send("exec", execParams)
 	default:
 		var params map[string]interface{}
 		params, err = buildParams(subArgs, nil)
@@ -202,7 +223,7 @@ func Execute() error {
 	printResponse(resp)
 
 	if !resp.Success {
-		os.Exit(1)
+		exitNow(1)
 	}
 
 	return nil
@@ -307,6 +328,83 @@ func parseFlagArgs(args []string) (flags map[string]string, paramsJSON, position
 		flags[key] = value
 	}
 	return flags, paramsJSON, positional, nil
+}
+
+// defaultRequestTimeoutMs is the normal command budget: discovery, waiting for a fresh
+// heartbeat, and the request itself all draw from this one number.
+const defaultRequestTimeoutMs = 120000
+
+// longCommandTimeoutMs is the default for commands that legitimately run for minutes: test and
+// verify execute the project's tests, and editor refresh --compile waits out a compile. They are
+// bounded rather than accidentally unbounded; --timeout (or an explicit --timeout 0) overrides it.
+const longCommandTimeoutMs = 30 * 60 * 1000
+
+// flagWasSet tells an explicit --timeout from the flag's default, which is what lets test/verify
+// have a long default without changing what a bare --timeout 0 means.
+func flagWasSet(name string) bool {
+	set := false
+	flag.CommandLine.Visit(func(f *flag.Flag) {
+		if f.Name == name {
+			set = true
+		}
+	})
+	return set
+}
+
+func effectiveInvocationTimeout(category string, subArgs []string, explicit bool) int {
+	if explicit {
+		return flagTimeout
+	}
+	if commandRunsLong(category, subArgs) {
+		return longCommandTimeoutMs
+	}
+	return flagTimeout
+}
+
+func commandRunsLong(category string, subArgs []string) bool {
+	if category == "test" || category == "verify" {
+		return true
+	}
+	if category == "editor" && len(subArgs) > 0 && subArgs[0] == "refresh" {
+		for _, a := range subArgs[1:] {
+			if a == "--compile" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// hasInvocationDeadline names the two commands whose own flag is the budget: 'wait --timeout' is
+// seconds of waiting, and a build's polling has to outlast BuildPlayer. Giving either the global
+// request deadline would cut a legitimate run short.
+func hasInvocationDeadline(category string) bool {
+	return category != waitCategory && category != "build"
+}
+
+// remainingTimeoutMs is the budget left for the next request. Without a shared deadline (wait,
+// build) it falls back to the command's own per-request value.
+func remainingTimeoutMs(ctx context.Context, fallback int) int {
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		return fallback
+	}
+	remaining := time.Until(deadline)
+	if remaining <= 0 {
+		return 1
+	}
+	if ms := int(remaining.Milliseconds()); ms > 0 {
+		return ms
+	}
+	return 1
+}
+
+func invocationDeadlineError(category string, timeoutMs int, cause error) error {
+	if cause == context.DeadlineExceeded {
+		return fmt.Errorf("timed out after %s waiting for Unity to answer %s (the editor may still be running it)",
+			(time.Duration(timeoutMs) * time.Millisecond).String(), category)
+	}
+	return fmt.Errorf("request cancelled: %w", cause)
 }
 
 // execRequestTimeout widens the HTTP request timeout so it outlasts the connector's
@@ -631,7 +729,12 @@ Update:
 Global Options:
   --port <N>          Select Unity instance by active heartbeat port
   --project <path>    Select Unity instance by project path
-  --timeout <ms>      Request timeout in ms (default: 120000)
+  --timeout <ms>      One budget per invocation, in ms, shared by discovery, waiting for a fresh
+                      heartbeat, and the request (default: 120000). A client deadline says
+                      "timed out ... (the editor may still be running it)", not "cannot connect".
+                      test, verify and 'editor refresh --compile' default to 1800000 (30 min);
+                      an explicit 0 means no deadline. 'wait --timeout' and build polling keep
+                      their own budgets.
   --ignore-version-mismatch
                       Run even when CLI and connector versions differ
   --meta              Print the response's meta (how the call was served) to stderr
@@ -985,6 +1088,9 @@ Options:
   --allow-dirty-scenes          Run even when open scenes have unsaved changes
   --auto-save-scenes            Save dirty open scenes before running tests
 
+Tests legitimately run for minutes, so this command's invocation budget defaults to 30 minutes
+instead of the global 120 s. --timeout <ms> overrides it; --timeout 0 means no deadline.
+
 EditMode tests hold the connection open and return results directly.
 PlayMode tests return immediately and poll a results file (domain reload safe).
 By default, tests are blocked when any open scene has unsaved changes.
@@ -1042,6 +1148,10 @@ Options:
   --max <n>                     List at most n errors and n failures (default 20)
   --keep-console                Don't clear the console first
   --json                        One JSON object instead of text
+
+verify runs the tests, so its invocation budget defaults to 30 minutes instead of the global
+120 s. --timeout <ms> overrides it; --timeout 0 means no deadline. Keep --timeout above --burst-wait
+when you set it explicitly.
 
 Exit codes:
   0  compiles, Burst is quiet, and every test passes

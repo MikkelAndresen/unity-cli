@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"strings"
@@ -64,7 +65,7 @@ func (f *fakeWait) run(args ...string) (int, string) {
 	waitStaleGrace = 20 * time.Millisecond
 
 	var out bytes.Buffer
-	return waitCmd(args, f.send, f.resolve, &out), out.String()
+	return waitCmd(context.Background(), args, f.send, f.resolve, &out), out.String()
 }
 
 func prov(line string, staleCount int, staleFiles ...string) *compileProvenance {

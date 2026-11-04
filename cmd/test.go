@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -26,7 +27,7 @@ func (s *suppressWriter) Write(p []byte) (int, error) {
 	return s.w.Write(p)
 }
 
-func testCmd(args []string, send sendFn, port int) (*client.CommandResponse, error) {
+func testCmd(ctx context.Context, args []string, send sendFn, port int) (*client.CommandResponse, error) {
 	flags, err := parseSubFlags(args)
 	if err != nil {
 		return nil, err
@@ -86,10 +87,10 @@ func testCmd(args []string, send sendFn, port int) (*client.CommandResponse, err
 	log.SetOutput(&suppressWriter{w: os.Stderr, suppress: "Unsolicited response received on idle HTTP channel"})
 	defer log.SetOutput(original)
 
-	return pollTestResults(port)
+	return pollTestResults(ctx, port)
 }
 
-func pollTestResults(port int) (*client.CommandResponse, error) {
+func pollTestResults(ctx context.Context, port int) (*client.CommandResponse, error) {
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return nil, fmt.Errorf("cannot determine home directory: %w", err)
@@ -99,7 +100,14 @@ func pollTestResults(port int) (*client.CommandResponse, error) {
 	deadline := time.Now().Add(10 * time.Minute)
 
 	for time.Now().Before(deadline) {
-		time.Sleep(500 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			if ctx.Err() == context.DeadlineExceeded {
+				return nil, fmt.Errorf("timed out waiting for test results (--timeout): %w", ctx.Err())
+			}
+			return nil, fmt.Errorf("waiting for test results cancelled: %w", ctx.Err())
+		case <-time.After(500 * time.Millisecond):
+		}
 
 		data, err := os.ReadFile(resultsPath)
 		if err == nil {

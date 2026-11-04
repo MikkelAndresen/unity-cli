@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"os"
@@ -279,6 +280,13 @@ func (g *versionGate) check(inst *client.Instance) error {
 // waitForAlive resolves the current target instance, then polls until a newer heartbeat appears.
 // This keeps following the same project even if Unity rebinds to a new port during reload.
 func waitForAlive(resolve instanceResolver, timeoutMs int) (*client.Instance, error) {
+	return waitForAliveContext(context.Background(), resolve, timeoutMs)
+}
+
+// waitForAliveContext is the same wait, bounded by ctx as well as timeoutMs: the caller's one
+// invocation deadline has to cover discovery and waiting too, or a slow start spends the budget
+// twice. A non-positive timeoutMs means "until ctx is canceled".
+func waitForAliveContext(ctx context.Context, resolve instanceResolver, timeoutMs int) (*client.Instance, error) {
 	baseline := time.Now().UnixMilli()
 	inst, err := resolve()
 	if err == nil {
@@ -294,9 +302,23 @@ func waitForAlive(resolve instanceResolver, timeoutMs int) (*client.Instance, er
 
 	fmt.Fprintf(os.Stderr, "Waiting for Unity...\n")
 
-	deadline := time.Now().Add(time.Duration(timeoutMs) * time.Millisecond)
-	for time.Now().Before(deadline) {
-		time.Sleep(statusPollInterval)
+	var deadline time.Time
+	if timeoutMs > 0 {
+		deadline = time.Now().Add(time.Duration(timeoutMs) * time.Millisecond)
+	}
+	for {
+		if !deadline.IsZero() && !time.Now().Before(deadline) {
+			return nil, waitForAliveTimeout(timeoutMs)
+		}
+		select {
+		case <-ctx.Done():
+			if ctx.Err() == context.DeadlineExceeded {
+				return nil, waitForAliveTimeout(timeoutMs)
+			}
+			return nil, fmt.Errorf("waiting for Unity cancelled: %w", ctx.Err())
+		case <-time.After(statusPollInterval):
+		}
+
 		inst, err = resolve()
 		if err != nil {
 			continue
@@ -309,8 +331,14 @@ func waitForAlive(resolve instanceResolver, timeoutMs int) (*client.Instance, er
 			return nil, err
 		}
 	}
+}
 
-	return nil, fmt.Errorf("timed out waiting for Unity")
+func waitForAliveTimeout(timeoutMs int) error {
+	if timeoutMs <= 0 {
+		return fmt.Errorf("timed out waiting for Unity")
+	}
+	return fmt.Errorf("timed out after %s waiting for Unity to answer (the editor may still be starting or busy)",
+		(time.Duration(timeoutMs) * time.Millisecond).String())
 }
 
 // crashedWhileWaiting answers with the crash report when the heartbeat on disk belongs to an editor
