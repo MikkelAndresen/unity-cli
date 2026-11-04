@@ -10,6 +10,14 @@ namespace UnityCliConnector
         /// The request was accepted, but the editor's main thread never started it. The command did not run.
         public const string MainThreadBusy = "main_thread_busy";
 
+        /// <summary>
+        /// The compile gate refused before the tool handler was entered because the editor is still
+        /// compiling. The command did not run; unlike <see cref="MainThreadBusy"/> this clears by
+        /// itself once the compile (and its reload) finishes, so the CLI repeats the request instead
+        /// of telling the caller to wait.
+        /// </summary>
+        public const string Compiling = "compiling";
+
         /// Unity reloaded or quit while the request was in flight.
         public const string DomainReload = "domain_reload";
 

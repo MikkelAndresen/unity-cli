@@ -3,6 +3,7 @@ package cmd
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -177,14 +178,7 @@ func Execute() error {
 	}
 
 	send := sendWatchingModal(func(command string, params interface{}) (*client.CommandResponse, error) {
-		inst, err := resolve()
-		if err != nil {
-			return nil, err
-		}
-		if err := gate.check(inst); err != nil {
-			return nil, err
-		}
-		return client.SendContext(ctx, inst, command, params, remainingTimeoutMs(ctx, flagTimeout))
+		return sendAfterReload(ctx, resolve, gate, command, params, flagTimeout)
 	}, resolve)
 
 	var resp *client.CommandResponse
@@ -197,11 +191,8 @@ func Execute() error {
 		if resolveErr != nil {
 			return resolveErr
 		}
-		if err := gate.check(currentInst); err != nil {
-			return err
-		}
 		testSend := sendWatchingModal(func(command string, params interface{}) (*client.CommandResponse, error) {
-			return client.SendContext(ctx, currentInst, command, params, remainingTimeoutMs(ctx, 0))
+			return sendAfterReload(ctx, resolve, gate, command, params, 0)
 		}, resolve)
 		resp, err = testCmd(ctx, subArgs, testSend, currentInst.Port)
 	case "build":
@@ -222,7 +213,7 @@ func Execute() error {
 			return noEditor(resolveErr)
 		}
 		testSend := sendWatchingModal(func(command string, params interface{}) (*client.CommandResponse, error) {
-			return client.SendContext(ctx, currentInst, command, params, remainingTimeoutMs(ctx, 0))
+			return sendAfterReload(ctx, resolve, gate, command, params, 0)
 		}, resolve)
 		exitNow(verifyCmd(ctx, subArgs, send, testSend, resolve, currentInst.Port, os.Stdout))
 	case waitCategory:
@@ -296,6 +287,136 @@ func stateNoteApplies(category string) bool {
 // sendFn is the function signature for sending a command to Unity.
 // Injected into each command function so they can be tested without a real Unity connection.
 type sendFn func(command string, params interface{}) (*client.CommandResponse, error)
+
+// retrySafeCommands may be sent again after an answer was lost: they are reads or idempotent
+// diagnostics, so a second delivery cannot apply an effect twice. State-changing commands are not
+// here; those are retried only when the connection never carried the request (RequestNotDelivered).
+var retrySafeCommands = map[string]struct{}{
+	"compile_diagnostics": {},
+	"compile_status":      {},
+	"console":             {},
+	"list":                {},
+	"modal":               {},
+	"status":              {},
+	"tool_describe":       {},
+	"tools":               {},
+}
+
+// sendAfterReload makes one request against the freshest heartbeat and, when the connection died to a
+// reload that moved the port or produced a newer beat, re-resolves and either retries once or tells the
+// caller what to check. It never retries a state-changing command whose request may have been read, and
+// it spends only the invocation's remaining budget (#9).
+func sendAfterReload(ctx context.Context, resolve instanceResolver, gate *versionGate, command string, params interface{}, timeoutMs int) (*client.CommandResponse, error) {
+	inst, err := resolve()
+	if err != nil {
+		return nil, err
+	}
+	if err := gate.check(inst); err != nil {
+		return nil, err
+	}
+
+	resp, err := client.SendContext(ctx, inst, command, params, remainingTimeoutMs(ctx, timeoutMs))
+	if err == nil {
+		if !answerSaysNeverRan(resp) || ctx.Err() != nil {
+			return resp, err
+		}
+		// The connector promises this request never reached a tool handler, so even a
+		// state-changing command can be repeated once. Wait for the reloaded editor to answer
+		// before spending the retry; the invocation's remaining budget bounds the wait.
+		fresh, ready := waitForEditorAnswering(ctx, resolve, time.Duration(remainingTimeoutMs(ctx, timeoutMs))*time.Millisecond)
+		if !ready {
+			return resp, nil
+		}
+		if err := gate.check(fresh); err != nil {
+			return resp, err
+		}
+		return client.SendContext(ctx, fresh, command, params, remainingTimeoutMs(ctx, timeoutMs))
+	}
+	if ctx.Err() != nil {
+		return resp, err
+	}
+
+	var failure *client.ConnectionFailure
+	if !errors.As(err, &failure) || failure.Class != client.FailureReload {
+		return resp, err
+	}
+
+	if _, safe := retrySafeCommands[command]; safe {
+		// The heartbeat can still say "reloading" when the old listener drops the connection, and a
+		// retry sent then only earns another refusal. Wait for a fresh idle beat first; the
+		// invocation's remaining budget bounds the wait, after which the original error stands.
+		fresh, ready := waitForEditorAnswering(ctx, resolve, time.Duration(remainingTimeoutMs(ctx, timeoutMs))*time.Millisecond)
+		if !ready {
+			return resp, err
+		}
+		if err := gate.check(fresh); err != nil {
+			return resp, err
+		}
+		return client.SendContext(ctx, fresh, command, params, remainingTimeoutMs(ctx, timeoutMs))
+	}
+
+	fresh := client.ReconnectInstance(inst)
+	if fresh == nil || (fresh.Port == inst.Port && fresh.Timestamp <= inst.Timestamp) {
+		return resp, err
+	}
+
+	if !client.RequestNotDelivered(err) {
+		return resp, fmt.Errorf("%w\n  retry:      the editor reloaded and now listens on port %d; the %s may have run — check before retrying", err, fresh.Port, command)
+	}
+	if err := gate.check(fresh); err != nil {
+		return resp, err
+	}
+	return client.SendContext(ctx, fresh, command, params, remainingTimeoutMs(ctx, timeoutMs))
+}
+
+// answerSaysNeverRan reports the connector's own guarantee that the tool handler was never entered:
+// a domain reload interrupted a request while it was still queued, or the compile gate refused
+// before dispatch. `started` must say so explicitly; a missing flag cannot distinguish "never ran"
+// from "ran and lost its answer".
+func answerSaysNeverRan(resp *client.CommandResponse) bool {
+	if resp == nil || resp.Success {
+		return false
+	}
+	switch client.ConnectorErrorCode(resp) {
+	case codeDomainReload, codeCompiling:
+	default:
+		return false
+	}
+	started, ok := client.ConnectorResponseStarted(resp)
+	return ok && !started
+}
+
+// waitForEditorAnswering polls until discovery finds a fresh heartbeat in an idle state. A
+// never-ran answer (reload or compile gate) and a safe command's EOF can both arrive while the old
+// record still says "reloading" or "compiling"; sending the retry then only earns another refusal.
+// It is bounded by both budget and ctx, so the retry never outlives the invocation deadline.
+func waitForEditorAnswering(ctx context.Context, resolve instanceResolver, budget time.Duration) (*client.Instance, bool) {
+	deadline := time.Now().Add(budget)
+	if d, ok := ctx.Deadline(); ok && d.Before(deadline) {
+		deadline = d
+	}
+
+	for {
+		inst, err := resolve()
+		if err == nil && isIdleState(inst.State) && heartbeatAge(inst) <= staleHeartbeatAge {
+			return inst, true
+		}
+
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return nil, false
+		}
+		step := statusPollInterval
+		if step > remaining {
+			step = remaining
+		}
+		select {
+		case <-ctx.Done():
+			return nil, false
+		case <-time.After(step):
+		}
+	}
+}
 
 func printResponse(resp *client.CommandResponse) {
 	printResponseTo(os.Stdout, resp)

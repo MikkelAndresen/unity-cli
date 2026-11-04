@@ -9,6 +9,7 @@ import (
 // the caller should do next.
 const (
 	codeMainThreadBusy      = "main_thread_busy"
+	codeCompiling           = "compiling"
 	codeDomainReload        = "domain_reload"
 	codeReloadDuringCommand = "reload_during_command"
 	codeSerializationFail   = "serialization_failed"
@@ -21,6 +22,8 @@ func connectorErrorHint(resp *client.CommandResponse) string {
 	switch client.ConnectorErrorCode(resp) {
 	case codeMainThreadBusy:
 		return "the command did not run and nothing changed; run 'unity-cli wait' until the editor is idle, then repeat it"
+	case codeCompiling:
+		return "the command did not run; the editor is still compiling, so run 'unity-cli wait' until it is idle, then repeat it"
 	case codeDomainReload:
 		return "the command did not reach a tool handler; run 'unity-cli wait' for the reloaded editor, then repeat it"
 	case codeReloadDuringCommand:

@@ -69,6 +69,10 @@ namespace UnityCliConnector
 					"Editor is currently compiling — retry shortly.",
 					new
 					{
+						// The gate runs before dispatch, so the tool was never entered. `started:false` plus
+						// the code let the CLI wait out the compile and repeat any command, including exec.
+						code = ErrorCodes.Compiling,
+						started = false,
 						compiling = true,
 						console_fallback_available = ConsoleLogEntries.IsAvailable,
 						console_fallback_error = ConsoleLogEntries.InitError
