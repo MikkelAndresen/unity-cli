@@ -582,6 +582,7 @@ Execute C#:
   exec "<code>"                 Run C# code in Unity (return required for output)
   echo '<code>' | exec          Pipe code via stdin (avoids shell escaping)
   exec "<code>" --usings x,y    Add extra using directives
+  exec "<code>" --no_default_usings     Drop the default usings and aliases
   exec "<code>" --await_timeout 60000   Wait longer for a Task/coroutine to finish
 
   Examples:
@@ -881,9 +882,13 @@ Execute C# code inside Unity Editor. Full access to UnityEngine,
 UnityEditor, and all loaded assemblies.
 
 Use 'return' to get output. Add --usings for types outside default namespaces.
+Using directives at the top of the snippet are moved above the generated method,
+and an alias there overrides the matching default alias.
 
 Options:
-  --usings <ns1,ns2>   Add extra using directives
+  --usings <ns1,ns2>   Add extra using directives (namespaces or "A = B" aliases)
+  --no_default_usings  Drop the default usings and aliases; combine with --usings
+                       to supply the whole set
   --await_timeout <ms> Max ms to await a returned Task / pump a returned coroutine
                        (default 30000; 0 or negative waits forever)
   --csc <path>         Path to csc compiler (csc.dll or csc.exe). Auto-detected if omitted.
@@ -894,6 +899,8 @@ Default usings: System, System.Collections, System.Collections.Generic,
   System.IO, System.Linq, System.Reflection, System.Threading.Tasks, UnityEngine,
   UnityEngine.SceneManagement, UnityEditor, UnityEditor.SceneManagement,
   UnityEditorInternal
+Default aliases: Object = UnityEngine.Object, Random = UnityEngine.Random,
+  Debug = UnityEngine.Debug
 
 Examples:
   unity-cli exec "return 1+1;"
@@ -901,6 +908,8 @@ Examples:
   echo 'return EditorSceneManager.GetActiveScene().name;' | unity-cli exec
   echo 'Debug.Log("hello"); return null;' | unity-cli exec
   unity-cli exec "return World.All.Count;" --usings Unity.Entities
+  unity-cli exec "using Object = System.Object; return typeof(Object).FullName;"
+  unity-cli exec "return typeof(Object).FullName;" --no_default_usings --usings System
   unity-cli exec "await Task.Delay(100); return 1;"
   unity-cli exec "return Task.Run(() => AssetDatabase.Refresh());" --await_timeout 60000
 

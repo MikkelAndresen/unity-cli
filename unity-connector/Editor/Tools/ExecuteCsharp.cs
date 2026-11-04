@@ -4,7 +4,6 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Reflection;
-using System.Text;
 using System.Text.RegularExpressions;
 using System.Threading.Tasks;
 using Newtonsoft.Json.Linq;
@@ -19,8 +18,6 @@ namespace UnityCliConnector.Tools
         // The 30000 mirrors the csc wait the old synchronous compile used, so a slow
         // compile still answers instead of hanging the request.
         private const int CompileTimeoutMs = 30000;
-
-        private const string SourceTypeName = "__CliDynamic";
 
         // An off-main-thread await only resumes on the editor thread while this domain's
         // synchronization context is pumping; a reload mid-await leaves the continuation on
@@ -42,22 +39,6 @@ namespace UnityCliConnector.Tools
         private static string s_CscPath;
         private static string s_DotnetPath;
 
-        private static readonly string[] DefaultUsings =
-        {
-            "System",
-            "System.Collections",
-            "System.Collections.Generic",
-            "System.IO",
-            "System.Linq",
-            "System.Reflection",
-            "System.Threading.Tasks",
-            "UnityEngine",
-            "UnityEngine.SceneManagement",
-            "UnityEditor",
-            "UnityEditor.SceneManagement",
-            "UnityEditorInternal",
-        };
-
         public class Parameters
         {
             [ToolParameter("C# code to execute. Use 'return' for output.", Required = true)]
@@ -65,6 +46,9 @@ namespace UnityCliConnector.Tools
 
             [ToolParameter("Additional using directives (comma-separated, e.g. Unity.Entities,Unity.Mathematics)")]
             public string[] Usings { get; set; }
+
+            [ToolParameter("Drop the default using directives and aliases; combine with --usings to supply the whole set")]
+            public bool NoDefaultUsings { get; set; }
 
             [ToolParameter("Path to csc compiler (csc.dll or csc.exe). Auto-detected if omitted.")]
             public string Csc { get; set; }
@@ -96,14 +80,14 @@ namespace UnityCliConnector.Tools
                     extraUsings.AddRange(usingsToken.ToString().Split(','));
             }
 
+            var includeDefaults = !(p.GetBool("no_default_usings") || p.GetBool("noDefaultUsings"));
             var cscPath = p.Get("csc");
             var dotnetPath = p.Get("dotnet");
             var awaitTimeout = p.GetInt("await_timeout") ?? p.GetInt("awaitTimeout") ?? ExecAwait.DefaultTimeoutMs;
-            return await CompileAndExecute(BuildSource(code, extraUsings, DetectBodyKind(code)),
+            return await CompileAndExecute(
+                ExecSource.Build(code, extraUsings, includeDefaults, DetectBodyKind(code)),
                 cscPath, dotnetPath, awaitTimeout);
         }
-
-        private enum BodyKind { Sync, Async, Iterator }
 
         /// <summary>
         /// Picks the signature the body is compiled into. Only the keywords the body
@@ -112,39 +96,11 @@ namespace UnityCliConnector.Tools
         /// unless the submitted code asks for it. A body that merely *returns* a Task
         /// needs no special signature — ExecAwait unwraps it after invocation.
         /// </summary>
-        private static BodyKind DetectBodyKind(string code)
+        private static ExecSource.BodyKind DetectBodyKind(string code)
         {
-            if (Regex.IsMatch(code, @"\byield\s+(return|break)\b")) return BodyKind.Iterator;
-            if (Regex.IsMatch(code, @"\b(await|async)\b")) return BodyKind.Async;
-            return BodyKind.Sync;
-        }
-
-        private static string BuildSource(string code, List<string> extraUsings, BodyKind kind)
-        {
-            var sb = new StringBuilder();
-            foreach (var u in DefaultUsings)
-                sb.AppendLine($"using {u};");
-            foreach (var u in extraUsings)
-                sb.AppendLine($"using {u};");
-
-            sb.AppendLine();
-            sb.AppendLine($"public static class {SourceTypeName} {{");
-            switch (kind)
-            {
-                case BodyKind.Iterator:
-                    sb.AppendLine("  public static System.Collections.IEnumerator Execute() {");
-                    break;
-                case BodyKind.Async:
-                    sb.AppendLine("  public static async System.Threading.Tasks.Task<object> Execute() {");
-                    break;
-                default:
-                    sb.AppendLine("  public static object Execute() {");
-                    break;
-            }
-            sb.AppendLine(code);
-            sb.AppendLine("  }");
-            sb.AppendLine("}");
-            return sb.ToString();
+            if (Regex.IsMatch(code, @"\byield\s+(return|break)\b")) return ExecSource.BodyKind.Iterator;
+            if (Regex.IsMatch(code, @"\b(await|async)\b")) return ExecSource.BodyKind.Async;
+            return ExecSource.BodyKind.Sync;
         }
 
         /// <summary>
@@ -239,7 +195,7 @@ namespace UnityCliConnector.Tools
                         { meta = CompileMeta("interrupted", compileMs, references.Count) };
 
                 var assembly = Assembly.Load(compiled.Bytes);
-                method = assembly.GetType(SourceTypeName)?.GetMethod("Execute");
+                method = assembly.GetType(ExecSource.TypeName)?.GetMethod("Execute");
                 if (method == null)
                     return new ErrorResponse("Internal error: compiled type or method not found.")
                         { meta = CompileMeta("compiled", compileMs, references.Count) };
