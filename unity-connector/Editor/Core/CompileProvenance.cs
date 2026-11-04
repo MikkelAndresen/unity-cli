@@ -119,6 +119,10 @@ namespace UnityCliConnector
             return BuildPayloadFrom(s_Record, s, NowMs());
         }
 
+        /// The provenance sentence without the source scan, for callers that only need to say
+        /// how old the compile behind an answer is (the compile gate's error message).
+        public static string DescribeLastCompile() => FormatProvenanceLine(s_Record, null, NowMs());
+
         internal static object BuildPayloadFrom(Record record, SourceScan scan, long nowMs)
         {
             var ageMs = record.finished_at_ms > 0 ? Math.Max(0, nowMs - record.finished_at_ms) : 0;

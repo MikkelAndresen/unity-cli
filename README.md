@@ -153,7 +153,7 @@ and states that the command did not run. A request still queued when Unity reloa
 | `editor` | Play/stop/pause/refresh the Unity Editor |
 | `input` | Inject new-Input-System keyboard/mouse/gamepad/touch state in Play mode and pump the player loop |
 | `console` | Read, filter, and clear console logs (newest 50 entries, capped stack traces) |
-| `exec` | Run arbitrary C# code inside Unity |
+| `exec` | Run arbitrary C# code inside Unity (`--skip_compile_check` bypasses the compile gate) |
 | `api` | What a loaded type or member actually is: kind, assembly, and C# signatures of every overload |
 | `test` | Run EditMode/PlayMode tests |
 | `verify` | Compile, list errors in your code, run tests: one call, brief output |
@@ -362,6 +362,8 @@ Use `return` to get output. Common namespaces are included by default. Add `--us
 
 `System` and `UnityEngine` both define `Object`, `Random`, and `Debug`, so those names resolve through default aliases to the Unity types instead of failing with CS0104. A `using` directive at the top of the snippet is moved above the generated method, and your own alias wins over the default one. To replace the default set completely, pass `--no_default_usings` (the default imports and aliases are dropped) and list what you want with `--usings`.
 
+**Compile gate.** Every tool runs behind a compile check, so a project that does not currently compile answers with the errors instead of running the call. The check only uses the current compile: live compiler diagnostics plus console entries from that compile, not old console lines or a failed build. When it blocks, the error names the first three diagnostics (`file:line:col CODE message`), says how old the compile is, and repeats the escape hatch. Pass `--skip_compile_check` (or `--params '{"skip_compile_check":true}'`) to run anyway — useful for diagnostics or to edit the source from `exec`.
+
 ```bash
 unity-cli exec "return Application.dataPath;"
 unity-cli exec "return EditorSceneManager.GetActiveScene().name;"
@@ -369,6 +371,7 @@ unity-cli exec "return World.All.Count;" --usings Unity.Entities
 unity-cli exec "return typeof(Object).FullName;"                  # UnityEngine.Object
 unity-cli exec "using Object = System.Object; return typeof(Object).FullName;"   # System.Object
 unity-cli exec "return typeof(Object).FullName;" --no_default_usings --usings System
+unity-cli exec "return 1;" --skip_compile_check                 # run while the project has compile errors
 
 # Pipe via stdin to avoid shell escaping issues
 echo 'Debug.Log("hello"); return null;' | unity-cli exec

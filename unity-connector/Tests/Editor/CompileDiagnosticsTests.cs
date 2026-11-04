@@ -13,6 +13,7 @@ namespace UnityCliConnector.Tests
         public void SetUp()
         {
             CompilationGate.ResetForTests();
+            CompilationGate.FileExistsForTests = _ => true;
             ConsoleLogEntries.TestOverride = _ => new List<ConsoleLogEntries.CompileDiag>();
         }
 

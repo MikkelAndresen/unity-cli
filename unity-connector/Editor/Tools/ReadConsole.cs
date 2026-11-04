@@ -23,6 +23,7 @@ namespace UnityCliConnector.Tools
         private const int DefaultMaxBytes = 15360;
 
         private static MethodInfo _startGettingEntriesMethod, _endGettingEntriesMethod, _clearMethod, _getCountMethod, _getEntryMethod;
+        private static MethodInfo _getEntryTimestampMethod;
         private static FieldInfo _modeField, _messageField, _fileField, _lineField;
         private static Type _logEntryType;
         private static PropertyInfo _consoleFlagsProperty;
@@ -47,6 +48,8 @@ namespace UnityCliConnector.Tools
                     ?? throw new Exception("Method not found: LogEntries.GetCount");
                 _getEntryMethod = logEntriesType.GetMethod("GetEntryInternal", sf)
                     ?? throw new Exception("Method not found: LogEntries.GetEntryInternal");
+                // Optional: used to tell a current compile error from a stale console entry.
+                _getEntryTimestampMethod = logEntriesType.GetMethod("GetEntryTimestampInternal", sf);
 
                 // Optional: older Unity versions may not expose the Console window filter. The read
                 // still works then, it just cannot widen what the window is currently showing.
@@ -67,6 +70,7 @@ namespace UnityCliConnector.Tools
             {
                 Debug.LogError($"[UnityCliConnector] ReadConsole init failed: {e.Message}");
                 _startGettingEntriesMethod = _endGettingEntriesMethod = _clearMethod = _getCountMethod = _getEntryMethod = null;
+                _getEntryTimestampMethod = null;
                 _modeField = _messageField = _fileField = _lineField = null;
                 _logEntryType = null;
                 _consoleFlagsProperty = null;
@@ -405,6 +409,14 @@ namespace UnityCliConnector.Tools
         internal static bool TryForEachEntry(Action<int, string, string, int> visitor)
         {
             if (visitor == null) throw new ArgumentNullException(nameof(visitor));
+            return TryForEachEntry((mode, message, file, line, _) => visitor(mode, message, file, line));
+        }
+
+        /// Same iteration, also passing the entry's console timestamp (null when the Unity
+        /// version does not expose GetEntryTimestampInternal).
+        internal static bool TryForEachEntry(Action<int, string, string, int, string> visitor)
+        {
+            if (visitor == null) throw new ArgumentNullException(nameof(visitor));
             if (_startGettingEntriesMethod == null || _endGettingEntriesMethod == null ||
                 _getCountMethod == null || _getEntryMethod == null ||
                 _modeField == null || _messageField == null || _logEntryType == null)
@@ -423,7 +435,18 @@ namespace UnityCliConnector.Tools
                     string message = _messageField.GetValue(logEntry) as string;
                     string file = _fileField?.GetValue(logEntry) as string;
                     int line = _lineField != null ? (int)_lineField.GetValue(logEntry) : 0;
-                    visitor(mode, message, file, line);
+                    string timestamp = null;
+                    if (_getEntryTimestampMethod != null)
+                    {
+                        try
+                        {
+                            var args = new object[] { i, null };
+                            _getEntryTimestampMethod.Invoke(null, args);
+                            timestamp = args[1] as string;
+                        }
+                        catch { }
+                    }
+                    visitor(mode, message, file, line, timestamp);
                 }
                 return true;
             }

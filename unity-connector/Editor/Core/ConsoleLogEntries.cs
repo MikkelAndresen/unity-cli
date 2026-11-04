@@ -43,6 +43,10 @@ namespace UnityCliConnector
 			@"^(?<file>[^()]+)\((?<line>\d+),(?<col>\d+)\):\s+(?<sev>error|warning)\s+(?<code>[A-Z]+\d+):\s*(?<msg>.+)$",
 			RegexOptions.Compiled);
 
+		// Unity's GetEntryTimestampInternal prefixes the message with e.g. "[07:20:09]".
+		private static readonly Regex TimestampPattern = new(
+			@"^\s*\[(?<h>\d{1,2}):(?<m>\d{2}):(?<s>\d{2})\]", RegexOptions.Compiled);
+
 		public static bool IsAvailable => ReadConsole.IsReflectionAvailable;
 		public static string InitError => IsAvailable ? null : "ReadConsole reflection unavailable";
 
@@ -57,9 +61,9 @@ namespace UnityCliConnector
 			var result = new List<CompileDiag>();
 			diagnostics = result;
 
-			return ReadConsole.TryForEachEntry((mode, message, file, line) =>
+			return ReadConsole.TryForEachEntry((mode, message, file, line, timestamp) =>
 			{
-				if (TryConvertEntry(mode, message, file, line, includeWarnings, out var diag))
+				if (TryConvertEntry(mode, message, file, line, includeWarnings, out var diag, timestamp))
 					result.Add(diag);
 			});
 		}
@@ -77,7 +81,7 @@ namespace UnityCliConnector
 		/// an empty message. Extracted so tests can exercise the mode-bit filtering
 		/// without faking out the LogEntries API.
 		internal static bool TryConvertEntry(int mode, string message, string file, int line,
-			bool includeWarnings, out CompileDiag diag)
+			bool includeWarnings, out CompileDiag diag, string timestamp = null)
 		{
 			diag = default;
 			var isError = (mode & CompileBlockingMask) != 0;
@@ -85,7 +89,22 @@ namespace UnityCliConnector
 			if (!isError && !(includeWarnings && isWarning)) return false;
 			if (string.IsNullOrEmpty(message)) return false;
 			diag = Parse(message, file, line, isError);
+			diag.Sticky = (mode & StickyErrorMask) != 0;
+			diag.TimeOfDaySeconds = ParseTimestampSeconds(timestamp);
+			diag.HasTimestamp = diag.TimeOfDaySeconds >= 0;
 			return true;
+		}
+
+		internal static long ParseTimestampSeconds(string timestamp)
+		{
+			if (string.IsNullOrEmpty(timestamp)) return -1;
+			var m = TimestampPattern.Match(timestamp);
+			if (!m.Success) return -1;
+			var h = int.Parse(m.Groups["h"].Value);
+			var min = int.Parse(m.Groups["m"].Value);
+			var s = int.Parse(m.Groups["s"].Value);
+			if (h > 23 || min > 59 || s > 59) return -1;
+			return h * 3600L + min * 60L + s;
 		}
 
 		internal static CompileDiag Parse(string fullMessage, string fileFallback, int lineFallback, bool isError)
@@ -142,6 +161,11 @@ namespace UnityCliConnector
 			/// <summary>What the caller should write instead, for the codes where that is knowable
 			/// (see <see cref="CompileHints"/>). Null when there is nothing close to suggest.</summary>
 			public string Hint;
+			/// <summary>Sticky console entry (build/runtime failure banner), not a compiler diagnostic.</summary>
+			public bool Sticky;
+			/// <summary>Local time of day from LogEntries.GetEntryTimestampInternal; -1 is unknown.</summary>
+			public long TimeOfDaySeconds;
+			public bool HasTimestamp;
 		}
 	}
 }
