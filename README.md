@@ -315,7 +315,8 @@ unity-cli input key Space press
 unity-cli input key Space release
 unity-cli input key W tap --hold_ms 200
 
-# Mouse: Game view pixels (0,0 is the top-left of the Game View), deltas, buttons, wheel
+# Mouse: Game view pixels (0,0 is the top-left of the Game View), deltas, buttons, wheel.
+# --dx/--dy are screen deltas: positive moves right and DOWN, like a screenshot.
 unity-cli input mouse --x 100 --y 200
 unity-cli input mouse --dx 10 --dy -4
 unity-cli input mouse --button left --mode click
@@ -328,7 +329,7 @@ unity-cli input gamepad --control leftTrigger --value 0.6
 unity-cli input gamepad --control buttonSouth --mode tap
 unity-cli input axis --control dpad --x 1 --y 0
 
-# Touch: virtual Touchscreen added on demand
+# Touch: same Game view pixels as mouse; a virtual Touchscreen is added on demand
 unity-cli input touch --x 64 --y 128 --mode tap
 
 # What the Input System currently sees, plus focus and InputSettings state
@@ -340,11 +341,13 @@ unity-cli input reset
 
 `input` writes device state instead of sending OS keystrokes: it queues a `StateEvent` built from the
 device's current state with one control overwritten (so other keys, the mouse position and the other
-stick survive), runs `InputSystem.Update()`, then pumps the player loop
-(`EditorApplication.QueuePlayerLoopUpdate` plus a repaint) so game code sees the change in the same
-call. Positional shorthand works (`unity-cli input key Space press` — the key and mode are taken by
-content, so either order reads the same) and flags always win over positional values. Only `state`
-and `reset` work outside play mode.
+stick survive) and pumps the player loop (`EditorApplication.QueuePlayerLoopUpdate` plus a repaint) so
+the player update consumes the event and game code sees it in the same call — including
+`wasPressedThisFrame`/`wasReleasedThisFrame`. State is read back with one tool update after the pump;
+with `--pump_frames 0` that readback is the only update, so game code does not see a fresh edge.
+Positional shorthand works (`unity-cli input key Space press` — the key and mode are taken by content,
+so either order reads the same) and flags always win over positional values. Only `state` and `reset`
+work outside play mode.
 
 Injected events are visible to the **new Input System** (`UnityEngine.InputSystem`, `InputAction`s on
 it) and never to legacy `UnityEngine.Input` or IMGUI `Event` code; every injection response repeats
@@ -355,8 +358,9 @@ Response fields:
 | Field | Meaning |
 |-------|---------|
 | `consumed` | The device state now matches the request — `isPressed`/`value` read back after the pump |
-| `fresh_press_frames`, `fresh_release_frames` | How many input updates reported the control as freshly pressed/released. This is the view game code gets in `Update()` via `wasPressedThisFrame`/`wasReleasedThisFrame` |
+| `fresh_press_frames`, `fresh_release_frames` | How many player-loop input updates reported the control as freshly pressed/released — the view game code gets in `Update()` via `wasPressedThisFrame`/`wasReleasedThisFrame`. The tool's own readback updates are not counted |
 | `held_state`, `state` | The control read back while held, and after the final pump |
+| `position`, `space` | For mouse/touch: the position in the same space the caller used, `top_left_px` (Game view pixels, 0,0 at the top-left) |
 | `focus.game_view_focused` | A Game View window currently has editor focus |
 | `focus.application_is_focused` | The flag the Input System's own focus gating reads; it can be true while the editor is not frontmost |
 | `focus.editor_focused` | Unity is the frontmost application (`EditorApplication.isFocused`) |
@@ -370,6 +374,12 @@ loss, which is what made queued events look dropped. The saved values are report
 and are restored when nothing is held anymore, by `input reset`, and when play mode exits. If the
 project sets `InputSettings.UpdateMode.ProcessEventsManually`, the tool leaves `InputSystem.Update()`
 to the game instead of calling it itself.
+
+Mouse and touch coordinates are Game view pixels with `(0,0)` at the top-left, matching a screenshot:
+`--dy` and `--y` grow downward. The tool converts the top edge to the Input System's bottom-left screen
+space using the Game view render height (the value `Screen.height` reports once the player loop has
+rendered), and echoes positions back in `top_left_px` space. `input state` reports mouse/touch positions
+in the same space under `position_space: top_left_px`.
 
 Injected state is *device state*, so the device's own backend can overwrite it later — a real mouse
 move replaces an injected position, for example. Read `input state` right after injecting, or inject

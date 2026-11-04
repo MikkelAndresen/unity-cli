@@ -1,11 +1,12 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Threading;
 using System.Threading.Tasks;
 using UnityEditor;
-using UnityEditorInternal;
 using UnityEngine;
 using UnityEngine.InputSystem;
+using UnityEngine.InputSystem.LowLevel;
 
 namespace UnityCliConnector.Tools
 {
@@ -30,17 +31,25 @@ namespace UnityCliConnector.Tools
         private const InputSettings.BackgroundBehavior IgnoreGameViewFocus =
             InputSettings.BackgroundBehavior.IgnoreFocus;
 
-        // A play loop that never ticks (paused, or an editor that stopped updating) must not hang the call.
+        // A play loop that never ticks (paused, or an editor that stopped updating) must not leave the
+        // pump task pending; the watchdog completes it from a timer. A main thread blocked outright still
+        // cannot carry any command's answer back to the CLI.
         private const double PumpSafetyTimeoutSeconds = 5.0;
 
         private static InputSettings.EditorInputBehaviorInPlayMode? s_SavedEditorBehavior;
         private static InputSettings.BackgroundBehavior? s_SavedBackgroundBehavior;
         private static readonly HashSet<(InputDevice device, InputControl control)> s_HeldControls = new();
+        private static readonly Dictionary<(InputDevice device, InputControl control), TouchState> s_HeldTouchStates = new();
         private static readonly List<InputDevice> s_AddedDevices = new();
         private static readonly List<InputDevice> s_WrittenDevices = new();
         private static bool s_HandlersRegistered;
+        private static int s_PumpDepth;
 
         public static bool HasSettingsOverride => s_SavedEditorBehavior.HasValue;
+
+        // True while PumpPlayerLoopAsync is waiting on a player-loop update; the fresh-press counters
+        // use it to ignore the tool's own readback updates.
+        public static bool IsPumpingPlayerLoop => s_PumpDepth > 0;
 
         public static IReadOnlyList<InputDevice> AddedDevices => s_AddedDevices;
 
@@ -66,12 +75,14 @@ namespace UnityCliConnector.Tools
                     RemoveAddedDevices();
                     PruneRemovedDevices(s_WrittenDevices);
                     s_HeldControls.Clear();
+                    s_HeldTouchStates.Clear();
                     break;
                 case PlayModeStateChange.EnteredEditMode:
                     RestoreSettings();
                     RemoveAddedDevices();
                     PruneRemovedDevices(s_WrittenDevices);
                     s_HeldControls.Clear();
+                    s_HeldTouchStates.Clear();
                     break;
             }
         }
@@ -120,6 +131,17 @@ namespace UnityCliConnector.Tools
         public static void NoteReleased(InputDevice device, InputControl control)
         {
             s_HeldControls.Remove((device, control));
+            s_HeldTouchStates.Remove((device, control));
+        }
+
+        public static void NoteTouchState(InputDevice device, InputControl control, TouchState state)
+        {
+            s_HeldTouchStates[(device, control)] = state;
+        }
+
+        public static bool TryGetTouchState(InputDevice device, InputControl control, out TouchState state)
+        {
+            return s_HeldTouchStates.TryGetValue((device, control), out state);
         }
 
         public static void RestoreSettingsIfIdle()
@@ -130,6 +152,7 @@ namespace UnityCliConnector.Tools
         public static void ClearHeldControls()
         {
             s_HeldControls.Clear();
+            s_HeldTouchStates.Clear();
         }
 
         public static object SettingsOverrideData()
@@ -211,19 +234,25 @@ namespace UnityCliConnector.Tools
         /// injection stays pressed for the requested duration before its release is queued.
         /// Completes on the next EditorApplication.update that satisfies both the frame count and the hold time.
         /// </summary>
-        public static Task PumpPlayerLoopAsync(int frames, double holdMilliseconds)
+        public static async Task PumpPlayerLoopAsync(int frames, double holdMilliseconds)
         {
             var targetFrames = Math.Max(0, frames);
             var holdSeconds = Math.Max(0, holdMilliseconds) * 0.001;
-            if (targetFrames == 0 && holdSeconds <= 0) return Task.CompletedTask;
-            if (!EditorApplication.isPlaying) return Task.CompletedTask;
+            if (targetFrames == 0 && holdSeconds <= 0) return;
+            if (!EditorApplication.isPlaying) return;
 
             var tcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
             var start = EditorApplication.timeSinceStartup;
             var remaining = targetFrames;
+            var finished = false;
 
             void Tick()
             {
+                if (finished)
+                {
+                    EditorApplication.update -= Tick;
+                    return;
+                }
                 if (!EditorApplication.isPlaying)
                 {
                     Finish();
@@ -243,25 +272,34 @@ namespace UnityCliConnector.Tools
 
             void Finish()
             {
-                EditorApplication.update -= Tick;
+                if (finished) return;
+                finished = true;
+                // The watchdog below calls this from a thread-pool thread, where touching
+                // EditorApplication.update is not allowed; the next Tick or the finally detaches it.
                 tcs.TrySetResult(true);
             }
 
-            PumpOneTick();
-            EditorApplication.update += Tick;
-            return tcs.Task;
+            ++s_PumpDepth;
+            try
+            {
+                PumpOneTick();
+                EditorApplication.update += Tick;
+                // Bound the wait by wall-clock time so a tick-less editor cannot leave the call pending.
+                using var watchdog = new Timer(_ => Finish(), null,
+                    TimeSpan.FromSeconds(PumpSafetyTimeoutSeconds + holdSeconds), Timeout.InfiniteTimeSpan);
+                await tcs.Task;
+            }
+            finally
+            {
+                finished = true;
+                EditorApplication.update -= Tick;
+                --s_PumpDepth;
+            }
         }
 
         private static void PumpOneTick()
         {
-            try { EditorApplication.QueuePlayerLoopUpdate(); }
-            catch (Exception)
-            {
-            }
-            try { InternalEditorUtility.RepaintAllViews(); }
-            catch (Exception)
-            {
-            }
+            HttpServer.RequestEditorUpdate();
         }
 
         /// <summary>

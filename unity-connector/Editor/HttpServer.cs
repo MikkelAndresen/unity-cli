@@ -235,13 +235,15 @@ namespace UnityCliConnector
 
         static void ForceEditorUpdate()
         {
-            s_MainContext?.Post(_ =>
-            {
-                try { EditorApplication.QueuePlayerLoopUpdate(); }
-                catch { }
-                try { UnityEditorInternal.InternalEditorUtility.RepaintAllViews(); }
-                catch { }
-            }, null);
+            s_MainContext?.Post(_ => RequestEditorUpdate(), null);
+        }
+
+        internal static void RequestEditorUpdate()
+        {
+            try { EditorApplication.QueuePlayerLoopUpdate(); }
+            catch { }
+            try { UnityEditorInternal.InternalEditorUtility.RepaintAllViews(); }
+            catch { }
         }
 
         static void ProcessQueue()

@@ -69,6 +69,7 @@ namespace UnityCliConnector.Tools
 
         private static readonly string[] KeyModes = { "press", "release", "tap" };
         private static readonly string[] MousePositionModes = { "move", "set" };
+        private static readonly string[] MouseScrollModes = { "set" };
         private static readonly string[] MouseButtonModes = { "press", "release", "tap", "click" };
         private static readonly string[] GamepadModes = { "set", "press", "release", "tap" };
 
@@ -164,8 +165,6 @@ namespace UnityCliConnector.Tools
             }
         }
 
-        // ---- actions ----------------------------------------------------------------------------
-
         private static async Task<object> InjectKeyAsync(ToolParams p, JArray args)
         {
             var keyName = Arg(p, args, "key", 1);
@@ -228,12 +227,12 @@ namespace UnityCliConnector.Tools
                 identity["button"] = button.name;
             }
 
-            var position = ResolveRequestedPosition(mouse, p);
-            if (position.HasValue)
+            if (TryResolveRequestedPosition(mouse, p, out var pointerPosition, out var topLeft))
             {
-                var write = ControlWrite.Vector(position.Value.x, position.Value.y);
+                var write = ControlWrite.Vector(pointerPosition.x, pointerPosition.y);
                 preWrites.Add((mouse.position, write));
-                identity["position"] = Vec(position.Value);
+                identity["position"] = Vec(topLeft);
+                identity["space"] = "top_left_px";
 
                 if (target is null)
                 {
@@ -256,8 +255,8 @@ namespace UnityCliConnector.Tools
 
                 if (target is null)
                 {
-                    if (!TryResolveMode(modeText, MousePositionModes, "set", out mode, out var modeError))
-                        return new ErrorResponse(modeError);
+                    if (!TryResolveMode(modeText, MouseScrollModes, "set", out mode, out var modeError))
+                        return new ErrorResponse($"{modeError} (scroll needs a --button for click/press modes)");
                     target = mouse.scroll;
                     on = write;
                     off = write;
@@ -282,17 +281,9 @@ namespace UnityCliConnector.Tools
             if (!TryResolveControl(gamepad, controlName, out var control, out var controlError))
                 return new ErrorResponse(controlError);
 
-            var isVector = control is InputControl<Vector2>;
-            var defaultValue = p.GetFloat("value") ?? 1f;
-            var hasExplicitValue = p.GetFloat("value").HasValue ||
-                                   p.GetFloat("x").HasValue || p.GetFloat("y").HasValue;
-            if (!TryResolveMode(p.Get("mode"), GamepadModes, hasExplicitValue ? "set" : "press", out var mode, out var modeError))
-                return new ErrorResponse(modeError);
-
-            var on = isVector
-                ? ControlWrite.Vector(p.GetFloat("x") ?? 0f, p.GetFloat("y") ?? 0f)
-                : ControlWrite.Float(defaultValue);
-            var off = isVector ? ControlWrite.Vector(0f, 0f) : ControlWrite.Float(0f);
+            if (!TryBuildGamepadWrite(control, p.Get("mode"), p.GetFloat("value"), p.GetFloat("x"), p.GetFloat("y"),
+                    out var mode, out var on, out var off, out var writeError))
+                return new ErrorResponse(writeError);
 
             return await ApplyAsync(p, gamepad, control, mode, on, off,
                 identity: new Dictionary<string, object>
@@ -309,78 +300,103 @@ namespace UnityCliConnector.Tools
             if (index >= touchscreen.touches.Count)
                 return new ErrorResponse($"{touchscreen.name} has {touchscreen.touches.Count} touch slot(s), so index {index} is out of range");
 
-            var requestedMode = (p.Get("mode") ?? "").Trim().ToLowerInvariant();
-            var tap = requestedMode is "tap" or "click";
-            if (tap) requestedMode = null;
-            if (!TryResolveTouchPhase(requestedMode, out var phase, out var phaseError))
+            var touch = touchscreen.touches[index];
+            // InputControl reads outside an update can land on the editor state buffer, where a touch
+            // begun by an earlier command is absent; the session copy is what the player buffer holds.
+            var previous = InputInjectionSession.TryGetTouchState(touchscreen, touch, out var heldTouch)
+                ? heldTouch
+                : touch.value;
+            if (!TryResolveTouchPlan(p.Get("mode"), previous, out var phase, out var tap, out var phaseError))
                 return new ErrorResponse(phaseError);
 
-            var touch = touchscreen.touches[index];
-            var previous = touch.value;
-            var x = p.GetFloat("x") ?? (previous.isInProgress ? previous.position.x : touchscreen.position.value.x);
-            var y = p.GetFloat("y") ?? (previous.isInProgress ? previous.position.y : touchscreen.position.value.y);
+            var previousTopLeft = PointerToTopLeft(
+                previous.isInProgress ? previous.position : touchscreen.position.value, GameViewHeight);
+            var topLeft = new Vector2(p.GetFloat("x") ?? previousTopLeft.x, p.GetFloat("y") ?? previousTopLeft.y);
+            var pointer = TopLeftToPointer(topLeft, GameViewHeight);
 
             var holdFrames = ClampFrames(p.GetInt("hold_frames", 1));
             var holdMs = Math.Max(0, p.GetInt("hold_ms", 0) ?? 0);
             var pumpFrames = ClampFrames(p.GetInt("pump_frames", DefaultPumpFrames));
 
+            var notedHeld = false;
             InputInjectionSession.BeginFocusNeutralSettings();
             InputInjectionSession.NoteWrittenDevice(touchscreen);
-            InputInjectionSession.NoteHeld(touchscreen, touch);
-
-            QueueTouchState(touchscreen, touch, index, TouchPhase.Began, x, y, previous);
-            UpdateInputStateNow();
-
-            var held = touch.value;
-            if (tap)
+            try
             {
-                await InputInjectionSession.PumpPlayerLoopAsync(holdFrames, holdMs);
+                InputInjectionSession.NoteHeld(touchscreen, touch);
+                notedHeld = true;
+
+                var queued = tap || phase == TouchPhase.Began
+                    ? QueueTouchState(touchscreen, touch, index, TouchPhase.Began, pointer.x, pointer.y, previous)
+                    : QueueTouchState(touchscreen, touch, index, phase, pointer.x, pointer.y, previous);
+                if (!tap && phase is not (TouchPhase.Ended or TouchPhase.Canceled))
+                    InputInjectionSession.NoteTouchState(touchscreen, touch, queued);
+
+                object heldReport = null;
+                if (tap)
+                {
+                    await InputInjectionSession.PumpPlayerLoopAsync(holdFrames, holdMs);
+                    heldReport = TouchReport(touch);
+
+                    var held = touch.value;
+                    QueueTouchState(touchscreen, touch, index, TouchPhase.Ended, pointer.x, pointer.y, held);
+                    InputInjectionSession.NoteReleased(touchscreen, touch);
+                    notedHeld = false;
+                }
+
+                await InputInjectionSession.PumpPlayerLoopAsync(pumpFrames, 0);
                 UpdateInputStateNow();
-                held = touch.value;
-                QueueTouchState(touchscreen, touch, index, TouchPhase.Ended, x, y, held);
+
+                if (phase is TouchPhase.Ended or TouchPhase.Canceled)
+                {
+                    InputInjectionSession.NoteReleased(touchscreen, touch);
+                    notedHeld = false;
+                }
+
+                var stateReport = TouchReport(touch);
+                heldReport ??= stateReport;
+                var reportedPhase = tap ? TouchPhase.Ended : phase;
+                var consumed = TouchIsAt(touch, reportedPhase);
+
+                var data = new Dictionary<string, object>
+                {
+                    ["mode"] = tap ? "tap" : phase.ToString().ToLowerInvariant(),
+                    ["device"] = DeviceLabel(touchscreen),
+                    ["touch_index"] = index,
+                    // Vec, not the raw Vector2: Unity 6's Vector2.normalized points back at a Vector2, which makes
+                    // Newtonsoft's response serialization loop and the connector never answers.
+                    ["position"] = Vec(topLeft),
+                    ["space"] = "top_left_px",
+                    ["consumed"] = consumed,
+                    ["held_state"] = heldReport,
+                    ["state"] = stateReport,
+                    ["pump_frames"] = pumpFrames,
+                    ["focus"] = InputInjectionSession.FocusData(),
+                    ["settings"] = InputInjectionSession.SettingsOverrideData(),
+                    ["legacy_input_note"] = LegacyNote,
+                };
+
+                return consumed
+                    ? new SuccessResponse(
+                        $"touch {index} {reportedPhase.ToString().ToLowerInvariant()} at ({Round(topLeft.x)}, {Round(topLeft.y)}) on {DeviceLabel(touchscreen)}",
+                        data)
+                    : new ErrorResponse($"touch event queued but {touchscreen.name} did not take it", data);
             }
-            else if (phase != TouchPhase.Began)
+            catch
             {
-                QueueTouchState(touchscreen, touch, index, phase, x, y, held);
+                if (notedHeld) InputInjectionSession.NoteReleased(touchscreen, touch);
+                throw;
             }
-            UpdateInputStateNow();
-
-            var heldReport = TouchReport(touch);
-            await InputInjectionSession.PumpPlayerLoopAsync(pumpFrames, 0);
-            UpdateInputStateNow();
-            var stateReport = TouchReport(touch);
-            if (tap || phase is TouchPhase.Ended or TouchPhase.Canceled)
-                InputInjectionSession.NoteReleased(touchscreen, touch);
-            InputInjectionSession.RestoreSettingsIfIdle();
-
-            var consumed = held.phase is not (TouchPhase.None or TouchPhase.Canceled);
-
-            var data = new Dictionary<string, object>
+            finally
             {
-                ["mode"] = tap ? "tap" : phase.ToString().ToLowerInvariant(),
-                ["device"] = DeviceLabel(touchscreen),
-                ["touch_index"] = index,
-                // Vec, not the raw Vector2: Unity 6's Vector2.normalized points back at a Vector2, which makes
-                // Newtonsoft's response serialization loop and the connector never answers.
-                ["position"] = Vec(new Vector2(x, y)),
-                ["consumed"] = consumed,
-                ["held_state"] = heldReport,
-                ["state"] = stateReport,
-                ["pump_frames"] = pumpFrames,
-                ["focus"] = InputInjectionSession.FocusData(),
-                ["settings"] = InputInjectionSession.SettingsOverrideData(),
-                ["legacy_input_note"] = LegacyNote,
-            };
-
-            return consumed
-                ? new SuccessResponse($"touch {index} {phase.ToString().ToLowerInvariant()} at ({x}, {y}) on {DeviceLabel(touchscreen)}", data)
-                : new ErrorResponse($"touch event queued but {touchscreen.name} did not take it", data);
+                InputInjectionSession.RestoreSettingsIfIdle();
+            }
         }
 
         private static async Task<object> ResetAsync()
         {
-            var removed = InputInjectionSession.RemoveAddedDevices();
             var reset = InputInjectionSession.ResetWrittenDevices();
+            var removed = InputInjectionSession.RemoveAddedDevices();
             InputInjectionSession.ClearHeldControls();
             InputInjectionSession.RestoreSettings();
 
@@ -400,11 +416,6 @@ namespace UnityCliConnector.Tools
 
         private static object StateData()
         {
-            // Control reads made outside an input update land in the editor state buffers, which never see the
-            // injected events (they are deferred into player updates). Running one update first puts the reader
-            // in the player buffer context that game code reads from.
-            UpdateInputStateNow();
-
             var data = new Dictionary<string, object>
             {
                 ["playing"] = EditorApplication.isPlaying,
@@ -433,7 +444,7 @@ namespace UnityCliConnector.Tools
                 data["mouse"] = new
                 {
                     device = DeviceLabel(mouse),
-                    position = Vec(mouse.position.value),
+                    position = Vec(PointerToTopLeft(mouse.position.value, GameViewHeight)),
                     scroll = Vec(mouse.scroll.value),
                     pressed_buttons = new[] { mouse.leftButton, mouse.rightButton, mouse.middleButton, mouse.forwardButton, mouse.backButton }
                         .Where(b => b.isPressed).Select(b => b.name).ToArray(),
@@ -443,6 +454,8 @@ namespace UnityCliConnector.Tools
             var gamepads = InputSystem.devices.OfType<Gamepad>().ToArray();
             if (gamepads.Length > 0)
                 data["gamepads"] = gamepads.Select(GamepadData).ToArray();
+
+            data["position_space"] = "top_left_px";
 
             var touchscreens = InputSystem.devices.OfType<Touchscreen>().ToArray();
             if (touchscreens.Length > 0)
@@ -473,19 +486,21 @@ namespace UnityCliConnector.Tools
 
         private static object TouchReport(TouchControl touch)
         {
-            var state = touch.value;
+            // The player buffer holds a touch begun by an earlier command even when a read outside
+            // an update lands on the editor buffer and reports None.
+            var state = InputInjectionSession.TryGetTouchState(touch.device, touch, out var held)
+                ? held
+                : touch.value;
             return new
             {
                 touch_id = state.touchId,
                 phase = state.phase.ToString(),
-                position = Vec(state.position),
+                position = Vec(PointerToTopLeft(state.position, GameViewHeight)),
                 pressed = state.isInProgress,
             };
         }
 
-        // ---- shared injection path --------------------------------------------------------------
-
-        private static async Task<object> ApplyAsync(ToolParams p, InputDevice device, InputControl control,
+        internal static async Task<object> ApplyAsync(ToolParams p, InputDevice device, InputControl control,
             string mode, ControlWrite on, ControlWrite off,
             List<(InputControl control, ControlWrite write)> preWrites = null,
             Dictionary<string, object> identity = null)
@@ -494,73 +509,89 @@ namespace UnityCliConnector.Tools
             var holdMs = Math.Max(0, p.GetInt("hold_ms", 0) ?? 0);
             var pumpFrames = ClampFrames(p.GetInt("pump_frames", DefaultPumpFrames));
 
+            var releasing = mode == "release";
+            var tapped = mode is "tap" or "click";
+            var notedHeld = false;
+
             InputInjectionSession.BeginFocusNeutralSettings();
             InputInjectionSession.NoteWrittenDevice(device);
 
-            var releasing = mode == "release";
-            var tapped = mode is "tap" or "click";
-            // Counted from inside the input updates themselves: reading wasPressedThisFrame after the
-            // call is useless because the tool's own update has already advanced the frame counter.
-            using var freshFlags = new FreshFlagCapture(control);
-            var writes = new List<(InputControl control, ControlWrite write)>(preWrites ?? NoWrites);
-            writes.Add((control, releasing ? off : on));
-            QueueControlStates(device, writes);
-            UpdateInputStateNow();
-
-            if (releasing) InputInjectionSession.NoteReleased(device, control);
-            else InputInjectionSession.NoteHeld(device, control);
-
-            object heldSample = null;
-            var heldOk = false;
-
-            if (!releasing)
+            try
             {
-                if (tapped) await InputInjectionSession.PumpPlayerLoopAsync(holdFrames, holdMs);
+                using var freshFlags = new FreshFlagCapture(control);
+                var writes = new List<(InputControl control, ControlWrite write)>(preWrites ?? NoWrites);
+                writes.Add((control, releasing ? off : on));
+                QueueControlStates(device, writes);
 
-                UpdateInputStateNow();
-                heldSample = SampleControl(control);
-                heldOk = ControlIsAt(control, on);
-
-                if (tapped)
+                if (releasing)
                 {
-                    QueueControlState(device, control, off);
-                    UpdateInputStateNow();
                     InputInjectionSession.NoteReleased(device, control);
                 }
+                else
+                {
+                    InputInjectionSession.NoteHeld(device, control);
+                    notedHeld = true;
+                }
+
+                var asPointerPosition = device is Pointer pointer && ReferenceEquals(control, pointer.position);
+                object heldSample = null;
+                var heldOk = false;
+
+                if (!releasing && tapped)
+                {
+                    // Leave the press for the player-loop update to consume. A readback update here would
+                    // advance the input update step, so game Update() would never see the press edge.
+                    await InputInjectionSession.PumpPlayerLoopAsync(holdFrames, holdMs);
+                    heldSample = SampleControl(control, asPointerPosition);
+                    heldOk = ControlIsAt(control, on);
+
+                    QueueControlState(device, control, off);
+                    InputInjectionSession.NoteReleased(device, control);
+                    notedHeld = false;
+                }
+
+                await InputInjectionSession.PumpPlayerLoopAsync(pumpFrames, 0);
+                UpdateInputStateNow();
+
+                var finalSample = SampleControl(control, asPointerPosition);
+                if (!releasing && !tapped) heldSample = finalSample;
+                var consumed = releasing
+                    ? ControlIsAt(control, off)
+                    : tapped ? heldOk : ControlIsAt(control, on);
+
+                var data = new Dictionary<string, object>
+                {
+                    ["mode"] = mode,
+                    ["device"] = DeviceLabel(device),
+                    ["control"] = control.name,
+                    ["consumed"] = consumed,
+                    ["fresh_press_frames"] = freshFlags.PressFrames,
+                    ["fresh_release_frames"] = freshFlags.ReleaseFrames,
+                    ["state"] = finalSample,
+                    ["pump_frames"] = pumpFrames,
+                    ["focus"] = InputInjectionSession.FocusData(),
+                    ["settings"] = InputInjectionSession.SettingsOverrideData(),
+                    ["legacy_input_note"] = LegacyNote,
+                };
+                if (identity is not null)
+                    foreach (var pair in identity)
+                        data[pair.Key] = pair.Value;
+                if (heldSample is not null) data["held_state"] = heldSample;
+
+                var label = $"{data.GetValueOrDefault("key") ?? control.name} {mode} on {DeviceLabel(device)}";
+                return consumed
+                    ? new SuccessResponse($"injected: {label}", data)
+                    : new ErrorResponse($"event queued but the Input System state did not change: {label}", data);
             }
-
-            await InputInjectionSession.PumpPlayerLoopAsync(pumpFrames, 0);
-            UpdateInputStateNow();
-            InputInjectionSession.RestoreSettingsIfIdle();
-
-            var finalSample = SampleControl(control);
-            var consumed = releasing
-                ? ControlIsAt(control, off)
-                : tapped ? heldOk : ControlIsAt(control, on);
-
-            var data = new Dictionary<string, object>
+            catch
             {
-                ["mode"] = mode,
-                ["device"] = DeviceLabel(device),
-                ["control"] = control.name,
-                ["consumed"] = consumed,
-                ["fresh_press_frames"] = freshFlags.PressFrames,
-                ["fresh_release_frames"] = freshFlags.ReleaseFrames,
-                ["state"] = finalSample,
-                ["pump_frames"] = pumpFrames,
-                ["focus"] = InputInjectionSession.FocusData(),
-                ["settings"] = InputInjectionSession.SettingsOverrideData(),
-                ["legacy_input_note"] = LegacyNote,
-            };
-            if (identity is not null)
-                foreach (var pair in identity)
-                    data[pair.Key] = pair.Value;
-            if (heldSample is not null) data["held_state"] = heldSample;
-
-            var label = $"{data.GetValueOrDefault("key") ?? control.name} {mode} on {DeviceLabel(device)}";
-            return consumed
-                ? new SuccessResponse($"injected: {label}", data)
-                : new ErrorResponse($"event queued but the Input System state did not change: {label}", data);
+                if (notedHeld) InputInjectionSession.NoteReleased(device, control);
+                throw;
+            }
+            finally
+            {
+                InputInjectionSession.RestoreSettingsIfIdle();
+            }
         }
 
         /// <summary>
@@ -587,7 +618,7 @@ namespace UnityCliConnector.Tools
             QueueControlStates(device, new[] { (control, write) });
         }
 
-        private static void QueueTouchState(Touchscreen touchscreen, TouchControl touch, int index,
+        private static TouchState QueueTouchState(Touchscreen touchscreen, TouchControl touch, int index,
             TouchPhase phase, float x, float y, TouchState previous)
         {
             var began = phase == TouchPhase.Began;
@@ -609,20 +640,17 @@ namespace UnityCliConnector.Tools
                 touch.WriteValueIntoEvent(state, eventPtr);
                 InputSystem.QueueEvent(eventPtr);
             }
+            return state;
         }
 
-        /// <summary>
-        /// Runs input event processing now instead of waiting for the next player-loop tick, so the readback
-        /// describes state that game code can already see. Skipped when the project drives InputSystem.Update
-        /// itself (InputSettings.UpdateMode.ProcessEventsManually).
-        /// </summary>
+        // InputSystem.Update() throws when the project drives input updates itself (ProcessEventsManually).
         private static void UpdateInputStateNow()
         {
             if (InputSystem.settings.updateMode == InputSettings.UpdateMode.ProcessEventsManually) return;
             InputSystem.Update();
         }
 
-        internal static object SampleControl(InputControl control)
+        internal static object SampleControl(InputControl control, bool asPointerPosition = false)
         {
             if (control is ButtonControl button)
             {
@@ -636,7 +664,11 @@ namespace UnityCliConnector.Tools
                 };
             }
             if (control is InputControl<Vector2> vector)
-                return new { control = vector.name, xy = Vec(vector.value) };
+                return new
+                {
+                    control = vector.name,
+                    xy = Vec(asPointerPosition ? PointerToTopLeft(vector.value, GameViewHeight) : vector.value),
+                };
             if (control is AxisControl axis)
                 return new { control = axis.name, value = Round(axis.value) };
 
@@ -666,8 +698,6 @@ namespace UnityCliConnector.Tools
 
             return control is AxisControl axis && Approximately(axis.value, want.Value);
         }
-
-        // ---- parameter resolution (internal for EditMode tests) ---------------------------------
 
         internal static bool TryResolveKey(string text, out Key key, out string error)
         {
@@ -782,6 +812,54 @@ namespace UnityCliConnector.Tools
             return false;
         }
 
+        internal static bool TryBuildGamepadWrite(InputControl control, string modeText,
+            float? value, float? x, float? y,
+            out string mode, out ControlWrite on, out ControlWrite off, out string error)
+        {
+            mode = string.Empty;
+            on = default;
+            off = default;
+            error = null;
+
+            var isVector = control is InputControl<Vector2>;
+            if (!isVector && control is not InputControl<float>)
+            {
+                error = $"'{control.name}' is not a writable gamepad control — {Join(GamepadControlNames(control.device))}";
+                return false;
+            }
+            if (isVector && value.HasValue)
+            {
+                error = $"'{control.name}' is a 2-axis control — use --x/--y, not --value";
+                return false;
+            }
+            if (!isVector && (x.HasValue || y.HasValue))
+            {
+                error = $"'{control.name}' is a single-axis control — use --value, not --x/--y";
+                return false;
+            }
+
+            var hasExplicitValue = value.HasValue || x.HasValue || y.HasValue;
+            if (!TryResolveMode(modeText, GamepadModes, hasExplicitValue ? "set" : "press", out mode, out error))
+                return false;
+
+            if (isVector)
+            {
+                if (mode != "release" && !x.HasValue && !y.HasValue)
+                {
+                    error = $"'{control.name}' needs --x and/or --y for {mode} (use --mode release to center it)";
+                    return false;
+                }
+                on = ControlWrite.Vector(x ?? 0f, y ?? 0f);
+                off = ControlWrite.Vector(0f, 0f);
+            }
+            else
+            {
+                on = ControlWrite.Float(value ?? 1f);
+                off = ControlWrite.Float(0f);
+            }
+            return true;
+        }
+
         internal static bool TryResolveMode(string text, IReadOnlyList<string> allowed, string fallback,
             out string mode, out string error)
         {
@@ -834,6 +912,29 @@ namespace UnityCliConnector.Tools
             }
         }
 
+        internal static bool TryResolveTouchPlan(string modeText, TouchState previous,
+            out TouchPhase phase, out bool tap, out string error)
+        {
+            var requested = (modeText ?? "").Trim().ToLowerInvariant();
+            tap = requested is "tap" or "click";
+            if (tap) requested = null;
+            if (!TryResolveTouchPhase(requested, out phase, out error)) return false;
+
+            if (!tap && phase != TouchPhase.Began && !previous.isInProgress)
+            {
+                error = $"no touch is in progress to report {phase.ToString().ToLowerInvariant()}; send --mode began first";
+                return false;
+            }
+            return true;
+        }
+
+        internal static bool TouchIsAt(TouchControl touch, TouchPhase want)
+        {
+            var state = touch.value;
+            var wantActive = want is TouchPhase.Began or TouchPhase.Moved or TouchPhase.Stationary;
+            return state.phase == want && state.isInProgress == wantActive;
+        }
+
         internal static bool TryResolveGamepad(string text, out Gamepad gamepad, out string error)
         {
             gamepad = null;
@@ -879,18 +980,39 @@ namespace UnityCliConnector.Tools
             return args[position]?.ToString();
         }
 
-        private static Vector2? ResolveRequestedPosition(Pointer pointer, ToolParams p)
+        private static bool TryResolveRequestedPosition(Pointer pointer, ToolParams p,
+            out Vector2 pointerPosition, out Vector2 topLeft)
         {
             var x = p.GetFloat("x");
             var y = p.GetFloat("y");
             var dx = p.GetFloat("dx");
             var dy = p.GetFloat("dy");
-            if (!x.HasValue && !y.HasValue && !dx.HasValue && !dy.HasValue) return null;
+            pointerPosition = default;
+            topLeft = default;
+            if (!x.HasValue && !y.HasValue && !dx.HasValue && !dy.HasValue) return false;
 
-            var current = pointer.position.value;
-            return new Vector2(
+            var current = PointerToTopLeft(pointer.position.value, GameViewHeight);
+            topLeft = new Vector2(
                 x ?? current.x + (dx ?? 0f),
                 y ?? current.y + (dy ?? 0f));
+            pointerPosition = TopLeftToPointer(topLeft, GameViewHeight);
+            return true;
+        }
+
+        // Screen.height is stale until a player-loop frame has rendered (it can report 36 right after
+        // entering play mode), while Handles already has the Game view's final render height.
+        private static float GameViewHeight => Handles.GetMainGameViewSize().y;
+
+        // Input System pointers use bottom-left screen pixels; the CLI documents Game view pixels from
+        // the top-left, like a screenshot.
+        internal static Vector2 TopLeftToPointer(Vector2 topLeft, float screenHeight)
+        {
+            return new Vector2(topLeft.x, screenHeight - topLeft.y);
+        }
+
+        internal static Vector2 PointerToTopLeft(Vector2 pointer, float screenHeight)
+        {
+            return new Vector2(pointer.x, screenHeight - pointer.y);
         }
 
         private static IEnumerable<string> GamepadControlNames(InputDevice device)
@@ -938,11 +1060,9 @@ namespace UnityCliConnector.Tools
             return values.Any(v => string.Equals(v, value, StringComparison.OrdinalIgnoreCase));
         }
 
-        /// <summary>
-        /// Counts the input updates in which a control reported a fresh press/release — the same view
-        /// MonoBehaviour.Update gets, since it runs after the input update of that frame.
-        /// </summary>
-        private sealed class FreshFlagCapture : IDisposable
+        // Counts fresh press/release only across player-loop pumps. InputSystem.Update() starts a new
+        // update step too, so counting every update would report the tool's own readback as a game frame.
+        internal sealed class FreshFlagCapture : IDisposable
         {
             private readonly InputControl m_Control;
 
@@ -957,6 +1077,7 @@ namespace UnityCliConnector.Tools
 
             private void OnAfterUpdate()
             {
+                if (!InputInjectionSession.IsPumpingPlayerLoop) return;
                 if (m_Control is not ButtonControl button) return;
                 if (button.wasPressedThisFrame) ++PressFrames;
                 if (button.wasReleasedThisFrame) ++ReleaseFrames;

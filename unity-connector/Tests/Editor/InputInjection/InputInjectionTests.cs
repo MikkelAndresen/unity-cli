@@ -1,3 +1,4 @@
+using System;
 using System.Threading.Tasks;
 using Newtonsoft.Json.Linq;
 using NUnit.Framework;
@@ -20,21 +21,31 @@ namespace UnityCliConnector.Tests
     {
         private Gamepad m_Gamepad;
         private Keyboard m_Keyboard;
+        private Mouse m_Mouse;
+        private bool m_MouseAdded;
 
         [SetUp]
         public void SetUp()
         {
             m_Gamepad = InputSystem.AddDevice<Gamepad>();
             m_Keyboard = InputSystem.AddDevice<Keyboard>();
+            m_Mouse = InputSystem.GetDevice<Mouse>();
+            m_MouseAdded = m_Mouse is null;
+            if (m_MouseAdded) m_Mouse = InputSystem.AddDevice<Mouse>();
         }
 
         [TearDown]
         public void TearDown()
         {
+            InputInjectionSession.ClearHeldControls();
+            InputInjectionSession.RestoreSettings();
+            InputInjectionSession.RemoveAddedDevices();
             if (m_Gamepad is { added: true }) InputSystem.RemoveDevice(m_Gamepad);
             if (m_Keyboard is { added: true }) InputSystem.RemoveDevice(m_Keyboard);
+            if (m_MouseAdded && m_Mouse is { added: true }) InputSystem.RemoveDevice(m_Mouse);
             m_Gamepad = null;
             m_Keyboard = null;
+            m_Mouse = null;
         }
 
         // ─── key name resolution ────────────────────────────────
@@ -135,10 +146,7 @@ namespace UnityCliConnector.Tests
         [TestCase("back", "backButton")]
         public void TryResolveMouseButton_ValidNames_Resolves(string text, string expectedControl)
         {
-            var mouse = InputSystem.GetDevice<Mouse>();
-            Assert.IsNotNull(mouse, "the editor is expected to have a Mouse device to resolve buttons against");
-
-            Assert.IsTrue(InputInjection.TryResolveMouseButton(mouse, text, out var button, out var error), error);
+            Assert.IsTrue(InputInjection.TryResolveMouseButton(m_Mouse, text, out var button, out var error), error);
             Assert.AreEqual(expectedControl, button.name);
         }
 
@@ -147,9 +155,7 @@ namespace UnityCliConnector.Tests
         [TestCase("button4")]
         public void TryResolveMouseButton_InvalidNames_Rejected(string text)
         {
-            var mouse = InputSystem.GetDevice<Mouse>();
-            Assert.IsNotNull(mouse);
-            Assert.IsFalse(InputInjection.TryResolveMouseButton(mouse, text, out _, out var error));
+            Assert.IsFalse(InputInjection.TryResolveMouseButton(m_Mouse, text, out _, out var error));
             Assert.That(error, Does.Contain("left | right | middle | forward | back"));
         }
 
@@ -173,6 +179,55 @@ namespace UnityCliConnector.Tests
         {
             Assert.IsFalse(InputInjection.TryResolveTouchPhase("wiggle", out _, out var error));
             Assert.That(error, Does.Contain("began | moved | stationary | ended"));
+        }
+
+        [Test]
+        public void TryResolveTouchPlan_PhaseOnIdleSlot_Rejected()
+        {
+            var idle = new TouchState();
+            foreach (var mode in new[] { "moved", "stationary", "ended", "canceled" })
+            {
+                Assert.IsFalse(InputInjection.TryResolveTouchPlan(mode, idle, out _, out _, out var error), mode);
+                Assert.That(error, Does.Contain("no touch is in progress"), mode);
+            }
+        }
+
+        [Test]
+        public void TryResolveTouchPlan_BeganAndTapAllowedOnIdleSlot()
+        {
+            var idle = new TouchState();
+
+            Assert.IsTrue(InputInjection.TryResolveTouchPlan("began", idle, out var phase, out var tap, out _));
+            Assert.AreEqual(TouchPhase.Began, phase);
+            Assert.IsFalse(tap);
+
+            Assert.IsTrue(InputInjection.TryResolveTouchPlan("tap", idle, out phase, out tap, out _));
+            Assert.AreEqual(TouchPhase.Began, phase);
+            Assert.IsTrue(tap);
+        }
+
+        [Test]
+        public void TryResolveTouchPlan_PhaseOnActiveSlot_Accepted()
+        {
+            var active = new TouchState { phaseId = (byte)TouchPhase.Began };
+
+            Assert.IsTrue(InputInjection.TryResolveTouchPlan("moved", active, out var phase, out _, out var error), error);
+            Assert.AreEqual(TouchPhase.Moved, phase);
+        }
+
+        [TestCase(0f, 0f, 100f, 0f, 100f)]
+        [TestCase(10f, 25f, 100f, 10f, 75f)]
+        [TestCase(10f, 25f, 720f, 10f, 695f)]
+        public void PointerCoordinates_ConvertBetweenTopLeftAndPointer(
+            float x, float y, float height, float pointerX, float pointerY)
+        {
+            var pointer = InputInjection.TopLeftToPointer(new UnityEngine.Vector2(x, y), height);
+            Assert.That(pointer.x, Is.EqualTo(pointerX).Within(0.001f));
+            Assert.That(pointer.y, Is.EqualTo(pointerY).Within(0.001f));
+
+            var topLeft = InputInjection.PointerToTopLeft(pointer, height);
+            Assert.That(topLeft.x, Is.EqualTo(x).Within(0.001f));
+            Assert.That(topLeft.y, Is.EqualTo(y).Within(0.001f));
         }
 
         // ─── gamepad control lookup ─────────────────────────────
@@ -215,6 +270,60 @@ namespace UnityCliConnector.Tests
         {
             Assert.IsTrue(InputInjection.TryResolveGamepad(null, out var gamepad, out _));
             Assert.That(InputSystem.devices, Does.Contain(gamepad));
+        }
+
+        [Test]
+        public void GamepadWrite_ValueOnVectorControl_Rejected()
+        {
+            Assert.IsFalse(InputInjection.TryBuildGamepadWrite(m_Gamepad.leftStick, null, 1f, null, null,
+                out _, out _, out _, out var error));
+            Assert.That(error, Does.Contain("--x/--y"));
+        }
+
+        [Test]
+        public void GamepadWrite_VectorPressWithoutAxes_Rejected()
+        {
+            Assert.IsFalse(InputInjection.TryBuildGamepadWrite(m_Gamepad.leftStick, "press", null, null, null,
+                out _, out _, out _, out var error));
+            Assert.That(error, Does.Contain("needs --x"));
+        }
+
+        [Test]
+        public void GamepadWrite_VectorReleaseWithoutAxes_Centers()
+        {
+            Assert.IsTrue(InputInjection.TryBuildGamepadWrite(m_Gamepad.leftStick, "release", null, null, null,
+                out var mode, out var on, out var off, out var error), error);
+            Assert.AreEqual("release", mode);
+            Assert.IsTrue(on.IsVector);
+            Assert.AreEqual(0f, on.X);
+            Assert.AreEqual(0f, on.Y);
+            Assert.IsTrue(off.IsVector);
+        }
+
+        [Test]
+        public void GamepadWrite_DeviceRoot_RejectedAsNotWritable()
+        {
+            Assert.IsFalse(InputInjection.TryBuildGamepadWrite(m_Gamepad, null, null, null, null,
+                out _, out _, out _, out var error));
+            Assert.That(error, Does.Contain("not a writable gamepad control"));
+        }
+
+        [Test]
+        public void GamepadWrite_AxesOnScalarControl_Rejected()
+        {
+            Assert.IsFalse(InputInjection.TryBuildGamepadWrite(m_Gamepad.leftTrigger, null, null, 1f, null,
+                out _, out _, out _, out var error));
+            Assert.That(error, Does.Contain("single-axis"));
+        }
+
+        [Test]
+        public void GamepadWrite_ScalarValue_IsUsed()
+        {
+            Assert.IsTrue(InputInjection.TryBuildGamepadWrite(m_Gamepad.leftTrigger, null, 0.6f, null, null,
+                out var mode, out var on, out _, out var error), error);
+            Assert.AreEqual("set", mode);
+            Assert.IsFalse(on.IsVector);
+            Assert.AreEqual(0.6f, on.Value);
         }
 
         // ─── state injection round-trip ─────────────────────────
@@ -327,6 +436,7 @@ namespace UnityCliConnector.Tests
             if (InputSystem.GetDevice<Touchscreen>() is not null)
                 Assert.Ignore("a Touchscreen was already present, so GetOrAddDevice would not add one");
 
+            InputInjectionSession.RemoveAddedDevices();
             try
             {
                 var screen = InputInjectionSession.GetOrAddDevice<Touchscreen>();
@@ -334,7 +444,8 @@ namespace UnityCliConnector.Tests
                 Assert.That(InputSystem.devices, Does.Contain(screen));
                 Assert.That(InputInjectionSession.AddedDevices, Does.Contain(screen));
 
-                Assert.AreEqual(1, InputInjectionSession.RemoveAddedDevices());
+                Assert.AreEqual(1, InputInjectionSession.RemoveAddedDevices(),
+                    "the test starts from an empty session, so only its own device can be removed");
                 Assert.IsNull(InputSystem.GetDevice<Touchscreen>(),
                     "a device the tool added has to be gone again — it must not linger in the editor");
                 Assert.IsEmpty(InputInjectionSession.AddedDevices);
@@ -343,6 +454,66 @@ namespace UnityCliConnector.Tests
             {
                 if (InputSystem.GetDevice<Touchscreen>() is { } leftover) InputSystem.RemoveDevice(leftover);
             }
+        }
+
+        [Test]
+        public void ResetAction_ReportsResetAndRemovedForAToolAddedDevice()
+        {
+            if (InputSystem.GetDevice<Touchscreen>() is not null)
+                Assert.Ignore("a Touchscreen was already present, so the tool would not add this test's device");
+
+            InputInjectionSession.RemoveAddedDevices();
+            try
+            {
+                var screen = InputInjectionSession.GetOrAddDevice<Touchscreen>();
+                InputInjectionSession.NoteWrittenDevice(screen);
+
+                var result = InputInjection.HandleCommand(new JObject { ["action"] = "reset" }).Result;
+                Assert.IsInstanceOf<SuccessResponse>(result);
+                var data = JObject.FromObject(((SuccessResponse)result).data);
+
+                Assert.GreaterOrEqual(data["devices_reset"].Value<int>(), 1);
+                Assert.GreaterOrEqual(data["devices_removed"].Value<int>(), 1);
+            }
+            finally
+            {
+                InputInjectionSession.RemoveAddedDevices();
+            }
+        }
+
+        [Test]
+        public void FreshFlagCapture_IgnoresTheToolsOwnReadbackUpdate()
+        {
+            try
+            {
+                using var capture = new InputInjection.FreshFlagCapture(m_Keyboard.spaceKey);
+                InputInjection.QueueControlState(m_Keyboard, m_Keyboard.spaceKey, InputInjection.ControlWrite.Float(1f));
+                InputSystem.Update();
+
+                Assert.AreEqual(0, capture.PressFrames,
+                    "a manual readback update is not a player-loop frame and must not report a fresh press");
+            }
+            finally
+            {
+                InputInjection.QueueControlState(m_Keyboard, m_Keyboard.spaceKey, InputInjection.ControlWrite.Float(0f));
+                InputSystem.Update();
+            }
+        }
+
+        [Test]
+        public void ApplyAsync_FailedWrite_RestoresTheSettingsOverride()
+        {
+            InputInjectionSession.ClearHeldControls();
+            InputInjectionSession.RestoreSettings();
+            Assert.IsFalse(InputInjectionSession.HasSettingsOverride);
+
+            var p = new ToolParams(new JObject { ["pump_frames"] = 0 });
+            Assert.ThrowsAsync<InvalidOperationException>(async () =>
+                await InputInjection.ApplyAsync(p, m_Gamepad, m_Gamepad, "press",
+                    InputInjection.ControlWrite.Float(1f), InputInjection.ControlWrite.Float(0f)));
+
+            Assert.IsFalse(InputInjectionSession.HasSettingsOverride,
+                "a write that threw must not leave the InputSettings override behind");
         }
 
         // ─── settings override bookkeeping ────────────────────────

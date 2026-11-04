@@ -780,9 +780,9 @@ Editor Control:
 
 Input Injection (Play mode, new Input System only):
   input key <name> [press|release|tap]   e.g. input key Space press
-  input mouse --x 100 --y 200            Game view pixels; --button left --mode click
+  input mouse --x 100 --y 200            Game view pixels (0,0 = top-left); --button left --mode click
   input gamepad|axis --control leftStick --x 1 --y 0
-  input touch --x 64 --y 128 --mode tap
+  input touch --x 64 --y 128 --mode tap  Same top-left Game view pixels as mouse
   input state                     Keys/mouse/gamepads as the Input System currently sees them
   input reset                     Release injected state, drop virtual devices, restore settings
 
@@ -919,8 +919,10 @@ Profiler:
 Input Injection (Play mode):
   input key <name> [press|release|tap]   Keyboard key by Key enum name (Space, W, LeftShift)
   input mouse [--x --y | --dx --dy] [--button left|right|middle|forward|back] [--mode ...]
+                                Game view pixels (0,0 = top-left); --dx/--dy grow right/down
   input gamepad|axis --control <name> [--x --y | --value] [--mode set|press|release|tap]
   input touch [--x --y] [--mode began|moved|stationary|ended|tap] [--index N]
+                                Same top-left Game view pixels as mouse
   input state                      Report pressed keys, mouse position, gamepads, focus, settings
   input reset                      Release everything, remove virtual devices, restore settings
 
@@ -993,19 +995,21 @@ func printTopicHelp(topic string) {
 		fmt.Print(`Usage: unity-cli input <key|mouse|gamepad|axis|touch|state|reset> [options]
 
 Injects device state into the new Input System (com.unity.inputsystem) and pumps the player loop
-so the events are consumed inside the same call. No OS keystrokes are involved.
+so the player update consumes the events inside the same call — game Update() sees fresh press/release
+edges. No OS keystrokes are involved.
 
 Actions:
   key <name> [press|release|tap]   Key enum name: Space, W, A, LeftShift, Enter, Digit1 …
                                    Aliases: ctrl, alt, shift, cmd, esc, return, up, down.
                                    Default mode: press. --hold_ms / --hold_frames tune a tap.
-  mouse                            --x/--y (Game view pixels, 0,0 = top-left), --dx/--dy,
-                                   --button left|right|middle|forward|back, --scroll_x/--scroll_y,
-                                   --mode press|release|tap|click|move|set.
+  mouse                            --x/--y (Game view pixels, 0,0 = top-left; --dx/--dy grow
+                                   right/down), --button left|right|middle|forward|back,
+                                   --scroll_x/--scroll_y, --mode press|release|tap|click|move|set.
   gamepad / axis                   --control leftStick|rightStick|dpad|leftTrigger|buttonSouth|…
                                    --x/--y for sticks, --value for buttons/triggers (default 1),
                                    --mode set|press|release|tap. Adds a virtual Gamepad on demand.
-  touch                            --x/--y, --mode began|moved|stationary|ended|tap, --index N.
+  touch                            --x/--y in the same top-left Game view pixels as mouse,
+                                   --mode began|moved|stationary|ended|tap, --index N.
                                    Adds a virtual Touchscreen on demand.
   state                            Read-only: pressed keys, mouse position/buttons/scroll,
                                    gamepad axes, touch phase, focus flags and InputSettings.
@@ -1014,16 +1018,23 @@ Actions:
 
 Response fields:
   consumed                The device state now matches the request (isPressed / value read back).
-  fresh_press_frames      Input updates that saw the control as freshly pressed — what game code
-                          in Update() sees through wasPressedThisFrame. The was_pressed_this_frame
-                          field of 'state' is read after the tool's own input update, so it is
-                          usually false.
+  fresh_press_frames      Player-loop input updates that saw the control as freshly pressed — what
+                          game Update() sees through wasPressedThisFrame. The tool's own readback
+                          updates are not counted, and was_pressed_this_frame is read after them, so
+                          it is usually false.
   held_state / state      The control read back while held and after the final pump.
+  position / space        Mouse/touch position echoed in the caller's space, top_left_px (Game view
+                          pixels, 0,0 at the top-left). 'state' reports mouse/touch positions in the
+                          same space under position_space.
   focus.*                game_view_focused (a Game View window has editor focus),
                           application_is_focused (what the Input System's own focus gating uses),
                           editor_focused (Unity is the frontmost application).
   settings.*              InputSettings in effect, the values saved before the override, and
                           held_controls — what is still keeping the override in place.
+
+Mouse/touch Y is converted to the Input System's bottom-left screen space with the Game view render
+height (the value Screen.height reports once the player loop has rendered); replies keep the top-left
+coordinates the caller used.
 
 Injected events are visible to the new Input System only. Code reading UnityEngine.Input or
 IMGUI Event sees nothing; every injection response repeats this in legacy_input_note.
