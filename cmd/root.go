@@ -82,6 +82,26 @@ func Execute() error {
 		// Runs with no connector and no heartbeat at all: startup dialogs are exactly the
 		// window where neither exists yet.
 		return dialogsCmd(subArgs)
+	case "editor":
+		// quit and restart run before the normal pipeline: restart has to work with
+		// no live editor, both stop the editor that pipeline would wait on, and
+		// quit --force must reach an editor parked on a modal dialog. The other
+		// editor subcommands fall through to the normal send path below.
+		if len(subArgs) > 0 && (subArgs[0] == "quit" || subArgs[0] == "restart") {
+			lifecycle := restartCmd
+			if subArgs[0] == "quit" {
+				lifecycle = quitCmd
+			}
+			resp, err := lifecycle(subArgs[1:], newRestartDeps(flagWasSet("timeout")))
+			if err != nil {
+				return err
+			}
+			printResponse(resp)
+			if !resp.Success {
+				os.Exit(1)
+			}
+			return nil
+		}
 	}
 
 	// verify and wait report an editor that can't answer as exit code 2, not as a CLI error.
@@ -561,6 +581,10 @@ Editor Control:
   editor pause                  Toggle pause/resume (play mode only)
   editor refresh [--force]      Refresh asset database (blocked in play mode unless forced)
   editor refresh --compile      Recompile scripts and wait until done
+  editor quit [--save|--discard] [--force]
+                                Quit Unity and wait until the process has exited
+  editor restart [--clean] [--save|--discard] [--force] [--editor-path <exe>]
+                                Quit, optionally clean Library/Temp, relaunch, wait until ready
 
 Input Injection (Play mode, new Input System only):
   input key <name> [press|release|tap]   e.g. input key Space press
@@ -820,7 +844,7 @@ Examples:
   unity-cli editor stop
 `)
 	case "editor":
-		fmt.Print(`Usage: unity-cli editor <play|stop|pause|refresh> [options]
+		fmt.Print(`Usage: unity-cli editor <play|stop|pause|refresh|quit|restart> [options]
 
 Subcommands:
   play [--wait]       Enter play mode
@@ -840,12 +864,34 @@ Subcommands:
     --keep-console    With --compile, don't clear the console first (the default clear keeps
                       stale errors from a previous compile out of the report).
     --force           Allow refresh during play mode and force asset update.
+  quit                Quit Unity and wait until the heartbeat or process confirms
+                      the exit. Unsaved scene changes are discarded unless --save.
+    --save            Save open scenes and assets before quitting.
+    --discard         Discard unsaved scene changes explicitly (the default).
+    --force           If Unity ignores the quit or a modal dialog blocks it,
+                      terminate the process (SIGTERM on unix).
+  restart             Quit Unity, relaunch the same project, and wait until ready.
+                      Also works when no editor is running (plain launch).
+                      Must run on the host that can signal and launch Unity; from
+                      a container it refuses before quitting the editor.
+    --save            Save open scenes and assets before quitting.
+    --discard         Discard unsaved scene changes explicitly (the default).
+    --force           Terminate Unity if it does not quit gracefully.
+    --clean           Delete Library/ and Temp/ before relaunching (full reimport).
+    --editor-path <exe>  Unity executable to launch (default: $UNITY_EDITOR or Unity Hub).
+                      --timeout <ms> overrides the quit and startup budgets
+                      (default: 60s to quit; 5m to start, 15m with --clean).
 
 Examples:
   unity-cli editor play --wait
   unity-cli editor stop
   unity-cli editor refresh --compile
   unity-cli editor refresh --force
+  unity-cli editor quit --save
+  unity-cli editor quit --save --force
+  unity-cli editor quit --discard
+  unity-cli editor restart
+  unity-cli editor restart --clean
 `)
 	case "console":
 		fmt.Print(`Usage: unity-cli console [options]
