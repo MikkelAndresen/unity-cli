@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"strconv"
@@ -254,6 +255,13 @@ func waitForBuild(poll sendFn, logw io.Writer, id string) (*client.CommandRespon
 			lastErr = err
 			if resp != nil && !resp.Success {
 				lastErr = fmt.Errorf("%s", resp.Message)
+			}
+			// A proven crash ends the build with it: the job cannot outlive the editor's process, and
+			// polling a dead one for the rest of buildContactTimeout only repeats the same answer.
+			var failure *client.ConnectionFailure
+			if errors.As(err, &failure) && failure.Crashed() {
+				fmt.Fprintln(logw, "the Unity editor died during the build; the job stopped with it.")
+				return lastResp, fmt.Errorf("%v\nThe build job %s died with the editor; restart it once Unity is back up.", failure, id)
 			}
 			if time.Since(lastAnswer) > buildContactTimeout {
 				return lostBuildContact(lastResp, lastJob, id, lastErr)

@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -24,9 +25,21 @@ const staleLockfileAge = 2 * time.Hour
 // annotateNoEditor turns a "no Unity instance" failure into editor_starting_or_blocked when the
 // disk shows an editor open for the target. Without that evidence the original message stands:
 // it is the right answer for a project that is simply not open.
+//
+// A crash is checked first because it outranks the starting-or-blocked reading: both have a silent
+// heartbeat, and only one of them is worth waiting for.
 func annotateNoEditor(err error, project string, port int) error {
 	if err == nil {
 		return nil
+	}
+	var already *crashError
+	if errors.As(err, &already) {
+		return err
+	}
+	if inst := client.NewestHeartbeat(project, port); inst != nil {
+		if verdict := assessCrash(inst); verdict.Crashed {
+			return crashedError(inst, verdict, err)
+		}
 	}
 	ev := client.FindEditorEvidence(project, port)
 	if !ev.Found() {

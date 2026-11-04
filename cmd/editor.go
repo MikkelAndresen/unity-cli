@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -153,9 +154,14 @@ func compileReportDiagnostics(send sendFn, hasErrors bool) (compileFindings, err
 }
 
 // isConnectionFailure reports an editor that was momentarily unreachable (mid-reload) rather than
-// one that answered with a failure.
+// one that answered with a failure, or one the CLI proved dead: retrying a crashed editor for the
+// whole deadline is how an agent spends ten minutes learning Unity is not coming back.
 func isConnectionFailure(err error) bool {
 	if err == nil {
+		return false
+	}
+	var failure *client.ConnectionFailure
+	if errors.As(err, &failure) && failure.Crashed() {
 		return false
 	}
 	msg := err.Error()

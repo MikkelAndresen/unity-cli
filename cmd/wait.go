@@ -135,7 +135,7 @@ func waitCmd(args []string, send sendFn, resolve instanceResolver, out io.Writer
 		return noReply("editor: %v", err)
 	}
 	if age := heartbeatAge(baseline); age > staleHeartbeatAge {
-		report := staleHeartbeatReport(baseline, age, client.FindEditorEvidence(baseline.ProjectPath, baseline.Port))
+		report := stalledEditorReport(baseline, age, assessCrash(baseline))
 		return noReply("%s", report)
 	}
 	r.State, r.Port, r.PID = baseline.State, baseline.Port, baseline.PID
@@ -168,7 +168,7 @@ func waitCmd(args []string, send sendFn, resolve instanceResolver, out io.Writer
 		// --timeout will make it answer. The threshold is looser than statusCmd's because a domain
 		// reload pauses the writes for a couple of seconds.
 		if age := heartbeatAge(status); age > waitSilentHeartbeat {
-			report := staleHeartbeatReport(status, age, client.FindEditorEvidence(status.ProjectPath, status.Port))
+			report := stalledEditorReport(status, age, assessCrash(status))
 			return noReply("%s", report)
 		}
 
@@ -230,9 +230,11 @@ func heartbeatAge(inst *client.Instance) time.Duration {
 	return time.Since(time.UnixMilli(inst.Timestamp))
 }
 
-// staleHeartbeatAge matches the cut-off statusCmd uses before calling an editor unresponsive. The
-// connector rewrites its heartbeat twice a second, including while it compiles.
-const staleHeartbeatAge = 3 * time.Second
+// staleHeartbeatAge is the cut-off statusCmd uses before calling an editor unresponsive. The client
+// applies the same value when it judges whether a silent editor crashed instead of reloaded, so the
+// two never disagree about what "stopped beating" means. The connector rewrites its heartbeat twice a
+// second, including while it compiles.
+const staleHeartbeatAge = client.BeatSilenceAge
 
 // waitSilentHeartbeat is the same judgement made while waiting, with room for a domain reload to
 // pause the writes.

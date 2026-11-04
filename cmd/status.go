@@ -21,8 +21,13 @@ func statusCmd(inst *client.Instance) error {
 	}
 
 	age := time.Since(time.UnixMilli(status.Timestamp))
-	if age > 3*time.Second {
-		fmt.Fprint(os.Stderr, staleHeartbeatReport(status, age, client.FindEditorEvidence(status.ProjectPath, status.Port)))
+	if age > staleHeartbeatAge {
+		verdict := assessCrash(status)
+		fmt.Fprint(os.Stderr, oneTrailingNewline(stalledEditorReport(status, age, verdict)))
+		if verdict.Crashed {
+			// A dead editor is not a state an agent can wait out, so it leaves as a failed exit.
+			return fmt.Errorf("%s", crashLine(status, verdict))
+		}
 		return checkConnectorVersion(status, Version, flagIgnoreVersionMismatch)
 	}
 
@@ -53,14 +58,29 @@ func staleHeartbeatReport(status *client.Instance, age time.Duration, ev *client
 
 func discoverStatusInstance(project string, port int) (*client.Instance, error) {
 	if port > 0 {
-		return client.FindByPort(port)
+		return readStatus(port)
 	}
-	return client.DiscoverInstance(project, 0)
+	inst, err := client.DiscoverInstance(project, 0)
+	if err == nil {
+		return inst, nil
+	}
+	// The instance scan deletes heartbeats whose pid is gone, which is what a crash leaves behind. When
+	// the file on disk still reads as one, that is the answer `status` owes the caller, so it is read
+	// past the scan. Anything else keeps the original "no Unity instances" failure.
+	if raw := client.NewestHeartbeat(project, 0); raw != nil && assessCrash(raw).Crashed {
+		return raw, nil
+	}
+	return nil, err
 }
 
-// readStatus finds the instance file matching the given port (any state).
+// readStatus finds the instance file matching the given port (any state). It reads the file directly
+// instead of through the instance scan, which would delete a crashed editor's heartbeat before
+// anything could judge it.
 func readStatus(port int) (*client.Instance, error) {
-	return client.FindByPort(port)
+	if inst := client.NewestHeartbeat("", port); inst != nil {
+		return inst, nil
+	}
+	return nil, fmt.Errorf("no instance on port %d", port)
 }
 
 func connectorVersionLabel(version string) string {
@@ -104,6 +124,9 @@ func waitForAlive(resolve instanceResolver, timeoutMs int) (*client.Instance, er
 	baseline := time.Now().UnixMilli()
 	inst, err := resolve()
 	if err == nil {
+		if err := crashedWhileWaiting(inst); err != nil {
+			return nil, err
+		}
 		baseline = inst.Timestamp
 		// Already fresh — check if timestamp was updated within the last second
 		if time.Now().UnixMilli()-baseline < 1000 {
@@ -124,9 +147,26 @@ func waitForAlive(resolve instanceResolver, timeoutMs int) (*client.Instance, er
 			fmt.Fprintf(os.Stderr, "Unity is ready.\n")
 			return inst, nil
 		}
+		if err := crashedWhileWaiting(inst); err != nil {
+			return nil, err
+		}
 	}
 
 	return nil, fmt.Errorf("timed out waiting for Unity")
+}
+
+// crashedWhileWaiting answers with the crash report when the heartbeat on disk belongs to an editor
+// the evidence says is dead, and nil otherwise — including for a heartbeat that is merely silent, which
+// is the case the wait exists to ride out. The artifact scan is skipped until the beat has been silent
+// long enough for `wait` to give up anyway, so the common live case never pays for it.
+func crashedWhileWaiting(inst *client.Instance) error {
+	if inst == nil || heartbeatAge(inst) <= waitSilentHeartbeat {
+		return nil
+	}
+	if verdict := assessCrash(inst); verdict.Crashed {
+		return crashedError(inst, verdict, nil)
+	}
+	return nil
 }
 
 // waitForReadyTo polls until the heartbeat state becomes "ready" again after a compile request,

@@ -133,6 +133,31 @@ func projectCandidates(project string, port int) []string {
 	return dirs
 }
 
+// NewestHeartbeat returns the newest instance file for the target whatever its state is, and without
+// pruning anything. ScanInstances drops files whose pid is gone, which is exactly what a crash leaves
+// behind; the crash verdict and `status` need that record, so they read the disk through here.
+// project is the --project value (path or substring, "" for any) and port the --port value (0 when
+// unset).
+func NewestHeartbeat(project string, port int) *Instance {
+	var best *Instance
+
+	files, _ := rawInstanceFiles()
+	for _, f := range files {
+		inst := f.Instance
+		if port > 0 && inst.Port != port {
+			continue
+		}
+		if project != "" && !projectMatches(inst.ProjectPath, project) {
+			continue
+		}
+		if best == nil || inst.Timestamp > best.Timestamp {
+			beat := inst
+			best = &beat
+		}
+	}
+	return best
+}
+
 // findStaleHeartbeat returns the newest heartbeat for the target that stopped arriving.
 // Files the connector marked "stopped" are skipped: that is a clean shutdown, not a silent one.
 func findStaleHeartbeat(project string, port int) (*Instance, string) {

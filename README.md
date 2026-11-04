@@ -830,7 +830,41 @@ unity-cli status
 #   PID:     12345
 ```
 
-The CLI also checks Unity's state automatically before sending any command. If Unity is busy (compiling, reloading), it waits for Unity to become responsive. If a modal dialog is open (state `modal`), it fails immediately and shows the dialog; see [Modal Dialogs](#modal-dialogs-macos). If a player build has the main thread (state `building`), the job id, phase and elapsed time are printed with it; see [Build a Player](#build-a-player-long-running). If nothing answers but the project looks open (`Temp/UnityLockfile`, or a heartbeat that went silent), the state is `editor_starting_or_blocked`; see [Startup Dialogs](#startup-dialogs-macos-host).
+The CLI also checks Unity's state automatically before sending any command. If Unity is busy (compiling, reloading), it waits for Unity to become responsive. If a modal dialog is open (state `modal`), it fails immediately and shows the dialog; see [Modal Dialogs](#modal-dialogs-macos). If a player build has the main thread (state `building`), the job id, phase and elapsed time are printed with it; see [Build a Player](#build-a-player-long-running). If nothing answers but the project looks open (`Temp/UnityLockfile`, or a heartbeat that went silent), the state is `editor_starting_or_blocked`; see [Startup Dialogs](#startup-dialogs-macos-host). If the editor's process died instead, the state is `crashed`; see [Editor Crashes](#editor-crashes).
+
+### Editor Crashes
+
+```bash
+unity-cli status
+# Output: Unity (port 8090): crashed (last heartbeat 30s ago)
+#   Crash log: /Users/me/Work/MyGame/mono_crash.1b6a4e0a.0.json (mono_crash, written 25s ago)
+#              signal 11 (SIGSEGV); System.NullReferenceException: Object reference not set to an instance of an object
+```
+
+A hard crash, a domain reload and a dropped socket all look the same over HTTP: `EOF`. Before reporting
+one, the CLI reads what the editor left on disk and says which of the three it is:
+
+| Verdict | Evidence | What the CLI says |
+|---------|----------|-------------------|
+| `crashed` | the heartbeat's pid is gone from a machine whose process table still lists Unity processes, **or** the heartbeat stopped without writing its `stopped` marker while a crash artifact newer than that beat exists | `editor process <pid> exited during the request (crash)`, the artifact path, and its first exception line |
+| reload / port change | the heartbeat is still arriving, but says `compiling`/`reloading`/`refreshing`/`building`/`modal`, or the connector answers on a new port | `Unity reloaded or rebound its port during the request (not a crash)`; run `unity-cli wait` |
+| unchanged | none of the above (including a request that merely timed out) | the original `cannot connect to Unity at port …: EOF` |
+
+Crash artifacts are `<project>/mono_crash.*.json` (and the same file under `<project>/Logs`), plus the
+macOS host's `~/Library/Logs/DiagnosticReports/Unity-*.ips` and `~/Library/Logs/Unity/Editor-prev.log`.
+Only artifacts **newer than the last heartbeat** (or newer than the request start) count, so a dump from
+an earlier crash is never blamed on a new silence. `Editor-prev.log` needs crash wording in its tail to
+count, because Unity rotates it on clean quits too. At most three artifacts are printed, each with one
+bounded line from the file — Mono's `payload`/`threads` structure is parsed defensively, and a truncated
+dump still yields its reason.
+
+That pointer matters because `Logs/Editor.log` rotates when Unity restarts: after the crash the dump is
+the only surviving record of what killed it.
+
+`status` reports `crashed` and **exits non-zero** — a dead editor is not a state an agent can wait out.
+Retry loops stop on that verdict instead of polling a dead editor for their whole timeout. Inside a
+container that cannot see the host's processes, a missing pid proves nothing, so only the artifact route
+can decide there; the verdict always prints which evidence it used.
 
 ## Global Options
 

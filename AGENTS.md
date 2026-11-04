@@ -18,7 +18,8 @@ cmd/                  # Go CLI — thin passthrough layer
   dialogs.go          # dialogs command (macOS only): list/click Unity windows with AppleScript
   update.go           # self-update from GitHub releases
   version_check.go    # periodic update notice (12h interval)
-internal/client/      # Unity HTTP client, instance discovery, Temp/UnityLockfile evidence
+internal/client/      # Unity HTTP client, instance discovery, Temp/UnityLockfile evidence,
+                      # crash artifacts (mono_crash/Editor-prev.log) and why a dropped connection died
 unity-connector/      # C# Unity Editor package (UPM)
   Editor/
     Core/             # Shared utilities (Response, ParamCoercion, ToolParams, StringCaseUtility, StackTraceFilter, CompileProvenance)
