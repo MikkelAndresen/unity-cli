@@ -177,12 +177,34 @@ namespace UnityCliConnector
 
             // `using (…)` and `using var …` are statements/declarations inside the body.
             if (code[p] == '(') return false;
-            if (string.CompareOrdinal(code, p, "var", 0, 3) == 0 &&
-                (p + 3 >= code.Length || !IsIdentifierPart(code[p + 3])))
-                return false;
+            if (IsKeywordAt(code, p, "var")) return false;
+            if (IsKeywordAt(code, p, "static"))
+            {
+                contentStart = p;
+                return true;
+            }
+
+            // `using <Type> <name> = …;` is a declaration too: the first token is a type
+            // and the next one starts the variable name. A directive's first token is the
+            // whole namespace or alias target, so nothing identifier-like follows it (a
+            // dot separated by whitespace does not count).
+            var semicolon = code.IndexOf(';', p);
+            if (semicolon < 0) return false;
+            var content = code.Substring(p, semicolon - p).TrimEnd();
+            var tokenEnd = 0;
+            while (tokenEnd < content.Length && !char.IsWhiteSpace(content[tokenEnd])) tokenEnd++;
+            var rest = content.Substring(tokenEnd).TrimStart();
+            if (rest.Length > 0 && (char.IsLetter(rest[0]) || rest[0] == '_')) return false;
 
             contentStart = p;
             return true;
+        }
+
+        private static bool IsKeywordAt(string code, int pos, string keyword)
+        {
+            if (string.CompareOrdinal(code, pos, keyword, 0, keyword.Length) != 0) return false;
+            var end = pos + keyword.Length;
+            return end >= code.Length || !IsIdentifierPart(code[end]);
         }
 
         private static bool IsIdentifierPart(char c)

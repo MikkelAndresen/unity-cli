@@ -222,6 +222,8 @@ Collapse를 끈 뒤 원래대로 복원하므로, `--type`은 창에 보이는 �
 
 `return`으로 결과를 받습니다. 주요 namespace는 기본 포함. 프로젝트 전용 타입(예: `Unity.Entities`)만 `--usings`로 추가합니다.
 
+`System`과 `UnityEngine`은 모두 `Object`, `Random`, `Debug`를 정의하므로, 이 이름들은 기본 alias로 Unity 타입에 연결되어 CS0104가 나지 않습니다. 스니펫 맨 위의 `using` 지시문은 생성된 메서드 위로 옮겨지고, 직접 선언한 alias가 기본 alias보다 우선합니다. 기본 집합을 완전히 바꾸려면 `--no_default_usings`로 기본 import와 alias를 끄고 `--usings`로 필요한 것을 나열합니다.
+
 ```bash
 unity-cli exec "return Application.dataPath;"
 unity-cli exec "return EditorSceneManager.GetActiveScene().name;"
@@ -249,6 +251,17 @@ echo 'for (int i = 0; i < 3; i++) { yield return null; yield return i; }' | unit
 대기는 `--await_timeout <ms>`로 제한된다 (기본 30000, `0`은 무한 대기). 대기가 이 시간을 넘기면 응답이 `{"timed_out": true, "status": "WaitingForActivation", "steps": N}`를 담은 error로 온다 — 작업은 에디터에서 계속 동작 중이며 그 응답으로는 결과를 알 수 없다. domain reload는 대기 중인 결과를 조용히 사라지게 하므로, 오래 걸리는 결과는 static field나 `ScriptableObject`에 보관하고 두 번째 `exec`로 읽어온다.
 
 `exec`는 실제 C#을 컴파일하고 실행하므로, 커스텀 도구가 할 수 있는 모든 것을 할 수 있습니다 — ECS 엔티티 조사, 에셋 수정, 내부 API 호출, 에디터 유틸리티 실행. AI 에이전트에게 이것은 **도구 코드를 한 줄도 작성하지 않고 Unity 전체 런타임에 즉시 접근**할 수 있다는 의미입니다. stdin 파이프를 사용하면 복잡한 코드에서 shell escaping 문제를 피할 수 있습니다.
+
+**결과 형태.** 반환값은 public field와 읽을 수 있는 public property에서 직렬화되므로, anonymous type, property만 가진 에디터 API 객체, list, dictionary, 중첩 객체가 `ToString()` 문자열이 아니라 JSON 객체로 돌아옵니다. 컬렉션은 100개, 깊이는 6에서 잘리고, cycle은 `"<cycle: Type>"`, 예외를 던지는 property는 형제를 잃지 않은 채 `"<error: Type: message>"`가 됩니다. Unity 객체는 식별 문자열(`"Main Camera (UnityEngine.Camera)"`)을 유지하고, Unity math struct는 `Vector3.normalized` 같은 파생값 대신 데이터 멤버를 노출합니다. 직렬화나 `ToString()` fallback이 일어나면 `data`는 문자열이 되고 `meta`에 `serialization_error`가 담깁니다 — `--meta`로 확인합니다.
+
+**컴파일 캐시.** `exec`는 스니펫을 `csc` subprocess로 컴파일하고, 에디터 메인 스레드를 막지 않고 기다린 뒤 로드/실행합니다. 같은 호출(같은 본문, 같은 `--usings`, 같은 reference 집합)은 이미 로드된 어셈블리를 재사용하므로 반복 probe가 프레임 하나로 끝납니다. 응답은 `meta: {"compile":"compiled|cached","compile_ms":N,"reference_assemblies":N}`로 이를 알리며 `data`와 분리되어 있어 결과 파싱은 그대로입니다. `--meta`를 주면 stderr로 출력됩니다.
+
+```bash
+unity-cli exec --meta "return Application.dataPath;"   # meta: {"compile":"compiled",…}
+unity-cli exec --meta "return Application.dataPath;"   # meta: {"compile":"cached",…}
+```
+
+캐시 조회는 256개로 제한되며, evict된 스니펫의 어셈블리는 어차피 다음 domain reload 전까지 domain에 남습니다 (Mono는 unload하지 못합니다). 컴파일 중 에디터가 reload되면 stale 컴파일을 실행하지 않고 error로 응답합니다.
 
 ### 메뉴 아이템
 

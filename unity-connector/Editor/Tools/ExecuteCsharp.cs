@@ -81,7 +81,7 @@ namespace UnityCliConnector.Tools
                 if (usingsToken.Type == JTokenType.Array)
                     extraUsings.AddRange(usingsToken.ToObject<string[]>());
                 else
-                    extraUsings.AddRange(usingsToken.ToString().Split(','));
+                    extraUsings.AddRange(SplitUsingList(usingsToken.ToString()));
             }
 
             var includeDefaults = !(p.GetBool("no_default_usings") || p.GetBool("noDefaultUsings"));
@@ -91,6 +91,27 @@ namespace UnityCliConnector.Tools
             return await CompileAndExecute(
                 ExecSource.Build(code, extraUsings, includeDefaults, DetectBodyKind(code)),
                 cscPath, dotnetPath, awaitTimeout);
+        }
+
+        /// <summary>
+        /// Splits the comma-separated --usings value, leaving commas inside a generic
+        /// argument list (`Map = Dictionary<string, int>`) in the same entry.
+        /// </summary>
+        private static IEnumerable<string> SplitUsingList(string raw)
+        {
+            var depth = 0;
+            var start = 0;
+            for (var i = 0; i < raw.Length; i++)
+            {
+                if (raw[i] == '<') depth++;
+                else if (raw[i] == '>' && depth > 0) depth--;
+                else if (raw[i] == ',' && depth == 0)
+                {
+                    yield return raw.Substring(start, i - start);
+                    start = i + 1;
+                }
+            }
+            yield return raw.Substring(start);
         }
 
         /// <summary>
@@ -297,7 +318,12 @@ namespace UnityCliConnector.Tools
                     ? await Task.Run(() => FindDotnetFile(dotnetOverride, contentsPath, isWindowsEditor))
                         .ConfigureAwait(false)
                     : null;
-                s_CompilerMemoKey = memoKey;
+                // A missing compiler is not memoized: the lookup can run while the Unity
+                // install is still being populated, and caching that would fail every later
+                // exec until a domain reload.
+                if (s_CscPath != null &&
+                    (!s_CscPath.EndsWith(".dll", StringComparison.OrdinalIgnoreCase) || s_DotnetPath != null))
+                    s_CompilerMemoKey = memoKey;
             }
 
             if (s_CscPath == null)
@@ -418,16 +444,17 @@ namespace UnityCliConnector.Tools
             public int GetHashCode(object obj) => RuntimeHelpers.GetHashCode(obj);
         }
 
+        private sealed class SerializeContext
+        {
+            internal readonly HashSet<object> Path = new HashSet<object>(ReferenceComparer.Instance);
+            /// Set when a value had to be reported as ToString() because it exposed no members.
+            internal string Fallback;
+        }
+
         internal static object Serialize(object obj)
         {
             string ignored;
-            return Serialize(obj, 0, out ignored);
-        }
-
-        internal static object Serialize(object obj, int depth)
-        {
-            string ignored;
-            return Serialize(obj, depth, out ignored);
+            return Serialize(obj, out ignored);
         }
 
         internal static object Serialize(object obj, out string serializationError)
@@ -438,9 +465,14 @@ namespace UnityCliConnector.Tools
         private static object Serialize(object obj, int depth, out string serializationError)
         {
             serializationError = null;
+            var context = new SerializeContext();
             try
             {
-                return SerializeValue(obj, depth, new HashSet<object>(ReferenceComparer.Instance));
+                var value = SerializeValue(obj, depth, context);
+                // The issue's second half: a ToString() fallback must be visible in meta,
+                // not only an exception escaping the walk.
+                serializationError = context.Fallback;
+                return value;
             }
             catch (Exception ex)
             {
@@ -452,7 +484,15 @@ namespace UnityCliConnector.Tools
             }
         }
 
-        private static object SerializeValue(object obj, int depth, HashSet<object> path)
+        private static object FallbackToToString(object obj, SerializeContext context)
+        {
+            if (context.Fallback == null)
+                context.Fallback = "no serializable members on " + obj.GetType().FullName +
+                    "; returned ToString()";
+            return SafeToString(obj);
+        }
+
+        private static object SerializeValue(object obj, int depth, SerializeContext context)
         {
             if (obj == null) return null;
 
@@ -469,11 +509,16 @@ namespace UnityCliConnector.Tools
             // Transform/GameObject graphs contain cycles.
             if (obj is UnityEngine.Object) return SafeToString(obj);
 
+            // JToken is IEnumerable<JToken>, so the enumerable branch would emit its
+            // JProperty wrappers as nested arrays and lose the payload. Its ToString is
+            // the JSON text the caller returned.
+            if (obj is JToken) return SafeToString(obj);
+
             var tracked = !type.IsValueType;
             if (tracked)
             {
-                if (path.Contains(obj)) return "<cycle: " + type.Name + ">";
-                path.Add(obj);
+                if (context.Path.Contains(obj)) return "<cycle: " + type.Name + ">";
+                context.Path.Add(obj);
             }
 
             try
@@ -486,32 +531,32 @@ namespace UnityCliConnector.Tools
                     if (task.IsCompleted && !task.IsFaulted && !task.IsCanceled)
                     {
                         var inner = TaskResultOf(task);
-                        return inner == null ? "<completed>" : SerializeValue(inner, depth + 1, path);
+                        return inner == null ? "<completed>" : SerializeValue(inner, depth + 1, context);
                     }
                     return $"<task {task.Status}>";
                 }
 
                 if (depth >= MaxDepth) return "<truncated at depth " + MaxDepth + ">";
 
-                if (obj is IDictionary dict) return SerializeDictionary(dict, depth, path);
-                if (obj is IEnumerable enumerable) return SerializeEnumerable(enumerable, depth, path);
+                if (obj is IDictionary dict) return SerializeDictionary(dict, depth, context);
+                if (obj is IEnumerable enumerable) return SerializeEnumerable(enumerable, depth, context);
 
                 var mathMembers = MathMemberNames(type);
                 if (mathMembers != null)
-                    return SerializeMath(obj, type, mathMembers, depth, path);
+                    return SerializeMath(obj, type, mathMembers, depth, context);
 
                 if (type.IsValueType || type.IsClass)
-                    return SerializeMembers(obj, type, depth, path);
+                    return SerializeMembers(obj, type, depth, context);
 
-                return SafeToString(obj);
+                return FallbackToToString(obj, context);
             }
             finally
             {
-                if (tracked) path.Remove(obj);
+                if (tracked) context.Path.Remove(obj);
             }
         }
 
-        private static object SerializeDictionary(IDictionary dict, int depth, HashSet<object> path)
+        private static object SerializeDictionary(IDictionary dict, int depth, SerializeContext context)
         {
             var result = new Dictionary<string, object>();
             var count = 0;
@@ -525,13 +570,13 @@ namespace UnityCliConnector.Tools
 
                 var key = entry.Key == null ? "null" : SafeToString(entry.Key);
                 if (key == null) key = "null";
-                try { result[key] = SerializeValue(entry.Value, depth + 1, path); }
+                try { result[key] = SerializeValue(entry.Value, depth + 1, context); }
                 catch (Exception ex) { result[key] = ErrorText(ex); }
             }
             return result;
         }
 
-        private static object SerializeEnumerable(IEnumerable enumerable, int depth, HashSet<object> path)
+        private static object SerializeEnumerable(IEnumerable enumerable, int depth, SerializeContext context)
         {
             var result = new List<object>();
             var count = 0;
@@ -543,14 +588,14 @@ namespace UnityCliConnector.Tools
                     break;
                 }
 
-                try { result.Add(SerializeValue(item, depth + 1, path)); }
+                try { result.Add(SerializeValue(item, depth + 1, context)); }
                 catch (Exception ex) { result.Add(ErrorText(ex)); }
             }
             return result;
         }
 
         private static object SerializeMath(object obj, Type type, string[] memberNames, int depth,
-            HashSet<object> path)
+            SerializeContext context)
         {
             var result = new Dictionary<string, object>();
             foreach (var name in memberNames)
@@ -558,20 +603,20 @@ namespace UnityCliConnector.Tools
                 var property = type.GetProperty(name, BindingFlags.Public | BindingFlags.Instance);
                 if (property != null && property.CanRead && property.GetIndexParameters().Length == 0)
                 {
-                    try { result[name] = SerializeValue(property.GetValue(obj, null), depth + 1, path); }
+                    try { result[name] = SerializeValue(property.GetValue(obj, null), depth + 1, context); }
                     catch (Exception ex) { result[name] = ErrorText(ex); }
                     continue;
                 }
 
                 var field = type.GetField(name, BindingFlags.Public | BindingFlags.Instance);
                 if (field == null) continue;
-                try { result[name] = SerializeValue(field.GetValue(obj), depth + 1, path); }
+                try { result[name] = SerializeValue(field.GetValue(obj), depth + 1, context); }
                 catch (Exception ex) { result[name] = ErrorText(ex); }
             }
-            return result.Count > 0 ? (object)result : SafeToString(obj);
+            return result.Count > 0 ? (object)result : FallbackToToString(obj, context);
         }
 
-        private static object SerializeMembers(object obj, Type type, int depth, HashSet<object> path)
+        private static object SerializeMembers(object obj, Type type, int depth, SerializeContext context)
         {
             var result = new Dictionary<string, object>();
             var count = 0;
@@ -586,7 +631,7 @@ namespace UnityCliConnector.Tools
                 if (result.ContainsKey(property.Name)) continue;
 
                 count++;
-                try { result[property.Name] = SerializeValue(property.GetValue(obj, null), depth + 1, path); }
+                try { result[property.Name] = SerializeValue(property.GetValue(obj, null), depth + 1, context); }
                 catch (Exception ex) { result[property.Name] = ErrorText(ex); }
             }
 
@@ -598,13 +643,13 @@ namespace UnityCliConnector.Tools
                     if (field.IsStatic || result.ContainsKey(field.Name)) continue;
 
                     count++;
-                    try { result[field.Name] = SerializeValue(field.GetValue(obj), depth + 1, path); }
+                    try { result[field.Name] = SerializeValue(field.GetValue(obj), depth + 1, context); }
                     catch (Exception ex) { result[field.Name] = ErrorText(ex); }
                 }
             }
 
             if (truncated) result[TruncatedMarker] = TruncatedMarker;
-            return result.Count > 0 ? (object)result : SafeToString(obj);
+            return result.Count > 0 ? (object)result : FallbackToToString(obj, context);
         }
 
         /// <summary>

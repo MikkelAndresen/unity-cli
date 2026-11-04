@@ -191,3 +191,16 @@ orchestrator to compile and run, per the task's no-editor-access override.
   code is left in the body and will still fail to compile as it should.
 - Cache keys include the generated source, so a cached snippet cannot be reused
   after a change to aliases, hoisting, or `--no_default_usings`.
+
+## Review follow-up
+
+- A C# 8 using declaration (`using FileStream fs = File.OpenRead(p);`) was classified as
+  a directive and hoisted to file scope, so a snippet that worked before this change
+  failed with a using-clause error. `IsUsingDirectiveStart` now treats a `using` line as a
+  directive only when the first token is the whole namespace/alias target (nothing
+  identifier-like follows it); `using static X;` remains a directive. Covered by
+  `ExecSourceTests.UsingDeclarationWithAnExplicitType_IsNotHoisted` and
+  `UsingDeclarationWithAnExplicitType_CompilesInTheBody`.
+- `--usings` is no longer split on commas inside a generic argument list, so
+  `Map = Dictionary<string,int>` arrives as one alias (`SplitUsingList`). Covered by
+  `ExecSourceTests.ExtraUsingsWithAGenericAlias_KeepTheCommasInsideTheAlias`.

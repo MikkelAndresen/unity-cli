@@ -119,3 +119,16 @@ EditMode tests and the orchestrator must compile and run them against the editor
   every derived property.
 - Truncation markers are strings in the result shape; a consumer must not treat a dictionary
   key `"... (truncated at 100)"` as user data.
+
+## Review follow-up
+
+- The `ToString()` fallback was still silent: `return new object();` answered
+  `data: "System.Object"` with no marker in `meta`. `Serialize` now records when a value
+  exposes no serializable members and sets `serialization_error`, so the claim above that
+  the marker appears "only when the fallback was used" holds for this path too
+  (`ExecSerializeTests.ObjectWithoutMembers_ReportsTheToStringFallback`).
+- A returned Newtonsoft `JToken` was walked as `IEnumerable<JToken>` and came back as nested
+  arrays of empty `JProperty` dumps. `JToken` keeps its JSON text, as it did before the
+  structural serializer (`ExecSerializeTests.JToken_SerializesAsItsJsonText`).
+- The unused `Serialize(object, int)` overload was removed; the only test-facing overload
+  left is the one that reports `serialization_error`.

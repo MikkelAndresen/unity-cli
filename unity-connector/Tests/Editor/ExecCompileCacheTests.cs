@@ -111,9 +111,10 @@ namespace UnityCliConnector.Tests
             Assert.AreEqual(6, without.data);
             Assert.AreEqual("compiled", MetaOf(without)["compile"].Value<string>());
 
-            var withExtra = await Exec("return 1;", "UnityEditorInternal,UnityEditor");
+            var withExtra = await Exec("return Enumerable.Range(1, 3).Sum();", "System.Linq,UnityEditorInternal");
+            Assert.AreEqual(6, withExtra.data);
             Assert.AreEqual("compiled", MetaOf(withExtra)["compile"].Value<string>(),
-                "a different using set is a different compile, not a cache hit");
+                "the same body with different usings is a different compile, not a cache hit");
         }
 
         [Test]

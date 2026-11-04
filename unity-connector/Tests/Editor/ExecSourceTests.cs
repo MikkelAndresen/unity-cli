@@ -103,6 +103,17 @@ namespace UnityCliConnector.Tests
         }
 
         [Test]
+        public void UsingDeclarationWithAnExplicitType_IsNotHoisted()
+        {
+            const string declaration =
+                "using System.IO.MemoryStream s = new System.IO.MemoryStream(new byte[4]);";
+
+            var source = Build(declaration + " return s.Length;");
+
+            StringAssert.Contains(declaration, BodyOf(source));
+        }
+
+        [Test]
         public void CommentsAroundLeadingUsings_StayInTheBody()
         {
             var source = Build("// pick a namespace\nusing System.Numerics;\n// body comment\nreturn 1;");
@@ -164,6 +175,24 @@ namespace UnityCliConnector.Tests
             var code = "using Object = System.Object;\nreturn typeof(Object).FullName;";
 
             Assert.AreEqual("System.Object", DataOf(await Exec(code)));
+        }
+
+        [Test]
+        public async Task ExtraUsingsWithAGenericAlias_KeepTheCommasInsideTheAlias()
+        {
+            var code = "Map m = new Map(); m[\"a\"] = 1; return m[\"a\"];";
+
+            Assert.AreEqual(1,
+                DataOf(await Exec(code, usings: "Map = System.Collections.Generic.Dictionary<string,int>")));
+        }
+
+        [Test]
+        public async Task UsingDeclarationWithAnExplicitType_CompilesInTheBody()
+        {
+            var code =
+                "using System.IO.MemoryStream s = new System.IO.MemoryStream(new byte[4]); return s.Length;";
+
+            Assert.AreEqual(4L, DataOf(await Exec(code)));
         }
 
         [Test]
