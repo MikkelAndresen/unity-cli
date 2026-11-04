@@ -71,6 +71,17 @@ namespace UnityCliConnector.Tests
         }
 
         [Test]
+        public void MarkBuildFinished_DropsTheForcedBuildingState()
+        {
+            // MarkBuildStarted forces the state to "building"; a build that does not pump the update
+            // loop returns with that still forced, and MarkBuildFinished must not write it back.
+            Heartbeat.MarkBuildStarted();
+            Heartbeat.MarkBuildFinished();
+
+            Assert.AreNotEqual(BuildJobRecord.PhaseBuilding, Heartbeat.LastState);
+        }
+
+        [Test]
         public void BuildStatus_OmitsBuildWhenNoBuildIsRunning()
         {
             var settings = new Newtonsoft.Json.JsonSerializerSettings { NullValueHandling = Newtonsoft.Json.NullValueHandling.Ignore };

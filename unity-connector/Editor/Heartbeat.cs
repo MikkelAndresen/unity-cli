@@ -161,6 +161,8 @@ namespace UnityCliConnector
         {
             s_BuildActive = false;
             s_BuildInfo = null;
+            // MarkBuildStarted forced the state; leaving it would write "building" with no build.
+            if (s_ForcedState == BuildJobRecord.PhaseBuilding) s_ForcedState = null;
             Write();
         }
 

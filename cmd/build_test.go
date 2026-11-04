@@ -164,6 +164,9 @@ func TestBuildCmd_WaitsAndPrintsProgress(t *testing.T) {
 	if !strings.Contains(string(resp.Data), `"phase":"succeeded"`) {
 		t.Errorf("final payload should be the terminal job report, got %s", string(resp.Data))
 	}
+	if strings.Contains(out, "\nsucceeded 5m02s") {
+		t.Errorf("a finished job must not print a progress line before the summary:\n%s", out)
+	}
 }
 
 func TestBuildCmd_FailedBuildReturnsReportAndError(t *testing.T) {
@@ -463,6 +466,8 @@ func TestFormatBytes(t *testing.T) {
 		{2048, "2.0 KB"},
 		{138_000_000, "131.6 MB"},
 		{5_000_000_000, "4.7 GB"},
+		// 1 PiB: used to index "KMGT"[4] and panic.
+		{1 << 50, "1024.0 TB"},
 	}
 	for _, tt := range tests {
 		if got := formatBytes(tt.in); got != tt.want {
