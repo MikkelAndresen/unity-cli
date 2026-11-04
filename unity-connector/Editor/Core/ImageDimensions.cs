@@ -7,6 +7,7 @@ namespace UnityCliConnector
     internal static class ImageDimensions
     {
         const int PngHeaderLength = 24;
+        const int PngTrailerLength = 12;
 
         /// PNG IHDR width and height. ScreenCapture only ever writes PNG, so a file with a
         /// different (or not yet written) header reports no size rather than guessing — a
@@ -40,6 +41,49 @@ namespace UnityCliConnector
             width = ReadBigEndianInt32(header, 16);
             height = ReadBigEndianInt32(header, 20);
             return width > 0 && height > 0;
+        }
+
+        /// <summary>
+        /// True when the file ends with the PNG IEND chunk. ScreenCapture writes the file itself,
+        /// so the file is the only completion signal there is: a write still in progress has the
+        /// header (the first chunk written) but cannot have IEND (the last one).
+        /// </summary>
+        internal static bool IsCompletePng(string path)
+        {
+            var trailer = new byte[PngTrailerLength];
+            int read;
+
+            try
+            {
+                using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+                if (stream.Length < PngTrailerLength) return false;
+                stream.Seek(-PngTrailerLength, SeekOrigin.End);
+                read = 0;
+                while (read < PngTrailerLength)
+                {
+                    var chunk = stream.Read(trailer, read, PngTrailerLength - read);
+                    if (chunk <= 0) break;
+                    read += chunk;
+                }
+            }
+            catch (IOException)
+            {
+                return false;
+            }
+            catch (UnauthorizedAccessException)
+            {
+                return false;
+            }
+
+            if (read < PngTrailerLength) return false;
+
+            // IEND's data length is always 0, and its CRC is fixed by the PNG spec.
+            for (var i = 0; i < 4; i++)
+                if (trailer[i] != 0) return false;
+
+            return trailer[4] == (byte)'I' && trailer[5] == (byte)'E'
+                && trailer[6] == (byte)'N' && trailer[7] == (byte)'D'
+                && trailer[8] == 0xAE && trailer[9] == 0x42 && trailer[10] == 0x60 && trailer[11] == 0x82;
         }
 
         static bool IsPng(byte[] header)

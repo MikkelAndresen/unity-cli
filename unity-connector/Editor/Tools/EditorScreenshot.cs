@@ -203,12 +203,15 @@ namespace UnityCliConnector.Tools
             InternalEditorUtility.RepaintAllViews();
             EditorApplication.QueuePlayerLoopUpdate();
 
-            if (File.Exists(outputPath))
-                File.Delete(outputPath);
+            // Unity writes the file itself, so the copy on disk is complete only once IEND is
+            // there; until then it is a sibling of the caller's path, because a capture that
+            // never lands must not destroy the screenshot already at outputPath.
+            var partialPath = PartialCapturePath(outputPath);
+            TryDeleteCapture(partialPath);
 
             try
             {
-                ScreenCapture.CaptureScreenshot(outputPath);
+                ScreenCapture.CaptureScreenshot(partialPath);
             }
             catch (Exception ex) when (ex is NotSupportedException || ex is IOException)
             {
@@ -224,37 +227,43 @@ namespace UnityCliConnector.Tools
 
             var deadline = new Deadline(GameCaptureTimeoutMs);
             var updates = 0;
-            var previousLength = -1L;
-            var stableUpdates = 0;
 
-            while (!deadline.Expired)
+            while (true)
             {
-                await NextEditorUpdate();
+                var remaining = deadline.RemainingMs;
+                if (remaining <= 0) break;
+
+                var update = NextEditorUpdate(() =>
+                {
+                    EditorApplication.QueuePlayerLoopUpdate();
+                    InternalEditorUtility.RepaintAllViews();
+                });
+
+                // Raced against the clock and resumed off Unity's SynchronizationContext: a main
+                // thread that stops firing updates would otherwise never complete this await, and
+                // the deadline below would not bound anything. Nothing after this point touches a
+                // Unity API, so running it on whichever thread wins is safe.
+                if (!ReferenceEquals(await Task.WhenAny(update, Task.Delay(remaining)).ConfigureAwait(false), update))
+                    break;
+
                 updates++;
 
-                EditorApplication.QueuePlayerLoopUpdate();
-                InternalEditorUtility.RepaintAllViews();
-
-                var length = ProbeCaptureFile(outputPath);
-                if (length > 0 && length == previousLength)
+                if (ProbeCaptureFile(partialPath) > 0 && ImageDimensions.IsCompletePng(partialPath))
                 {
-                    // Unchanged across updates: the write is finished, not merely started.
-                    if (++stableUpdates >= 2)
-                        return GameCaptureResult(outputPath, length, updates, sizeRequested);
-                }
-                else
-                {
-                    stableUpdates = 0;
-                    previousLength = length;
+                    PublishCapture(partialPath, outputPath);
+                    return GameCaptureResult(outputPath, updates, sizeRequested);
                 }
             }
 
-            var lastLength = ProbeCaptureFile(outputPath);
+            var lastLength = ProbeCaptureFile(partialPath);
+            TryDeleteCapture(partialPath);
+
             return new ErrorResponse(
-                $"ScreenCapture never finished writing {outputPath} within {GameCaptureTimeoutMs}ms " +
-                $"({updates} editor updates; {DescribeProbe(lastLength)}). The Game view may not be " +
-                "rendering: check 'unity-cli status' for a paused editor, or capture with --mode camera, " +
-                "which renders a camera into a render texture without waiting on the game loop.",
+                $"ScreenCapture never finished writing the Game view capture within {GameCaptureTimeoutMs}ms " +
+                $"({updates} editor updates; {DescribeProbe(lastLength)}). {outputPath} was not replaced. " +
+                "The Game view may not be rendering: check 'unity-cli status' for a paused editor, or " +
+                "capture with --mode camera, which renders a camera into a render texture without " +
+                "waiting on the game loop.",
                 new
                 {
                     path = outputPath,
@@ -264,8 +273,44 @@ namespace UnityCliConnector.Tools
                 });
         }
 
-        private static object GameCaptureResult(string outputPath, long length, int updates, bool sizeRequested)
+        /// <summary>
+        /// The sibling file Unity writes to. Kept next to outputPath (same directory, .png name)
+        /// because the capture's own resolution and format come from the Game view, not the path.
+        /// </summary>
+        internal static string PartialCapturePath(string outputPath)
         {
+            var name = Path.GetFileNameWithoutExtension(outputPath) + ".partial.png";
+            var dir = Path.GetDirectoryName(outputPath);
+            return string.IsNullOrEmpty(dir) ? name : Path.Combine(dir, name);
+        }
+
+        internal static void PublishCapture(string partialPath, string outputPath)
+        {
+            if (File.Exists(outputPath))
+                File.Delete(outputPath);
+            File.Move(partialPath, outputPath);
+        }
+
+        /// Best effort: a writer still holding the partial file must not turn a timeout report into
+        /// an exception.
+        static void TryDeleteCapture(string path)
+        {
+            try
+            {
+                if (File.Exists(path))
+                    File.Delete(path);
+            }
+            catch (IOException)
+            {
+            }
+            catch (UnauthorizedAccessException)
+            {
+            }
+        }
+
+        private static object GameCaptureResult(string outputPath, int updates, bool sizeRequested)
+        {
+            var length = ProbeCaptureFile(outputPath);
             var hasSize = ImageDimensions.TryReadPng(outputPath, out var pngWidth, out var pngHeight);
             int? width = hasSize ? pngWidth : (int?)null;
             int? height = hasSize ? pngHeight : (int?)null;
@@ -333,13 +378,18 @@ namespace UnityCliConnector.Tools
             return window != null;
         }
 
-        private static Task NextEditorUpdate()
+        /// <summary>
+        /// The next editor update, run through <paramref name="onMainThread"/> before it is
+        /// awaited, because the continuation may resume on another thread.
+        /// </summary>
+        private static Task NextEditorUpdate(Action onMainThread)
         {
             var tcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
 
             void Handler()
             {
                 EditorApplication.update -= Handler;
+                onMainThread();
                 tcs.TrySetResult(true);
             }
 

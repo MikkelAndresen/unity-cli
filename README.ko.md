@@ -152,7 +152,7 @@ Unity 커넥터의 동작:
 | `reserialize` | Unity 시리얼라이저를 통해 에셋 재직렬화 |
 | `clear_burst_cache` | `Library/BurstCache`를 삭제해 Burst가 처음부터 다시 컴파일하게 함 |
 | `burst_status` | Burst 컴파일이 끝났는지, 어떤 `[BurstCompile]` 대상이 컴파일됐는지, 무엇이 실패했는지(BCxxxx) |
-| `screenshot` | Scene/Game 뷰를 PNG로 캡처 |
+| `screenshot` | 실행 중인 게임(Game 뷰, OnGUI 포함), 카메라, 또는 Scene 뷰를 PNG로 캡처 |
 | `profiler` | 프로파일러 하이어라키 읽기, 녹화 제어 |
 | `modal` | 에디터를 막고 있는 모달 다이얼로그 확인 및 응답 (macOS) |
 | `list` | 사용 가능한 모든 도구와 파라미터 스키마 표시 |
@@ -183,6 +183,32 @@ unity-cli editor refresh --compile
 # 플레이모드 중 강제 새로고침
 unity-cli editor refresh --force
 ```
+
+### 스크린샷
+
+```bash
+# 실행 중인 게임이 보여주는 화면 (OnGUI/IMGUI HUD 포함, 플레이 모드 필요)
+unity-cli editor play --wait
+unity-cli screenshot --mode gameview --output_path Temp/shots/hud.png
+
+# 카메라 하나를 지정한 크기로 오프스크린 렌더 (OnGUI·에디터 오버레이 없음)
+unity-cli screenshot --mode camera --width 3840 --height 2160
+
+# Scene 뷰 카메라 — 플레이 모드가 아닐 때 모드 없는 `screenshot`의 의미
+unity-cli screenshot
+```
+
+| mode | 캡처 대상 | 포함 | 제외 |
+|---|---|---|---|
+| `gameview` | 실행 중인 게임이 만든 프레임(`ScreenCapture.CaptureScreenshot`), Game 뷰 자체 해상도 | 게임의 OnGUI/IMGUI HUD | Game 뷰 탭의 에디터 UI(툴바, 해상도 드롭다운) |
+| `camera` | `Camera.main`을 `--width`/`--height` 크기의 렌더 텍스처로 오프스크린 렌더 | 해당 카메라의 렌더 | 게임 GUI(OnGUI/IMGUI), Scene 뷰 기즈모·Handles·에디터 오버레이 |
+| `scene` | Scene 뷰 카메라를 `--width`/`--height`로 오프스크린 렌더 | 현재 Scene 카메라가 보는 장면 | 기즈모와 Handles, Scene 뷰 오버레이 UI, 게임 GUI |
+
+`gameview`는 플레이 모드의 기본값이고 `scene`은 에디트 모드의 기본값입니다(모드 없는 `screenshot`이 원래 하던 일). `gameview`는 플레이 모드가 필요합니다: 에디트 모드에서는 게임 프레임이 없어 Unity가 파일을 쓰지 않으므로, 멈추지 않고 그 사실을 알려줍니다. 일시정지된 게임도 프레임을 만들지 않으므로 같은 이유로 에러를 내며, 이때는 게임 루프 없이 렌더하는 `--mode camera`를 쓰면 됩니다. Unity는 캡처를 같은 디렉터리의 `*.partial.png`에 쓰고, 파일이 완전해진(PNG 트레일러가 있는) 뒤에야 `--output_path`로 옮기므로, 실패하거나 시간 초과된 캡처는 그 경로에 있던 기존 스크린샷을 건드리지 않습니다. 쓰기가 비동기이므로 도구는 에디터 업데이트를 돌리며 완성된 파일이 생기는 즉시(최대 5초) 경로·바이트 수·해상도를 보고합니다.
+
+에디터 창의 화면 픽셀을 읽는 모드는 없습니다. 모든 모니터 밖으로 옮겨진 에디터 창을 읽으면 에디터가 네이티브 단계에서 죽기 때문에, `screenshot`은 카메라 렌더와 게임 자체의 `ScreenCapture`만 사용합니다.
+
+`--view`는 `--mode`의 옛 표기입니다: `--view scene`은 `--mode scene`이지만, `--view game`은 Game 뷰가 아니라 오프스크린 렌더인 `--mode camera`입니다.
 
 ### 콘솔 로그
 
