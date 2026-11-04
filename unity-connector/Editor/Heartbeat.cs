@@ -40,6 +40,10 @@ namespace UnityCliConnector
 
         static Heartbeat()
         {
+            // An AssetImportWorker shares the editor's projectPath, so its heartbeat would land in the
+            // same file with the worker's pid — e.g. MarkStopped on the worker's quit.
+            if (AssetDatabase.IsAssetImportWorkerProcess()) return;
+
             EditorApplication.update += Tick;
             EditorApplication.quitting += Cleanup;
             AssemblyReloadEvents.beforeAssemblyReload += OnBeforeAssemblyReload;

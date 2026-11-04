@@ -28,6 +28,9 @@ namespace UnityCliConnector.BuildJobs
 
         static BuildJobStore()
         {
+            // Loading in a worker would see the editor's running job as abandoned and rewrite the
+            // record as interrupted while the build is still going.
+            if (AssetDatabase.IsAssetImportWorkerProcess()) return;
             Load();
         }
 

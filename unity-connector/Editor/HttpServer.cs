@@ -48,6 +48,11 @@ namespace UnityCliConnector
 
         static HttpServer()
         {
+            // AssetImportWorker children load project assemblies and run [InitializeOnLoad] too. They
+            // carry the same -projectPath as the editor, so listening here makes a worker look like a
+            // connector and steals the editor's port after a reload.
+            if (AssetDatabase.IsAssetImportWorkerProcess()) return;
+
             s_MainContext = SynchronizationContext.Current;
             Start();
             EditorApplication.quitting += Stop;
