@@ -23,6 +23,12 @@ namespace UnityCliConnector.Tools
 
             [ToolParameter("Maximum number of diagnostics to return (default 50)")]
             public int Limit { get; set; }
+
+            [ToolParameter("Include what the reported compile covers (compiled_at, rebuilt assemblies, stale sources) (default: true)")]
+            public bool IncludeProvenance { get; set; }
+
+            [ToolParameter("Milliseconds the provenance source scan may take before it reports itself incomplete (default 200)")]
+            public int ScanBudget { get; set; }
         }
 
         public static object HandleCommand(JObject @params)
@@ -32,6 +38,9 @@ namespace UnityCliConnector.Tools
             bool sourceTreeOnly = p.GetBool("source_tree_only") || p.GetBool("sourceTreeOnly");
             int limit = p.GetInt("limit") ?? 50;
             if (limit < 1) limit = 1;
+            bool includeProvenance = ParamCoercion.CoerceBoolNullable(
+                p.GetRaw("include_provenance") ?? p.GetRaw("includeProvenance")) ?? true;
+            int scanBudget = p.GetInt("scan_budget") ?? CompileProvenance.DefaultScanBudgetMs;
 
             if (EditorApplication.isCompiling)
                 return new SuccessResponse("Editor is compiling; call again when it finishes.", new
@@ -39,6 +48,9 @@ namespace UnityCliConnector.Tools
                     compiling = true,
                     total = 0,
                     diagnostics = new List<object>(),
+                    // Provenance of the compile before this one; cheap, and the caller learns the
+                    // editor is busy either way.
+                    provenance = CompileProvenance.BuildPayload(false, 0),
                 });
 
             var diags = CompilationGate.GetLiveDiagnostics(includeWarnings)
@@ -58,6 +70,9 @@ namespace UnityCliConnector.Tools
                     code = d.Code,
                     message = d.Message,
                 }).ToList(),
+                // One provenance line per compile-related result is the point: the caller must not
+                // have to make a second call to know whether this answer covers its own edit.
+                provenance = includeProvenance ? CompileProvenance.BuildPayload(true, scanBudget) : null,
             });
         }
 

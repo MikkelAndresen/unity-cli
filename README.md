@@ -149,6 +149,8 @@ Before compiling or reloading, the Connector records the state (`compiling`, `re
 | `exec` | Run arbitrary C# code inside Unity |
 | `test` | Run EditMode/PlayMode tests |
 | `verify` | Compile, list errors in your code, run tests: one call, brief output |
+| `wait` | Block until the editor is idle, then say what the last compile covers |
+| `compile_status` | When the last compile finished, what it rebuilt, which sources are newer than it |
 | `build` | Start a player build as a job, watch progress, report the BuildReport |
 | `menu` | Execute any Unity menu item by path |
 | `reserialize` | Re-serialize assets through Unity's serializer |
@@ -190,7 +192,8 @@ unity-cli editor refresh --force
 `editor refresh --compile` waits for the compilation and answers with one report instead of a bare
 `refresh_triggered`: `compile_requested`, `compile_succeeded`, `error_count`, `errors[]`
 (file/line/col/severity/code/message, from the connector's `compile_diagnostics` tool), `timed_out`
-and `elapsed_ms`. `timed_out: true` means the wait gave up after 5 minutes — not that the compile
+and `elapsed_ms`, plus the [compile provenance](#compile-provenance-and-wait) (`provenance`,
+`provenance_line`, and `stale_line` when a source file was written after the compile). `timed_out: true` means the wait gave up after 5 minutes — not that the compile
 failed. `nothing_to_compile: true` means no compilation was seen to run after the request, in which
 case `compile_succeeded` describes the editor's current compile state rather than a compile this
 command caused. The proof a compile actually ran is the connector's compile-finished clock: the
@@ -556,13 +559,79 @@ A clean C# compile also gets a Burst line, because Burst compiles outside script
 
 ```
 compile: ok
+compiled 14:02:11 (3 s ago, took 2.2 s) · 1 source file changed since previous compile · rebuilt: Game, Game.Tests.Editor
 burst: 14 targets compiled, 0 error(s)
 tests: 31/31 passed
 ```
 
+The `compiled ...` line is the [compile provenance](#compile-provenance-and-wait): it says which compile this verdict came from, and whether anything in the project is newer than it.
+
 Burst errors print like compile errors and fail verify (exit 1) before the tests run; `--burst-wait <seconds>` bounds how long verify waits for Burst to go idle (default 60, keep `--timeout` above it). A Burst check that cannot run — no `burst_status` tool because Burst is not installed, or the editor wouldn't answer — prints nothing or a note and leaves the verdict alone.
 
 `verify` clears the console first (a Burst error stays there after its code changes; Burst logs a live one again on the next compile; `--keep-console` skips the clear), refreshes and compiles, and lists this compile's errors from the connector's `compile_diagnostics` tool, leaving out `Library/` and `PackageCache/` unless nothing else failed. It then saves dirty open scenes and runs the tests, printing `passed/total` and the first line of each failure (`--max` caps both lists, default 20). Exit code 0 means it compiles, Burst is quiet and every test passed; 1 means compile errors, Burst errors, failing tests or no test ran; 2 means the editor couldn't answer: not running, timed out, or blocked by a modal dialog, which is named along with the command that answers it. Connectors before 0.7.0 have no `compile_diagnostics` and ignore `--assembly`; `verify` then lists console errors and says so.
+
+### Compile provenance, and `wait`
+
+Every compile result says which compile it reflects, so a clean answer is told apart from a stale one:
+
+```
+compiled 14:02:11 (3 s ago, took 2.2 s) · 1 source file changed since previous compile · rebuilt: Game, Game.Tests.Editor
+stale: Assets/Scripts/Player.cs modified after this compile — run verify again
+```
+
+The first line is the connector's: when the last script compilation finished (the reload it triggered
+included), how long it took, how many source files were written since the compile before it, and
+which assemblies it rebuilt. The second line appears when a `.cs`, `.asmdef` or `.asmref` under
+`Assets/` or under a `file:`/embedded package was written **after** that compile: the edit is in the
+project but not in the result above it, which is the doubt that otherwise makes agents poll the
+editor with `sleep 45 && unity-cli compile_errors` loops.
+
+| Where it shows | Fields |
+|---|---|
+| `verify` | printed after the compile verdict; `compile.provenance` with `--json` |
+| `editor refresh --compile` | `provenance`, `provenance_line`, `stale_line`, and a note naming uncompiled sources |
+| `compile_diagnostics` | nested under `provenance` (`--include_provenance false` drops it) |
+| `compile_status` | the whole object: `compiled_at_ms`, `compiled_at` (ISO), `duration_ms`, `changed_since_previous_compile`, `rebuilt_assemblies`, `stale_files`, `scan_ms`, `scan_complete`, `provenance_line`, `stale_line` |
+
+```bash
+# Block until the editor is idle, then print its state and the provenance line
+unity-cli wait
+
+# Also require proof that the last compile covers the edit you just saved
+unity-cli wait --compile --timeout 120
+
+# Just the provenance, no waiting
+unity-cli compile_status
+unity-cli compile_status --scan false        # timestamps only, no filesystem walk
+unity-cli compile_status --scan_budget 1000  # let the scan take up to a second
+```
+
+`wait` exits 0 when the editor is idle (heartbeat `ready`, `playing` or `paused` — not compiling,
+refreshing, reloading, building, and no dialog open), 1 when it gave up, and 2 when the editor could
+not answer, naming a modal dialog and the command that answers it. `--timeout` is seconds and belongs
+after the command name; the global `--timeout` before it stays a request timeout in milliseconds.
+
+With `--compile`, one of two things has to be true to exit 0: the connector's compile-finished clock
+moved after `wait` started (both sides of that comparison are connector stamps, so an agent sandbox
+with a different clock than the editor's still works), or the source scan found nothing newer than
+the last compile, which means your edit is already in. A compile that finished *before* `wait`
+started and stale sources prove nothing, so `wait` keeps waiting — and says so after 10 seconds,
+because Unity only auto-refreshes while it has focus. An editor driven from a terminal never does,
+so the honest answer there is exit 1 with `run unity-cli verify` in the note:
+
+```
+Unity (port 8090): ready
+gave up after 11s: still ready — no compilation started within 10s of finding uncompiled sources
+compiled 14:02:11 (7 min ago, took 3.4 s) · 1 source file changed since previous compile · rebuilt: Assembly-CSharp
+stale: Assets/Scratch/Stale.cs modified after this compile — run verify again
+  (Unity only auto-refreshes while it has focus; run unity-cli verify (or unity-cli editor refresh --compile) to compile them)
+```
+
+The scan walks `Assets/` plus embedded and `file:`/local packages — registry and git packages under
+`Library/PackageCache` are not your code and would spend the whole budget. It gets 200 ms of the
+editor's main thread and, when the project is bigger than that, says so (`scan_complete: false`,
+counts are a lower bound) instead of stalling the editor. A connector without `compile_status` cannot supply provenance: `wait` and the compile reports then
+print the state and say that provenance is unavailable.
 
 ### Build a Player (long-running)
 

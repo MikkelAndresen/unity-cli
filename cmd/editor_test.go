@@ -291,15 +291,61 @@ func compileTestBudgets(t *testing.T) {
 
 // compileReport mirrors the JSON `unity-cli editor refresh --compile` answers with.
 type compileReport struct {
-	RefreshTriggered bool         `json:"refresh_triggered"`
-	CompileRequested bool         `json:"compile_requested"`
-	CompileSucceeded bool         `json:"compile_succeeded"`
-	NothingToCompile bool         `json:"nothing_to_compile"`
-	ErrorCount       int          `json:"error_count"`
-	Errors           []verifyDiag `json:"errors"`
-	TimedOut         bool         `json:"timed_out"`
-	ElapsedMs        int64        `json:"elapsed_ms"`
-	Notes            []string     `json:"notes"`
+	RefreshTriggered bool               `json:"refresh_triggered"`
+	CompileRequested bool               `json:"compile_requested"`
+	CompileSucceeded bool               `json:"compile_succeeded"`
+	NothingToCompile bool               `json:"nothing_to_compile"`
+	ErrorCount       int                `json:"error_count"`
+	Errors           []verifyDiag       `json:"errors"`
+	TimedOut         bool               `json:"timed_out"`
+	ElapsedMs        int64              `json:"elapsed_ms"`
+	Notes            []string           `json:"notes"`
+	ProvenanceLine   string             `json:"provenance_line"`
+	StaleLine        string             `json:"stale_line"`
+	Provenance       *compileProvenance `json:"provenance"`
+}
+
+// The refresh report has to say which compile it answers with, or a clean report from a stale
+// editor looks identical to one that covers the caller's edit.
+func TestEditorCmd_RefreshCompileReportCarriesProvenance(t *testing.T) {
+	compileTestBudgets(t)
+	base := int64(1_000)
+	f := &fakeEditor{t: t, diagnostics: clean(), echoFinished: &base, finishedAt: 2_000,
+		provenance: map[string]interface{}{"provenance_line": provLine, "compiled_at_ms": 2_000,
+			"rebuilt_assemblies": []string{"Game"}}}
+
+	resp, err := editorCmd([]string{"refresh", "--compile"}, f.send, f.resolve)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	report := parseCompileReport(t, resp)
+	if report.ProvenanceLine != provLine {
+		t.Errorf("provenance_line = %q, want the connector's line", report.ProvenanceLine)
+	}
+	if report.Provenance == nil || report.Provenance.CompiledAtMs != 2_000 ||
+		len(report.Provenance.RebuiltAssemblies) != 1 || report.Provenance.RebuiltAssemblies[0] != "Game" {
+		t.Errorf("provenance = %+v, want the connector's fields", report.Provenance)
+	}
+}
+
+func TestEditorCmd_RefreshCompileReportNotesStaleSources(t *testing.T) {
+	compileTestBudgets(t)
+	base := int64(1_000)
+	f := &fakeEditor{t: t, diagnostics: clean(), echoFinished: &base, finishedAt: 2_000,
+		provenance: map[string]interface{}{"provenance_line": provLine, "stale_count": 1,
+			"stale_files": []string{"Assets/Foo.cs"}, "stale_line": "stale: Assets/Foo.cs modified after this compile"}}
+
+	resp, err := editorCmd([]string{"refresh", "--compile"}, f.send, f.resolve)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	report := parseCompileReport(t, resp)
+	if report.StaleLine == "" {
+		t.Errorf("report = %+v, want the stale line echoed", report)
+	}
+	if !hasNoteContaining(report.Notes, "written after this compile") {
+		t.Errorf("notes = %v, want one that names the uncompiled sources", report.Notes)
+	}
 }
 
 func parseCompileReport(t *testing.T, resp *client.CommandResponse) compileReport {

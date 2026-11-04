@@ -77,9 +77,9 @@ func Execute() error {
 		return dialogsCmd(subArgs)
 	}
 
-	// verify reports an editor that can't answer as exit code 2, not as a CLI error.
+	// verify and wait report an editor that can't answer as exit code 2, not as a CLI error.
 	noEditor := func(err error) error {
-		if category == "verify" {
+		if category == "verify" || category == waitCategory {
 			os.Exit(verifyExit(os.Stdout, err))
 		}
 		return err
@@ -163,6 +163,8 @@ func Execute() error {
 			return client.Send(currentInst, command, params, 0)
 		}, resolve)
 		os.Exit(verifyCmd(subArgs, send, testSend, resolve, currentInst.Port, os.Stdout))
+	case waitCategory:
+		os.Exit(waitCmd(subArgs, send, resolve, os.Stdout))
 	case "exec":
 		subArgs = readStdinIfPiped(subArgs)
 		var params map[string]interface{}
@@ -366,18 +368,41 @@ func readStdinIfPiped(args []string) []string {
 
 // splitArgs separates global flags from subcommand args.
 // Global flags must be parsed by flag.CommandLine before the subcommand runs.
+//
+// --timeout is the exception after the command name: for `wait` it is that command's own budget in
+// seconds, while the global one is an HTTP request timeout in milliseconds. Stealing
+// `wait --timeout 120` would hand wait a 120 ms request timeout and no budget at all. The global
+// flag still works when it comes before the command name.
 func splitArgs(args []string) (flags, commands []string) {
+	command := ""
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
 		case "--ignore-version-mismatch":
 			flags = append(flags, args[i])
-		case "--port", "--project", "--timeout":
+		case "--port", "--project":
+			flags = append(flags, args[i])
+			if i+1 < len(args) {
+				i++
+				flags = append(flags, args[i])
+			}
+		case "--timeout":
+			if command == waitCategory {
+				commands = append(commands, args[i])
+				if i+1 < len(args) && !strings.HasPrefix(args[i+1], "--") {
+					i++
+					commands = append(commands, args[i])
+				}
+				continue
+			}
 			flags = append(flags, args[i])
 			if i+1 < len(args) {
 				i++
 				flags = append(flags, args[i])
 			}
 		default:
+			if command == "" {
+				command = args[i]
+			}
 			commands = append(commands, args[i])
 		}
 	}
@@ -471,6 +496,16 @@ Verify (compile + tests, brief output for agents):
   verify --no-tests               Stop after the compile
   verify --assembly <a,b>         Only these test assemblies (also --filter, --mode)
   verify --no-burst               Skip the Burst step
+
+Wait / compile provenance (what a result covers):
+  wait                            Block until the editor is idle, then print its state + compile line
+  wait --compile                  Also require that your edit is in the last compile
+  wait --timeout 60               Give up after 60 seconds (exit 1)
+  compile_status                  Just the compile provenance, no waiting
+
+  Every compile result carries one provenance line:
+    compiled 14:02:11 (3 s ago, took 2.2 s) · 1 source file changed since previous compile · rebuilt: Game.Tests.Editor
+    stale: Assets/Foo.cs modified after this compile — run verify again
 
 Build (long-running; the editor stays observable while it runs):
   build --profile <name> --output <path>      Start a player build job, watch progress, exit 0/1
@@ -621,8 +656,10 @@ Subcommands:
     --compile         Recompile scripts and wait until compilation finishes.
                       Answers with one report: compile_requested, compile_succeeded,
                       error_count, errors[], timed_out, elapsed_ms, plus nothing_to_compile
-                      when the scripts were already up to date. Exit 1 when the compile
-                      failed or timed out; the report is still printed.
+                      when the scripts were already up to date. The report also carries the
+                      compile provenance (provenance, provenance_line, and stale_line when a
+                      source file was written after the compile), so it says which edit it covers.
+                      Exit 1 when the compile failed or timed out; the report is still printed.
     --keep-console    With --compile, don't clear the console first (the default clear keeps
                       stale errors from a previous compile out of the report).
     --force           Allow refresh during play mode and force asset update.
@@ -891,6 +928,18 @@ brief enough for an agent's context:
   5. Unless --no-tests: saves dirty open scenes and runs the tests, then
      prints passed/total and the first line of each failure.
 
+Every compile result says which compile it reflects, so a clean answer is told apart from a stale
+one. verify prints the connector's provenance line after the compile verdict:
+
+  compile: ok
+  compiled 14:02:11 (3 s ago, took 2.2 s) · 1 source file changed since previous compile · rebuilt: Game.Tests.Editor
+  stale: Assets/Foo.cs modified after this compile — run verify again
+
+The stale line means a source file under Assets/ or a file:/embedded package was written after that
+compile: the edit is in the project but not in the result. --json carries the same fields under
+compile.provenance (unix ms and ISO timestamps). See 'unity-cli wait --help' to block on that
+instead of reading it.
+
 Options:
   --no-tests                    Stop after the compile
   --no-burst                    Skip the Burst step
@@ -1054,6 +1103,84 @@ Examples:
   unity-cli build status
   unity-cli build status build-20240101-114213-9f0ac1
   unity-cli status                 # shows: Unity (port 8090): building
+`)
+	case "wait":
+		fmt.Print(`Usage: unity-cli wait [--compile] [--timeout <seconds>] [--json]
+
+Blocks until the editor stops reporting work in progress, then prints its state and the compile
+provenance line. It replaces the 'sleep 45 && unity-cli compile_errors' loop: the answer says both
+that the editor has settled and which compile it reflects.
+
+Idle means the heartbeat state is ready, playing or paused — not compiling, not refreshing, not
+reloading, not building, and no modal dialog is open. Play mode counts as idle: waiting for someone
+to stop play mode is not what this command is for.
+
+Options:
+  --compile          Also require proof that the last compile covers your edit: a script compilation
+                     finished after wait started (connector compile clock, compared to the value at
+                     wait start — no local clock involved), OR the source scan finds nothing newer
+                     than that compile. Without it, wait only reports the state.
+  --timeout <second> Give up after this many seconds (default 120) and exit 1. For wait this flag is
+                     seconds and must come after the command name; the global --timeout (before it)
+                     stays an HTTP request timeout in milliseconds.
+  --json             One JSON object instead of text.
+
+An idle editor with stale sources that starts no compilation within 10 seconds ends the wait early
+with exit 1: Unity only auto-refreshes while it has focus, so an editor driven from a terminal is not
+going to compile what you just saved. Run unity-cli verify (or unity-cli editor refresh --compile).
+
+Output:
+  Unity (port 8090): ready
+  compiled 14:02:11 (3 s ago, took 2.2 s) · 1 source file changed since previous compile · rebuilt: Game
+  stale: Assets/Foo.cs modified after this compile — run verify again
+
+The provenance comes from the connector's compile_status tool. A connector without it answers with
+the state and says that provenance is unavailable.
+
+The source scan walks Assets/ plus embedded and file:/local packages, and gives up after 200 ms on
+the editor's main thread, saying so instead of stalling the editor.
+
+Exit codes:
+  0  the editor is idle (and with --compile, the edit is provably in)
+  1  the editor was still working when --timeout ran out
+  2  the editor could not answer: not running, heartbeat silent, or blocked by a modal dialog
+     (named, with the command that answers it)
+
+Examples:
+  unity-cli wait
+  unity-cli wait --compile --timeout 120
+  unity-cli wait --json
+  unity-cli editor refresh --compile && unity-cli wait --compile
+`)
+	case "compile_status":
+		fmt.Print(`Usage: unity-cli compile_status [--scan false] [--scan_budget <ms>]
+
+What the last script compilation covers, without waiting or compiling:
+when it finished (unix ms, ISO and a printed line), how long it took, which assemblies it rebuilt,
+how many source files changed since the compile before it, and which sources (.cs, .asmdef,
+.asmref) were written after it — stale, meaning the project has an edit that compile does not.
+
+  compiled_at_ms / compiled_at      when the last compile finished (connector clock)
+  changed_since_previous_compile    what triggered it; null when no earlier compile is recorded
+  rebuilt_assemblies                assemblies the compile produced
+  stale_files / stale_count         sources newer than that compile
+  scan_ms / scan_complete           cost of the scan; false means the counts are a lower bound
+
+Options:
+  --scan false        Skip the filesystem scan (timestamps of the last compile only)
+  --scan_budget <ms>  How long the scan may take on the editor's main thread (default 200)
+
+Scanned roots: Assets/, plus embedded and file:/local packages. Registry and git packages under
+Library/PackageCache are not scanned: they are not your code, and walking them would spend the
+whole budget.
+
+The same provenance object rides along in compile_diagnostics (key "provenance"), and verify and
+'editor refresh --compile' print its line. See 'unity-cli wait --help'.
+
+Examples:
+  unity-cli compile_status
+  unity-cli compile_status --scan false
+  unity-cli compile_status --scan_budget 1000
 `)
 	case "list":
 		fmt.Print(`Usage: unity-cli list
