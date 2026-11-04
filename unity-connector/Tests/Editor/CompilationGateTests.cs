@@ -154,6 +154,23 @@ namespace UnityCliConnector.Tests
             Assert.AreEqual(2, errors.Count, "different column on same line is a distinct diagnostic");
         }
 
+        // ─── Compile clock (evidence the CLI polls for) ────────────
+
+        [Test]
+        public void LastCompileFinishedAt_IsWallClockAndAdvances()
+        {
+            var before = CompilationGate.LastCompileFinishedAt;
+            CompilationGate.NoteCompileFinishedForTests();
+            var after = CompilationGate.LastCompileFinishedAt;
+
+            Assert.That(after, Is.GreaterThan(before),
+                "a finished compile has to be visible to the CLI's before/after comparison");
+            // Unix ms, not EditorApplication.timeSinceStartup: the CLI compares this against the
+            // heartbeat's own timestamps, across a domain reload that resets the static.
+            Assert.That(after, Is.EqualTo(System.DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()).Within(5000),
+                "the compile clock must be wall-clock ms");
+        }
+
         // ─── GetLiveDiagnostics (public API consumed by extensions) ──
 
         [Test]

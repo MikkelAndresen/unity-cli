@@ -22,6 +22,10 @@ type Instance struct {
 	ConnectorVersion string `json:"connectorVersion,omitempty"`
 	Timestamp        int64  `json:"timestamp,omitempty"`
 	CompileErrors    bool   `json:"compileErrors,omitempty"`
+	// CompileFinishedAt is the connector's wall-clock ms of the last finished script
+	// compilation. The CLI compares it before and after a compile request as evidence that a
+	// compile actually ran; 0 means the connector does not report it.
+	CompileFinishedAt int64 `json:"compileFinishedAt,omitempty"`
 	// Modal is set while State is "modal": the dialog blocking Unity's main thread.
 	Modal *ModalDialog `json:"modal,omitempty"`
 }

@@ -30,6 +30,7 @@ namespace UnityCliConnector
         static int s_Pid;
         static string s_LastState = "ready";
         static bool s_LastCompileErrors;
+        static long s_LastCompileFinishedAt;
 
         static Heartbeat()
         {
@@ -112,6 +113,7 @@ namespace UnityCliConnector
 
             s_LastState = s_ForcedState ?? GetState();
             s_LastCompileErrors = EditorUtility.scriptCompilationFailed;
+            s_LastCompileFinishedAt = CompilationGate.LastCompileFinishedAt;
             WriteFile();
         }
 
@@ -129,18 +131,11 @@ namespace UnityCliConnector
         static void WriteFile()
         {
             var modal = s_LastState == "stopped" ? null : ModalWatchdog.Current;
-            var status = new
-            {
-                state = modal != null ? "modal" : s_LastState,
-                projectPath = s_ProjectPath,
-                port = HttpServer.Port,
-                pid = s_Pid,
-                unityVersion = s_UnityVersion,
-                connectorVersion = GetConnectorVersion(),
-                timestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
-                compileErrors = s_LastCompileErrors,
-                modal,
-            };
+            var status = BuildStatus(
+                modal != null ? "modal" : s_LastState,
+                s_LastCompileErrors,
+                s_LastCompileFinishedAt,
+                modal);
 
             lock (s_WriteLock)
             {
@@ -154,6 +149,27 @@ namespace UnityCliConnector
                 {
                 }
             }
+        }
+
+        /// <summary>
+        /// Builds the heartbeat payload. Property names here are the contract with the Go CLI's
+        /// client.Instance struct, so renaming one breaks polling silently.
+        /// </summary>
+        internal static object BuildStatus(string state, bool compileErrors, long compileFinishedAt, ModalDialog modal)
+        {
+            return new
+            {
+                state,
+                projectPath = s_ProjectPath,
+                port = HttpServer.Port,
+                pid = s_Pid,
+                unityVersion = s_UnityVersion,
+                connectorVersion = GetConnectorVersion(),
+                timestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+                compileErrors,
+                compileFinishedAt,
+                modal,
+            };
         }
 
         static string GetConnectorVersion()
