@@ -25,7 +25,7 @@ namespace UnityCliConnector.Tools
 
         private static MethodInfo _startGettingEntriesMethod, _endGettingEntriesMethod, _clearMethod, _getCountMethod, _getEntryMethod;
         private static MethodInfo _getEntryTimestampMethod;
-        private static FieldInfo _modeField, _messageField, _fileField, _lineField;
+        private static FieldInfo _modeField, _messageField, _fileField, _lineField, _globalLineIndexField;
         private static Type _logEntryType;
         private static PropertyInfo _consoleFlagsProperty;
         private static MethodInfo _getFilteringTextMethod, _setFilteringTextMethod;
@@ -66,13 +66,17 @@ namespace UnityCliConnector.Tools
                     ?? throw new Exception("Field not found: LogEntry.message");
                 _fileField = _logEntryType.GetField("file", inf);
                 _lineField = _logEntryType.GetField("line", inf);
+                // Optional: the console-wide ordinal of the entry. It only grows while the console
+                // keeps its entries and restarts at 0 when the console is cleared, which is what
+                // lets CompilationGate tell this compile's entries from older ones.
+                _globalLineIndexField = _logEntryType.GetField("globalLineIndex", inf);
             }
             catch (Exception e)
             {
                 Debug.LogError($"[UnityCliConnector] ReadConsole init failed: {e.Message}");
                 _startGettingEntriesMethod = _endGettingEntriesMethod = _clearMethod = _getCountMethod = _getEntryMethod = null;
                 _getEntryTimestampMethod = null;
-                _modeField = _messageField = _fileField = _lineField = null;
+                _modeField = _messageField = _fileField = _lineField = _globalLineIndexField = null;
                 _logEntryType = null;
                 _consoleFlagsProperty = null;
                 _getFilteringTextMethod = _setFilteringTextMethod = null;
@@ -431,12 +435,13 @@ namespace UnityCliConnector.Tools
         internal static bool TryForEachEntry(Action<int, string, string, int> visitor)
         {
             if (visitor == null) throw new ArgumentNullException(nameof(visitor));
-            return TryForEachEntry((mode, message, file, line, _) => visitor(mode, message, file, line));
+            return TryForEachEntry((mode, message, file, line, _, _) => visitor(mode, message, file, line));
         }
 
         /// Same iteration, also passing the entry's console timestamp (null when the Unity
-        /// version does not expose GetEntryTimestampInternal).
-        internal static bool TryForEachEntry(Action<int, string, string, int, string> visitor)
+        /// version does not expose GetEntryTimestampInternal) and its globalLineIndex (-1 when the
+        /// field is absent).
+        internal static bool TryForEachEntry(Action<int, string, string, int, string, int> visitor)
         {
             if (visitor == null) throw new ArgumentNullException(nameof(visitor));
             if (_startGettingEntriesMethod == null || _endGettingEntriesMethod == null ||
@@ -468,8 +473,44 @@ namespace UnityCliConnector.Tools
                         }
                         catch { }
                     }
-                    visitor(mode, message, file, line, timestamp);
+                    int index = _globalLineIndexField != null
+                        ? (int)_globalLineIndexField.GetValue(logEntry)
+                        : -1;
+                    visitor(mode, message, file, line, timestamp, index);
                 }
+                return true;
+            }
+            finally
+            {
+                try { _endGettingEntriesMethod.Invoke(null, null); } catch { }
+                filterScope.Dispose();
+            }
+        }
+
+        /// The console's ordinal range: the oldest remaining entry's globalLineIndex and the newest
+        /// one. An empty console reports (-1, -1); false means the binding is unavailable, not empty.
+        internal static bool TryGetConsoleIndexRange(out int firstIndex, out int lastIndex)
+        {
+            firstIndex = -1;
+            lastIndex = -1;
+            if (_startGettingEntriesMethod == null || _endGettingEntriesMethod == null ||
+                _getCountMethod == null || _getEntryMethod == null || _globalLineIndexField == null ||
+                _logEntryType == null)
+                return false;
+
+            var filterScope = EnterConsoleFilterOverride();
+            try
+            {
+                _startGettingEntriesMethod.Invoke(null, null);
+                int total = (int)_getCountMethod.Invoke(null, null);
+                if (total <= 0) return true;
+
+                object logEntry = Activator.CreateInstance(_logEntryType);
+                _getEntryMethod.Invoke(null, new object[] { 0, logEntry });
+                firstIndex = (int)_globalLineIndexField.GetValue(logEntry);
+                if (total > 1)
+                    _getEntryMethod.Invoke(null, new object[] { total - 1, logEntry });
+                lastIndex = (int)_globalLineIndexField.GetValue(logEntry);
                 return true;
             }
             finally

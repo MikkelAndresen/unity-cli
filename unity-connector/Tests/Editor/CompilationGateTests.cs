@@ -27,6 +27,7 @@ namespace UnityCliConnector.Tests
         public void TearDown()
         {
             CompilationGate.ResetForTests();
+            CompilationGate.RestoreLiveStateForTests();
             ConsoleLogEntries.TestOverride = null;
         }
 
@@ -98,25 +99,27 @@ namespace UnityCliConnector.Tests
                 "camelCase opt-out should bypass the gate");
         }
 
-        // ─── Console staleness ──────────────────────────────────
+        // ─── Console staleness (ordinal pin) ────────────────────
 
         [Test]
         public void CheckOrNull_StaleConsoleEntry_AfterCleanCompile_DoesNotBlock()
         {
             var now = NowMs();
             CompilationGate.SeedCompileClockForTests(now - 5000, now - 1000);
+            // The console held entries 3..10 when the compile started; this entry is from before it.
+            CompilationGate.SeedConsoleBoundaryForTests(maxIndex: 10, firstIndex: 3);
+            CompilationGate.ConsoleRangeForTests = new CompilationGate.ConsoleIndexRange(true, 3, 12);
             ConsoleLogEntries.TestOverride = _ => new List<ConsoleLogEntries.CompileDiag>
             {
                 new ConsoleLogEntries.CompileDiag
                 {
                     File = "Assets/Old.cs", Line = 1, Col = 1, Severity = "error",
-                    Code = "CS1002", Message = "; expected",
-                    HasTimestamp = true, TimeOfDaySeconds = AgoSeconds(600)
+                    Code = "CS1002", Message = "; expected", ConsoleIndex = 6
                 }
             };
 
             Assert.IsNull(CompilationGate.CheckOrNull(new JObject()),
-                "a console error logged 10 minutes before the last compile must not block exec");
+                "a console error logged before the last compile started must not block exec");
         }
 
         [Test]
@@ -124,13 +127,14 @@ namespace UnityCliConnector.Tests
         {
             var now = NowMs();
             CompilationGate.SeedCompileClockForTests(now - 5000, now - 1000);
+            CompilationGate.SeedConsoleBoundaryForTests(maxIndex: 10, firstIndex: 3);
+            CompilationGate.ConsoleRangeForTests = new CompilationGate.ConsoleIndexRange(true, 3, 12);
             ConsoleLogEntries.TestOverride = _ => new List<ConsoleLogEntries.CompileDiag>
             {
                 new ConsoleLogEntries.CompileDiag
                 {
                     File = "Assets/Fresh.cs", Line = 7, Col = 2, Severity = "error",
-                    Code = "CS0103", Message = "The name 'x' does not exist",
-                    HasTimestamp = true, TimeOfDaySeconds = TimeOfDaySeconds(now)
+                    Code = "CS0103", Message = "The name 'x' does not exist", ConsoleIndex = 11
                 }
             };
 
@@ -146,7 +150,168 @@ namespace UnityCliConnector.Tests
         }
 
         [Test]
-        public void CheckOrNull_FreshStickyConsoleError_DoesNotBlock()
+        public void CheckOrNull_AfterReload_KeepsConsoleErrorsFromTheCompileThatReloaded()
+        {
+            // A successful compile reloads the domain, so the new domain has no start clock and the
+            // console warnings/errors it logged still belong to the compile that just finished.
+            // They carry an ordinal, not necessarily a timestamp this domain can trust.
+            var now = NowMs();
+            CompilationGate.SeedCompileClockForTests(0, now, finishedViaReload: true);
+            CompilationGate.SeedConsoleBoundaryForTests(maxIndex: 10, firstIndex: 3);
+            CompilationGate.ConsoleRangeForTests = new CompilationGate.ConsoleIndexRange(true, 3, 12);
+            ConsoleLogEntries.TestOverride = _ => new List<ConsoleLogEntries.CompileDiag>
+            {
+                new ConsoleLogEntries.CompileDiag
+                {
+                    File = "Assets/Warned.cs", Line = 4, Col = 1, Severity = "error",
+                    Code = "CS0168", Message = "The variable is declared but never used", ConsoleIndex = 12
+                }
+            };
+
+            var response = CompilationGate.CheckOrNull(new JObject());
+            Assert.IsInstanceOf<ErrorResponse>(response,
+                "the compile that caused the reload is the last one: its console diagnostics are current");
+        }
+
+        [Test]
+        public void CheckOrNull_AfterReload_DropsConsoleErrorsFromBeforeTheCompile()
+        {
+            var now = NowMs();
+            CompilationGate.SeedCompileClockForTests(0, now, finishedViaReload: true);
+            CompilationGate.SeedConsoleBoundaryForTests(maxIndex: 10, firstIndex: 3);
+            CompilationGate.ConsoleRangeForTests = new CompilationGate.ConsoleIndexRange(true, 3, 12);
+            ConsoleLogEntries.TestOverride = _ => new List<ConsoleLogEntries.CompileDiag>
+            {
+                new ConsoleLogEntries.CompileDiag
+                {
+                    File = "Assets/Older.cs", Line = 4, Col = 1, Severity = "error",
+                    Code = "CS0168", Message = "stale", ConsoleIndex = 9
+                }
+            };
+
+            Assert.IsNull(CompilationGate.CheckOrNull(new JObject()));
+        }
+
+        [Test]
+        public void CheckOrNull_ConsoleClearedSinceCompileStart_KeepsTheFirstIndexDrop()
+        {
+            // LogEntries.Clear restarts the ordinals at 0: the oldest entry now sits below the
+            // ordinal the compile-start pin saw, so everything left was logged after that start.
+            var now = NowMs();
+            CompilationGate.SeedCompileClockForTests(now - 5000, now - 1000);
+            CompilationGate.SeedConsoleBoundaryForTests(maxIndex: 10, firstIndex: 3);
+            CompilationGate.ConsoleRangeForTests = new CompilationGate.ConsoleIndexRange(true, 0, 2);
+            ConsoleLogEntries.TestOverride = _ => new List<ConsoleLogEntries.CompileDiag>
+            {
+                new ConsoleLogEntries.CompileDiag
+                {
+                    File = "Assets/AfterClear.cs", Line = 1, Col = 1, Severity = "error",
+                    Code = "CS1002", Message = "; expected", ConsoleIndex = 1
+                }
+            };
+
+            var response = CompilationGate.CheckOrNull(new JObject());
+            Assert.IsInstanceOf<ErrorResponse>(response,
+                "after a console Clear the restarted ordinals are not evidence of staleness");
+        }
+
+        [Test]
+        public void CheckOrNull_ConsoleClearedSinceCompileStart_KeepsTheMaxIndexDrop()
+        {
+            // A console that started empty pins first=0, so only the shrunk maximum reveals the Clear.
+            var now = NowMs();
+            CompilationGate.SeedCompileClockForTests(now - 5000, now - 1000);
+            CompilationGate.SeedConsoleBoundaryForTests(maxIndex: 10, firstIndex: 0);
+            CompilationGate.ConsoleRangeForTests = new CompilationGate.ConsoleIndexRange(true, 0, 4);
+            ConsoleLogEntries.TestOverride = _ => new List<ConsoleLogEntries.CompileDiag>
+            {
+                new ConsoleLogEntries.CompileDiag
+                {
+                    File = "Assets/AfterClear.cs", Line = 2, Col = 1, Severity = "error",
+                    Code = "CS1002", Message = "; expected", ConsoleIndex = 2
+                }
+            };
+
+            Assert.IsInstanceOf<ErrorResponse>(CompilationGate.CheckOrNull(new JObject()));
+        }
+
+        [Test]
+        public void NoOpCompile_DoesNotAdvanceTheBoundary()
+        {
+            // The CLI's `refresh --compile` can run a second, empty compile right after the real one
+            // (measured against the editor: start/finish fire, no assemblyCompilationFinished). The
+            // console still holds the real compile's diagnostics, so the boundary must not move.
+            CompilationGate.SeedConsoleSnapshotForTests(maxIndex: 10, firstIndex: 3);
+            CompilationGate.ConsoleRangeForTests = new CompilationGate.ConsoleIndexRange(true, 3, 10);
+            CompilationGate.NoteCompileStartedForTests();
+            CompilationGate.NoteCompileFinishedForTests();
+            CompilationGate.NoteCompileStartedForTests();
+            CompilationGate.NoteCompileFinishedForTests();
+
+            CompilationGate.SeedCompileClockForTests(0, NowMs(), finishedViaReload: true);
+            ConsoleLogEntries.TestOverride = _ => new List<ConsoleLogEntries.CompileDiag>
+            {
+                new ConsoleLogEntries.CompileDiag
+                {
+                    File = "Assets/FromTheRealCompile.cs", Line = 1, Col = 1, Severity = "error",
+                    Code = "CS0618", Message = "obsolete", ConsoleIndex = 11
+                }
+            };
+
+            Assert.IsInstanceOf<ErrorResponse>(CompilationGate.CheckOrNull(new JObject()),
+                "a compile that rebuilt nothing has no diagnostics of its own to make the previous ones stale");
+        }
+
+        [Test]
+        public void CompileThatRebuilt_AdvancesTheBoundaryToThePostCompileConsole()
+        {
+            CompilationGate.SeedConsoleSnapshotForTests(maxIndex: 10, firstIndex: 3);
+            CompilationGate.NoteCompileStartedForTests();
+            CompilationGate.NoteAssemblyCompiledForTests();
+            CompilationGate.ConsoleRangeForTests = new CompilationGate.ConsoleIndexRange(true, 3, 20);
+            CompilationGate.NoteCompileFinishedForTests();
+            CompilationGate.NoteCompileStartedForTests();
+
+            CompilationGate.SeedCompileClockForTests(0, NowMs(), finishedViaReload: true);
+            ConsoleLogEntries.TestOverride = _ => new List<ConsoleLogEntries.CompileDiag>
+            {
+                new ConsoleLogEntries.CompileDiag
+                {
+                    File = "Assets/PreviousCompile.cs", Line = 1, Col = 1, Severity = "error",
+                    Code = "CS0618", Message = "obsolete", ConsoleIndex = 12
+                }
+            };
+
+            Assert.IsNull(CompilationGate.CheckOrNull(new JObject()),
+                "the next compile starts above the console the finished compile left behind");
+        }
+
+        [Test]
+        public void AfterReload_WithNoOrdinalBoundary_KeepsDiagnosticsLoggedAfterTheCompileStart()
+        {
+            // No idle snapshot preceded the compile (the first compile after the editor opened), so
+            // the gate falls back to timestamps — and must use the compile's start, not the reload's
+            // finish, or every diagnostic of the compile that caused the reload is dropped.
+            var now = NowMs();
+            CompilationGate.SeedCompileClockForTests(now - 10_000, now - 1000, finishedViaReload: true);
+            ConsoleLogEntries.TestOverride = _ => new List<ConsoleLogEntries.CompileDiag>
+            {
+                new ConsoleLogEntries.CompileDiag
+                {
+                    File = "Assets/WarnedBeforeReload.cs", Line = 4, Col = 1, Severity = "error",
+                    Code = "CS0168", Message = "declared but never used",
+                    HasTimestamp = true, TimeOfDaySeconds = TimeOfDaySeconds(now - 9000)
+                }
+            };
+
+            var response = (ErrorResponse)CompilationGate.CheckOrNull(new JObject());
+            Assert.IsNotNull(response, "the entry was logged 9 s ago, after the compile started 10 s ago");
+            var data = JObject.FromObject(response.data);
+            Assert.AreEqual("timestamp", data["console_freshness"]["mode"].Value<string>());
+        }
+
+        [Test]
+        public void CheckOrNull_NoOrdinalPin_FallsBackToTimestamp_AndSaysSo()
         {
             var now = NowMs();
             CompilationGate.SeedCompileClockForTests(now - 5000, now - 1000);
@@ -154,14 +319,75 @@ namespace UnityCliConnector.Tests
             {
                 new ConsoleLogEntries.CompileDiag
                 {
+                    File = "Assets/Fresh.cs", Line = 7, Col = 2, Severity = "error",
+                    Code = "CS0103", Message = "missing",
+                    HasTimestamp = true, TimeOfDaySeconds = TimeOfDaySeconds(now)
+                }
+            };
+
+            var response = (ErrorResponse)CompilationGate.CheckOrNull(new JObject());
+            var data = JObject.FromObject(response.data);
+            Assert.AreEqual("timestamp", data["console_freshness"]["mode"].Value<string>(),
+                "the result has to say when the gate fell back to timestamps");
+            Assert.AreEqual("timestamp", CompilationGate.ConsoleFreshnessMode);
+        }
+
+        [Test]
+        public void CheckOrNull_OrdinalPin_ReportsTheBaselineOrdinal()
+        {
+            CompilationGate.SeedConsoleBoundaryForTests(maxIndex: 10, firstIndex: 3);
+            CompilationGate.ConsoleRangeForTests = new CompilationGate.ConsoleIndexRange(true, 3, 12);
+            CompilationGate.SeedForTests("Library/ScriptAssemblies/Foo.dll", new[]
+            {
+                MakeCompilerMessage("Assets/Foo.cs", 1, 1, "CS0103: bork", CompilerMessageType.Error)
+            });
+
+            var data = JObject.FromObject(((ErrorResponse)CompilationGate.CheckOrNull(new JObject())).data);
+            Assert.AreEqual("ordinal", data["console_freshness"]["mode"].Value<string>());
+            Assert.AreEqual(10, data["console_freshness"]["baseline_index"].Value<int>());
+        }
+
+        [Test]
+        public void CheckOrNull_StickyBuildFailure_DoesNotBlock()
+        {
+            var now = NowMs();
+            CompilationGate.SeedCompileClockForTests(now - 5000, now - 1000);
+            CompilationGate.SeedConsoleBoundaryForTests(maxIndex: 10, firstIndex: 3);
+            CompilationGate.ConsoleRangeForTests = new CompilationGate.ConsoleIndexRange(true, 3, 12);
+            ConsoleLogEntries.TestOverride = _ => new List<ConsoleLogEntries.CompileDiag>
+            {
+                new ConsoleLogEntries.CompileDiag
+                {
                     File = "", Line = 0, Col = 0, Severity = "error",
-                    Message = "All compiler errors have to be fixed before you can enter play mode!",
-                    Sticky = true, HasTimestamp = true, TimeOfDaySeconds = TimeOfDaySeconds(now)
+                    Message = "Build completed with a result of 'Failed'",
+                    Sticky = true, ConsoleIndex = 11
                 }
             };
 
             Assert.IsNull(CompilationGate.CheckOrNull(new JObject()),
                 "sticky build/runtime failures are not compiler diagnostics");
+        }
+
+        [Test]
+        public void CheckOrNull_StickyCompilerBanner_StillBlocks()
+        {
+            // The banner can be the only console evidence of a failed compile (the pipeline events
+            // were missed), so excluding every sticky entry would let exec through on a broken project.
+            var now = NowMs();
+            CompilationGate.SeedCompileClockForTests(now - 5000, now - 1000);
+            CompilationGate.SeedConsoleBoundaryForTests(maxIndex: 10, firstIndex: 3);
+            CompilationGate.ConsoleRangeForTests = new CompilationGate.ConsoleIndexRange(true, 3, 12);
+            ConsoleLogEntries.TestOverride = _ => new List<ConsoleLogEntries.CompileDiag>
+            {
+                new ConsoleLogEntries.CompileDiag
+                {
+                    File = "", Line = 0, Col = 0, Severity = "error",
+                    Message = "All compiler errors have to be fixed before you can enter play mode!",
+                    Sticky = true, StickyCompileFailure = true, ConsoleIndex = 11
+                }
+            };
+
+            Assert.IsInstanceOf<ErrorResponse>(CompilationGate.CheckOrNull(new JObject()));
         }
 
         [Test]
@@ -210,19 +436,19 @@ namespace UnityCliConnector.Tests
         {
             var now = NowMs();
             CompilationGate.SeedCompileClockForTests(now - 5000, now - 1000);
+            CompilationGate.SeedConsoleBoundaryForTests(maxIndex: 10, firstIndex: 3);
+            CompilationGate.ConsoleRangeForTests = new CompilationGate.ConsoleIndexRange(true, 3, 12);
             ConsoleLogEntries.TestOverride = _ => new List<ConsoleLogEntries.CompileDiag>
             {
                 new ConsoleLogEntries.CompileDiag
                 {
                     File = "Assets/Old.cs", Line = 1, Col = 1, Severity = "error",
-                    Code = "CS1002", Message = "; expected",
-                    HasTimestamp = true, TimeOfDaySeconds = AgoSeconds(600)
+                    Code = "CS1002", Message = "; expected", ConsoleIndex = 8
                 },
                 new ConsoleLogEntries.CompileDiag
                 {
                     File = "Assets/Now.cs", Line = 2, Col = 2, Severity = "error",
-                    Code = "CS0103", Message = "missing",
-                    HasTimestamp = true, TimeOfDaySeconds = TimeOfDaySeconds(now)
+                    Code = "CS0103", Message = "missing", ConsoleIndex = 12
                 }
             };
 
@@ -458,6 +684,35 @@ namespace UnityCliConnector.Tests
             Assert.IsTrue(ok, "sticky compile-error banner should be treated as a compile error");
             Assert.AreEqual("error", diag.Severity);
             Assert.IsTrue(diag.Sticky, "the gate needs the sticky marker to exclude build/runtime failures");
+            Assert.IsTrue(diag.StickyCompileFailure,
+                "the play-mode banner names compiler errors, so it is compile evidence");
+        }
+
+        [Test]
+        public void TryConvertEntry_StickyBuildFailure_IsNotCompileEvidence()
+        {
+            Assert.IsTrue(ConsoleLogEntries.TryConvertEntry(
+                ConsoleLogEntries.StickyErrorMask, "Build completed with a result of 'Failed'",
+                null, 0, false, out var build));
+            Assert.IsTrue(build.Sticky);
+            Assert.IsFalse(build.StickyCompileFailure, "a failed player build is not a compile failure");
+
+            Assert.IsTrue(ConsoleLogEntries.TryConvertEntry(
+                ConsoleLogEntries.ScriptCompileErrorMask, "Assets/Foo.cs(1,1): error CS1002: ; expected",
+                null, 0, false, out var compile));
+            Assert.IsFalse(compile.Sticky);
+            Assert.IsFalse(compile.StickyCompileFailure);
+        }
+
+        [Test]
+        public void TryConvertEntry_RecordsTheConsoleOrdinal()
+        {
+            Assert.IsTrue(ConsoleLogEntries.TryConvertEntry(
+                ConsoleLogEntries.ScriptCompileErrorMask, "Assets/Foo.cs(1,1): error CS1002: ; expected",
+                null, 0, false, out var diag, "[07:20:09] x", consoleIndex: 42));
+
+            Assert.AreEqual(42, diag.ConsoleIndex);
+            Assert.IsTrue(diag.HasConsoleIndex);
         }
 
         [Test]
@@ -518,6 +773,74 @@ namespace UnityCliConnector.Tests
             }
         }
 
+        // ─── Console ordinal + timestamp bindings (real LogEntries) ──
+
+        [Test]
+        public void RealConsoleEntries_ExposeOrdinalAndParseableTimestamp()
+        {
+            // The gate's ordinal rule is only as good as these two bindings: globalLineIndex must
+            // exist and grow for new entries, and GetEntryTimestampInternal must return the
+            // bracketed [HH:MM:SS] prefix ParseTimestampSeconds expects (the timestamp fallback).
+            ConsoleLogEntries.TestOverride = null;
+            UnityEngine.TestTools.LogAssert.ignoreFailingMessages = true;
+            try
+            {
+                Debug.LogError("unitycli_r12_ordinal_probe");
+
+                Assert.IsTrue(ConsoleLogEntries.TryGetConsoleIndexRange(out _, out var consoleMax),
+                    "LogEntry.globalLineIndex binding is required by the console freshness rule");
+
+                int probes = 0, probeIndex = -1;
+                var iterated = UnityCliConnector.Tools.ReadConsole.TryForEachEntry(
+                    (mode, message, file, line, timestamp, index) =>
+                    {
+                        if (message == null || !message.StartsWith("unitycli_r12_ordinal_probe")) return;
+                        probes++;
+                        probeIndex = index;
+                        Assert.GreaterOrEqual(index, 0, "the entry must carry its console ordinal");
+                        Assert.GreaterOrEqual(ConsoleLogEntries.ParseTimestampSeconds(timestamp), 0,
+                            $"GetEntryTimestampInternal returned '{timestamp}', which is not a [HH:MM:SS] stamp");
+                    });
+
+                Assert.IsTrue(iterated, "iterating the in-memory console failed");
+                Assert.GreaterOrEqual(probes, 1, "the probe entry must be visible to the reflection seam");
+                Assert.AreEqual(consoleMax, probeIndex,
+                    "the entry logged last must be the console's highest ordinal; that ordering is what " +
+                    "the compile-start pin relies on");
+            }
+            finally
+            {
+                UnityEngine.TestTools.LogAssert.ignoreFailingMessages = false;
+            }
+        }
+
+        // ─── Diagnostic file resolution ─────────────────────────
+
+        [Test]
+        public void DiagnosticFileExists_ResolvesPackageAssetPaths()
+        {
+            CompilationGate.FileExistsForTests = null;
+            var package = UnityEditor.PackageManager.PackageInfo.FindForAssembly(typeof(CompilationGate).Assembly);
+            if (package == null) Assert.Ignore("the connector is not installed as a package in this project");
+
+            Assert.IsTrue(CompilationGate.DiagnosticFileExists(
+                    package.assetPath + "/Editor/Core/CompilationGate.cs"),
+                "a package diagnostic names a logical asset path that PackageInfo maps to its real source");
+            Assert.IsFalse(CompilationGate.DiagnosticFileExists(
+                    package.assetPath + "/Editor/Core/Ghost12DoesNotExist.cs"),
+                "a package diagnostic for a file that is gone is still stale");
+        }
+
+        [Test]
+        public void DiagnosticFileExists_DoesNotExemptDirectoriesNamedUnknown()
+        {
+            CompilationGate.FileExistsForTests = null;
+            Assert.IsFalse(CompilationGate.DiagnosticFileExists("Assets/unknown/Old.cs"),
+                "the virtual-source exemption is about the file name, not any path containing 'unknown'");
+            Assert.IsTrue(CompilationGate.DiagnosticFileExists("unknown"));
+            Assert.IsTrue(CompilationGate.DiagnosticFileExists("<unknown>"));
+        }
+
         // ─── Helpers ────────────────────────────────────────────
 
         static long NowMs() => DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
@@ -526,12 +849,6 @@ namespace UnityCliConnector.Tests
         {
             var local = DateTimeOffset.FromUnixTimeMilliseconds(epochMs).ToLocalTime();
             return local.Hour * 3600L + local.Minute * 60L + local.Second;
-        }
-
-        static long AgoSeconds(int secondsAgo)
-        {
-            var sod = TimeOfDaySeconds(NowMs()) - secondsAgo;
-            return sod < 0 ? sod + 86400 : sod;
         }
 
         static CompilerMessage MakeCompilerMessage(string file, int line, int column, string message,

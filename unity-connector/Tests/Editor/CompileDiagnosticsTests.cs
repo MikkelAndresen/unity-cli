@@ -21,6 +21,7 @@ namespace UnityCliConnector.Tests
         public void TearDown()
         {
             CompilationGate.ResetForTests();
+            CompilationGate.RestoreLiveStateForTests();
             ConsoleLogEntries.TestOverride = null;
         }
 
@@ -67,11 +68,16 @@ namespace UnityCliConnector.Tests
         public void ConsoleOnlyErrors_AreIncluded()
         {
             // Burst errors never reach the CompilationPipeline; they only exist in the console.
+            // Pin the compile start so the test proves the ordinal rule keeps a current entry
+            // rather than the "no compile clock yet" shortcut admitting everything.
+            CompilationGate.SeedConsoleBoundaryForTests(maxIndex: 39, firstIndex: 3);
+            CompilationGate.ConsoleRangeForTests = new CompilationGate.ConsoleIndexRange(true, 3, 41);
             ConsoleLogEntries.TestOverride = _ => new List<ConsoleLogEntries.CompileDiag>
             {
                 new ConsoleLogEntries.CompileDiag
                 {
-                    File = "Assets/Sys.cs", Line = 7, Col = 3, Severity = "error", Code = "BC1028", Message = "Burst error",
+                    File = "Assets/Sys.cs", Line = 7, Col = 3, Severity = "error", Code = "BC1028",
+                    Message = "Burst error", ConsoleIndex = 41,
                 },
             };
 
