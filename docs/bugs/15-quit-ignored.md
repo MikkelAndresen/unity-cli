@@ -92,13 +92,14 @@ The fix therefore does not depend on knowing which of these fired: it removes th
   - Skips the compilation gate (`SkipCompilationGate`) because quitting must work in a broken editor.
 - **Go CLI (`cmd/quit.go`, `cmd/restart.go`, `internal/editor/`).**
   - `editor quit [--save|--discard] [--force]` sends `quit_editor`, waits for the heartbeat to say
-    `stopped` / the PID to disappear / the heartbeat to go stale, and otherwise fails with the
-    timeout plus a `wantsToQuit`/modal explanation. `--force` terminates only after
+    `stopped` or for a stale heartbeat whose PID is not visibly alive, and otherwise fails with the
+    timeout plus a `wantsToQuit`/modal explanation. `--force` terminates after an ignored quit, a
+    refused `quit_editor` request (unless `--save` was asked for), or a modal block, and only after
     `editor.CanManageProcess` confirms the PID is a visible Unity process.
-  - `editor restart [--clean] [--save|--discard] [--force] [--editor-path]` stops, optionally
-    removes `Library/` and `Temp/`, relaunches the same project and waits for `ready`. It refuses
-    before quitting when the CLI cannot manage the editor PID (the container case), because it
-    could not relaunch it.
+  - `editor restart [--clean] [--save|--discard] [--force] [--editor-path]` resolves the launch
+    executable first, then stops the editor, optionally removes `Library/` and `Temp/`, relaunches
+    the same project and waits for `ready`. It refuses before quitting when the CLI cannot manage
+    the editor PID (the container case) or cannot find the executable to relaunch it.
   - `internal/editor/` provides heartbeat-path reading, exit waiting, process termination,
     executable discovery, launch, clean and project-version helpers. `client.IsProcessAlive` is the
     conservative liveness probe shared with exit waiting.
@@ -159,3 +160,27 @@ What was **not** verified:
   accidentally visible and named `Unity` inside a container, restart would proceed.
 - A quit that completes faster than the 0.5 s reply-flush delay is still possible, though the delay
   was chosen from the branch's live measurements.
+
+## Review follow-up
+
+Code review of `fix/12-stale-compile-gate..fix/15-quit-editor` found four Go-side correctness gaps,
+all now fixed with regression tests:
+
+- `editor restart` resolved the executable only after quitting and cleaning, so a missing editor
+  install could leave the project stopped and `Library/` deleted. Resolution (and the
+  `--editor-path` advice in its error) now happens before anything irreversible.
+- `WaitForExit` treated a frozen heartbeat as an exit even when the PID was visibly alive, which
+  could confirm a quit that SIGTERM had not finished. The stale signal now requires the PID to be
+  unset or dead; the container case is unchanged because the host PID looks dead there.
+- `--force` returned early on a `quit_editor` refusal (`success:false`), leaving the editor running.
+  A refusal now falls through to termination unless `--save` was requested, where the refusal may
+  mean unsaved work could not be written.
+- The executable-not-found error named `--editor`, which is not a flag. It now names
+  `--editor-path`, and the README/help describe the wait by heartbeat state rather than a
+  process-death signal that only applies without a project heartbeat.
+
+The wait test that claimed to cover an advancing heartbeat was matching no heartbeat at all (its
+stub PID was 0), so it only exercised the timeout; it now returns the waited-on PID and proves the
+stale timer resets. The C# findings (play-mode `--save` reply fields, the unverified
+`EditorApplication.Exit` veto assumption, and the missing Windows process-name guard) are not
+changed here.

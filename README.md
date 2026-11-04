@@ -253,7 +253,7 @@ from inside a command handler shares the command's fate: the reply and the shutd
 race, and an exit vetoed by `EditorApplication.wantsToQuit` has no way to report
 itself. `editor quit` sends `quit_editor`, which answers first and schedules the
 exit for a later editor tick. It then waits until the heartbeat reports `stopped`
-or the process is gone, and fails if neither happens within 60 seconds
+or stops advancing, and fails if neither happens within 60 seconds
 (`--timeout` overrides it).
 
 Without `--save`, dirty scenes are discarded; the reply lists them under
@@ -264,9 +264,12 @@ default. The reply also lists any visible `EditorApplication.wantsToQuit`
 subscribers, and the connector logs an error naming them if Unity is still alive
 after the scheduled `Exit` - that is what a veto looks like from outside.
 
-With `--force`, an editor that does not exit in time, or that is parked on a
-modal dialog, is terminated (SIGTERM on macOS/Linux, `TerminateProcess` on
-Windows). Unsaved changes are lost. The CLI only signals a PID whose process
+With `--force`, an editor that does not exit in time, that refuses the
+`quit_editor` request, or that is parked on a modal dialog, is terminated
+(SIGTERM on macOS/Linux, `TerminateProcess` on
+Windows). Unsaved changes are lost. A `--save` request that the connector refuses
+is not overridden by `--force`, because the refusal may mean unsaved work could
+not be written. The CLI only signals a PID whose process
 name contains `Unity`. When the CLI runs in a container that cannot see the host
 editor's PID, `--force` fails and Unity has to be stopped from the host. The final
 JSON reports `method`: `graceful` or `terminate`, and `editor` carries the
@@ -288,11 +291,12 @@ unity-cli editor restart --clean
 unity-cli editor restart --editor-path /Applications/Unity/Hub/Editor/6000.1.0f1/Unity.app/Contents/MacOS/Unity
 ```
 
-`editor restart` resolves the project before stopping the editor (from the running
-instance, `--project`, or the current directory), quits it, optionally removes
-`Library/` and `Temp/`, relaunches it, and waits until the new editor reports
-`ready`. Progress and removed paths go to stderr; the final JSON contains the
-project path, old and new PIDs, cleaned paths, and elapsed time.
+`editor restart` resolves the project (from the running instance, `--project`, or
+the current directory) and the launch executable before stopping the editor,
+then quits it, optionally removes `Library/` and `Temp/`, relaunches it, and
+waits until the new editor reports `ready`. Progress and removed paths go to
+stderr; the final JSON contains the project path, old and new PIDs, cleaned
+paths, and elapsed time.
 
 The default wait budget is 5 minutes, or 15 minutes with `--clean`; `--timeout`
 overrides both that and the 60-second quit wait. Restart stops Unity the same way

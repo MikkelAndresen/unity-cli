@@ -1061,8 +1061,8 @@ Subcommands:
     --keep-console    With --compile, don't clear the console first (the default clear keeps
                       stale errors from a previous compile out of the report).
     --force           Allow refresh during play mode and force asset update.
-  quit                Quit Unity and wait until the heartbeat or process confirms
-                      the exit. Unsaved scene changes are discarded unless --save.
+  quit                Quit Unity and wait until its heartbeat reports stopped or
+                      stops advancing. Unsaved scene changes are discarded unless --save.
     --save            Save open scenes and assets before quitting.
     --discard         Discard unsaved scene changes explicitly (the default).
     --force           If Unity ignores the quit or a modal dialog blocks it,
