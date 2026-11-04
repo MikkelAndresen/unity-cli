@@ -252,3 +252,13 @@ DLL as covered because "its content matches what the compile recorded for it"; a
 assembly; editing `Heartbeat.cs` and calling `compile_status` before any compile reported
 `stale_assembly_count: 1` while the content record still held the old hash. All edited files were
 restored byte-for-byte.
+
+## Review follow-up (Go half)
+
+- `verify --assembly A,B` now applies that filter to the provenance's stale-assembly list, the same
+  rule `test --assembly` uses: a stale assembly outside the requested set is reported but no longer
+  refuses the tests, and a stale assembly inside it still does. A truncated list keeps the full
+  count because it cannot prove the requested assemblies are clean.
+- An explicit `editor refresh --compile clean` is refused when the connector's reply does not
+  advertise `clean_compile_supported`; an older connector would ignore the mode and answer a plain
+  refresh, so the CLI no longer reports "nothing to compile" (exit 0) for a rebuild that never ran.

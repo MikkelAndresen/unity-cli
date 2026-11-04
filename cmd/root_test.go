@@ -3,6 +3,8 @@ package cmd
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
+	"io"
 	"reflect"
 	"strings"
 	"testing"
@@ -84,7 +86,7 @@ func TestPrintResponseToEndsWithExactlyOneNewline(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			var out bytes.Buffer
-			printResponseTo(&out, tt.resp)
+			printResponseTo(&out, io.Discard, tt.resp)
 			if got := out.String(); got != tt.want {
 				t.Errorf("printResponseTo() = %q, want %q", got, tt.want)
 			}
@@ -271,9 +273,10 @@ func TestBuildParams_InvalidJSONNamesTheOccurrence(t *testing.T) {
 	tests := []struct {
 		name string
 		args []string
+		want string
 	}{
-		{"first params", []string{"--params", `{`}},
-		{"second params", []string{"--params", `{"ok":1}`, "--params", `{`}},
+		{"first params", []string{"--params", `{`}, "invalid JSON in --params #1"},
+		{"second params", []string{"--params", `{"ok":1}`, "--params", `{`}, "invalid JSON in --params #2"},
 	}
 
 	for _, tt := range tests {
@@ -282,8 +285,8 @@ func TestBuildParams_InvalidJSONNamesTheOccurrence(t *testing.T) {
 			if err == nil {
 				t.Fatal("expected invalid JSON error")
 			}
-			if !strings.Contains(err.Error(), "invalid JSON in --params") {
-				t.Errorf("error should mention --params, got: %v", err)
+			if !strings.Contains(err.Error(), tt.want) {
+				t.Errorf("error should contain %q, got: %v", tt.want, err)
 			}
 		})
 	}
@@ -379,5 +382,56 @@ func TestBuildParams_ExecUsingsFlags(t *testing.T) {
 	}
 	if args, ok := p["args"].([]string); !ok || len(args) != 1 || args[0] != "return 1;" {
 		t.Errorf("args = %v, want [return 1;]", p["args"])
+	}
+}
+
+// TestPrintFailureReport_PrintsTheReportBeforeTheError: editor refresh --compile answers with a
+// report and then exits non-zero, so the failing path must not swallow what the command produced.
+func TestPrintFailureReport_PrintsTheReportBeforeTheError(t *testing.T) {
+	resp := &client.CommandResponse{Success: false, Message: "Refresh done; compilation failed with 2 error(s).",
+		Data: json.RawMessage(`{"compile_succeeded":false,"error_count":2}`)}
+	err := errors.New("compilation failed: 2 error(s), listed in the report")
+
+	noteCalls := 0
+	errOut := captureStderr(t, func() {
+		printFailureReport(resp, err, func() { noteCalls++ })
+	})
+	if !strings.Contains(errOut, "Refresh done") || !strings.Contains(errOut, `"error_count":2`) {
+		t.Errorf("stderr = %q, want the report before the error", errOut)
+	}
+	if noteCalls != 1 {
+		t.Errorf("state note calls = %d, want 1", noteCalls)
+	}
+
+	if out := captureStdout(t, func() { printFailureReport(nil, err, func() { noteCalls++ }) }); out != "" {
+		t.Errorf("a nil response printed %q, want nothing", out)
+	}
+	if out := captureStdout(t, func() { printFailureReport(resp, nil, func() { noteCalls++ }) }); out != "" {
+		t.Errorf("a nil error printed %q, want nothing", out)
+	}
+	if noteCalls != 1 {
+		t.Errorf("state note calls = %d, want no note for a nil response or error", noteCalls)
+	}
+}
+
+// TestPrintResponseTo_MetaGoesToTheErrorWriter: the result and the meta/error lines must be
+// separable, so a test can assert the ordering a '2>&1 | tail -1' pipeline sees.
+func TestPrintResponseTo_MetaGoesToTheErrorWriter(t *testing.T) {
+	orig := flagMeta
+	flagMeta = true
+	t.Cleanup(func() { flagMeta = orig })
+
+	resp := &client.CommandResponse{
+		Success: true,
+		Data:    json.RawMessage(`"result"`),
+		Meta:    json.RawMessage(`{"compile":"cached"}`),
+	}
+	var out, errOut bytes.Buffer
+	printResponseTo(&out, &errOut, resp)
+	if out.String() != "result\n" {
+		t.Errorf("stdout = %q, want only the result", out.String())
+	}
+	if errOut.String() != "meta: {\"compile\":\"cached\"}\n" {
+		t.Errorf("stderr = %q, want only the meta line", errOut.String())
 	}
 }

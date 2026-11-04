@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -29,7 +30,7 @@ func statusCmd(inst *client.Instance) error {
 		printVersionSummary(os.Stderr, status)
 		if verdict.Crashed {
 			// A dead editor is not a state an agent can wait out, so it leaves as a failed exit.
-			return fmt.Errorf("%s", crashLine(status, verdict))
+			return fmt.Errorf("%s", crashLine(status))
 		}
 		return nil
 	}
@@ -40,7 +41,7 @@ func statusCmd(inst *client.Instance) error {
 	printVersionSummary(os.Stdout, status)
 	fmt.Printf("  PID:     %d\n", status.PID)
 	if isStartingState(status.State) {
-		fmt.Println("  Note:    the HTTP listener is up; the editor has not run its first update tick yet")
+		fmt.Println("  Note:    " + startingNote(status))
 	}
 	if isModal(status) {
 		fmt.Print(describeModal(status.Modal))
@@ -69,19 +70,23 @@ func staleHeartbeatReport(status *client.Instance, age time.Duration, ev *client
 	return b.String()
 }
 
+// discoverInstanceKeepingEvidence is a variable so tests can exercise the case where the instance
+// scan removed the dead-pid heartbeat before the crash verdict ran.
+var discoverInstanceKeepingEvidence = client.DiscoverInstanceKeepingEvidence
+
 func discoverStatusInstance(project string, port int) (*client.Instance, error) {
 	if port > 0 {
 		return readStatus(port)
 	}
-	inst, err := client.DiscoverInstance(project, 0)
+	inst, beat, err := discoverInstanceKeepingEvidence(project, 0)
 	if err == nil {
 		return inst, nil
 	}
-	// The instance scan deletes heartbeats whose pid is gone, which is what a crash leaves behind. When
-	// the file on disk still reads as one, that is the answer `status` owes the caller, so it is read
-	// past the scan. Anything else keeps the original "no Unity instances" failure.
-	if raw := client.NewestHeartbeat(project, 0); raw != nil && assessCrash(raw).Crashed {
-		return raw, nil
+	// The instance scan deletes heartbeats whose pid is gone, which is what a crash leaves behind. beat
+	// was read before that scan; when it reads as a crash, that is the answer `status` owes the caller.
+	// Anything else keeps the original "no Unity instances" failure.
+	if beat != nil && assessCrash(beat).Crashed {
+		return beat, nil
 	}
 	return nil, err
 }
@@ -111,30 +116,41 @@ const minConnectorVersion = "0.7.0"
 
 // versionExemptCommands are read-only or recovery commands: they must keep answering even when the
 // connector speaks a different protocol, because they are how an operator diagnoses and repairs the
-// mismatch. Gating them only turns a version drift into an unusable session (#11).
+// mismatch. Gating them only turns a version drift into an unusable session (#11). Only commands
+// that actually reach the gate are listed: status, dialogs, help, version and update return before
+// newVersionGate exists, so an entry for them would describe a decision that is never made.
+// tool_describe is a connector tool, not a CLI subcommand, but the default dispatch sends it like
+// one; it stays listed because it is part of the same diagnosis.
 var versionExemptCommands = map[string]struct{}{
-	"status":              {},
 	"console":             {},
 	"compile_diagnostics": {},
 	"compile_status":      {},
+	"api":                 {},
+	"burst_status":        {},
 	"modal":               {},
 	"tools":               {},
 	"tool_describe":       {},
 	"wait":                {},
-	"dialogs":             {},
 	"list":                {},
-	"help":                {},
-	"version":             {},
-	"update":              {},
 }
 
 type connectorCompatibility struct {
-	CLI        string
-	Connector  string
-	Compatible bool
-	Verdict    string
-	Warning    string
-	Refusal    error
+	CLI       string
+	Connector string
+	Verdict   string
+	Warning   string
+	Refusal   error
+}
+
+type connectorRefusal struct {
+	message string
+}
+
+func (e *connectorRefusal) Error() string { return e.message }
+
+func isConnectorRefusal(err error) bool {
+	var refusal *connectorRefusal
+	return errors.As(err, &refusal)
 }
 
 type semanticVersion struct {
@@ -151,12 +167,10 @@ func assessConnectorVersion(inst *client.Instance, cliVersion string) connectorC
 
 	cli, cliOK := parseVersion(v.CLI)
 	if v.CLI == "dev" || !cliOK {
-		v.Compatible = true
 		v.Verdict = "development CLI; compatibility not checked"
 		return v
 	}
 	if v.Connector == "" {
-		v.Compatible = true
 		v.Verdict = "unknown connector version; update the connector package"
 		v.Warning = versionWarning(v.CLI, "", "the connector reports no version")
 		return v
@@ -164,25 +178,21 @@ func assessConnectorVersion(inst *client.Instance, cliVersion string) connectorC
 
 	connector, connectorOK := parseVersion(v.Connector)
 	if !connectorOK {
-		v.Compatible = true
 		v.Verdict = fmt.Sprintf("unrecognised connector version %q; update the connector package", v.Connector)
 		v.Warning = versionWarning(v.CLI, v.Connector, "the connector version is not a version number")
 		return v
 	}
 	min, _ := parseVersion(minConnectorVersion)
 	if versionLess(connector, min) {
-		v.Compatible = false
 		v.Verdict = fmt.Sprintf("connector %s is older than the minimum %s; update the connector package", v.Connector, minConnectorVersion)
-		v.Refusal = fmt.Errorf("connector %s is older than the minimum %s supported by unity-cli %s (%s). Update the com.youngwoocho02.unity-cli-connector package in Unity, or rerun with --ignore-version-mismatch", v.Connector, minConnectorVersion, v.CLI, executablePath())
+		v.Refusal = &connectorRefusal{message: fmt.Sprintf("connector %s is older than the minimum %s supported by unity-cli %s (%s). Update the com.youngwoocho02.unity-cli-connector package in Unity, or rerun with --ignore-version-mismatch", v.Connector, minConnectorVersion, v.CLI, executablePath())}
 		return v
 	}
 	if connector.major == cli.major && connector.minor == cli.minor {
-		v.Compatible = true
 		v.Verdict = fmt.Sprintf("compatible (same major.minor %d.%d)", cli.major, cli.minor)
 		return v
 	}
 
-	v.Compatible = true
 	field := "minor"
 	if connector.major != cli.major {
 		field = "major"
@@ -280,13 +290,21 @@ func (g *versionGate) check(inst *client.Instance) error {
 	return nil
 }
 
-// waitForAlive resolves the current target instance, then polls until a newer heartbeat appears.
-// This keeps following the same project even if Unity rebinds to a new port during reload.
-func waitForAlive(resolve instanceResolver, timeoutMs int) (*client.Instance, error) {
-	return waitForAliveContext(context.Background(), resolve, timeoutMs)
+// resolveKeepingEvidence is the wait-loop resolver: like DiscoverInstance, but it keeps the
+// heartbeat the instance scan deletes, so a crash during the wait still reaches crashedWhileWaiting.
+func resolveKeepingEvidence(project string, port int) instanceResolver {
+	return func() (*client.Instance, error) {
+		inst, beat, err := discoverInstanceKeepingEvidence(project, port)
+		if err != nil && beat != nil {
+			return beat, nil
+		}
+		return inst, err
+	}
 }
 
-// waitForAliveContext is the same wait, bounded by ctx as well as timeoutMs: the caller's one
+// waitForAliveContext resolves the current target instance, then polls until a newer heartbeat
+// appears, following the same project even if Unity rebinds to a new port during a reload. It is
+// bounded by ctx as well as timeoutMs: the caller's one
 // invocation deadline has to cover discovery and waiting too, or a slow start spends the budget
 // twice. A non-positive timeoutMs means "until ctx is canceled".
 func waitForAliveContext(ctx context.Context, resolve instanceResolver, timeoutMs int) (*client.Instance, error) {
@@ -345,7 +363,25 @@ func waitForAliveTimeout(timeoutMs int) error {
 		return fmt.Errorf("timed out waiting for Unity")
 	}
 	return fmt.Errorf("timed out after %s waiting for Unity to answer (the editor may still be starting or busy)",
-		(time.Duration(timeoutMs) * time.Millisecond).String())
+		client.FormatBudget(time.Duration(timeoutMs)*time.Millisecond))
+}
+
+// pollOrCancel waits one poll interval, returning the context error when the invocation deadline
+// or a signal ends the wait first.
+func pollOrCancel(ctx context.Context) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-time.After(statusPollInterval):
+		return nil
+	}
+}
+
+func compileWaitError(cause error) error {
+	if cause == context.DeadlineExceeded {
+		return fmt.Errorf("timed out waiting for compilation (--timeout): %w", cause)
+	}
+	return fmt.Errorf("waiting for compilation cancelled: %w", cause)
 }
 
 // crashedWhileWaiting answers with the crash report when the heartbeat on disk belongs to an editor
@@ -353,7 +389,7 @@ func waitForAliveTimeout(timeoutMs int) error {
 // is the case the wait exists to ride out. The artifact scan is skipped until the beat has been silent
 // long enough for `wait` to give up anyway, so the common live case never pays for it.
 func crashedWhileWaiting(inst *client.Instance) error {
-	if inst == nil || heartbeatAge(inst) <= waitSilentHeartbeat {
+	if inst == nil || client.HeartbeatAge(inst) <= waitSilentHeartbeat {
 		return nil
 	}
 	if verdict := assessCrash(inst); verdict.Crashed {
@@ -362,44 +398,13 @@ func crashedWhileWaiting(inst *client.Instance) error {
 	return nil
 }
 
-// waitForReadyTo polls until the heartbeat state becomes "ready" again after a compile request,
-// writing progress to logw. command names the waiting command if a modal dialog blocks the editor.
-// It cannot tell a compile that finished from an editor that was already ready; callers that need
-// that proof use waitForCompileTo.
-func waitForReadyTo(resolve instanceResolver, logw io.Writer, command string) (hasErrors, timedOut bool, err error) {
-	_, _ = fmt.Fprintf(logw, "Waiting for compilation...\n")
-
-	deadline := time.Now().Add(compileWaitTimeout)
-	for time.Now().Before(deadline) {
-		time.Sleep(statusPollInterval)
-		status, err := resolve()
-		if err != nil {
-			continue
-		}
-		if isModal(status) {
-			return false, false, modalBlockedError(status, command, true)
-		}
-		if status.State == "ready" {
-			if status.CompileErrors {
-				_, _ = fmt.Fprintf(logw, "Compilation finished with errors.\n")
-			} else {
-				_, _ = fmt.Fprintf(logw, "Compilation complete.\n")
-			}
-			return status.CompileErrors, false, nil
-		}
-	}
-
-	_, _ = fmt.Fprintf(logw, "Timed out waiting for compilation (%s).\n", compileWaitTimeout)
-	return false, true, nil
-}
-
 // Compile wait budgets. Variables so tests can shrink them.
 var (
 	compileWaitTimeout = 5 * time.Minute
 	// compileIdleGrace is how long a requested compile is given to show any sign of having run
-	// before the CLI concludes the asset refresh left nothing to recompile. The connector keeps
-	// its heartbeat "compiling" for 3 s after a request, so a real compile is visible long before
-	// this elapses; without it, a no-op compile request would wait out the full timeout.
+	// before the CLI concludes the asset refresh left nothing to recompile. The connector only
+	// guarantees a 3 s "compiling" heartbeat after a request; a compile queued behind other
+	// editor work can start later, so this is a heuristic rather than proof.
 	compileIdleGrace = 20 * time.Second
 )
 
@@ -408,7 +413,10 @@ var (
 // and the first poll still counts as evidence.
 type compileBaseline struct {
 	FinishedAt int64
-	PID        int
+	// Tracked says the reply carried the compile-clock key, so a clock that still reads 0 is a new
+	// connector that has not stamped it yet, not one without the clock.
+	Tracked bool
+	PID     int
 }
 
 // compileOutcome says how waiting for a requested compile ended.
@@ -425,13 +433,16 @@ type compileOutcome struct {
 // waitForCompileTo polls the heartbeat until the connector reports a script compilation that
 // finished after baseline. A heartbeat that is simply "ready" is not proof: it can already have
 // been ready when polling started, and the compile can finish inside one poll interval.
-func waitForCompileTo(resolve instanceResolver, logw io.Writer, command string, baseline compileBaseline) (compileOutcome, error) {
+func waitForCompileTo(ctx context.Context, resolve instanceResolver, logw io.Writer, command string, baseline compileBaseline) (compileOutcome, error) {
 	_, _ = fmt.Fprintf(logw, "Waiting for compilation...\n")
 
 	start := time.Now()
 	deadline := start.Add(compileWaitTimeout)
+	lastErrors := false
 	for time.Now().Before(deadline) {
-		time.Sleep(statusPollInterval)
+		if err := pollOrCancel(ctx); err != nil {
+			return compileOutcome{}, compileWaitError(err)
+		}
 		status, err := resolve()
 		if err != nil {
 			continue
@@ -440,26 +451,28 @@ func waitForCompileTo(resolve instanceResolver, logw io.Writer, command string, 
 			return compileOutcome{}, modalBlockedError(status, command, true)
 		}
 
-		outcome := compileOutcome{Elapsed: time.Since(start), HasErrors: status.CompileErrors}
-		tracked := baseline.FinishedAt != 0 || status.CompileFinishedAt != 0
+		lastErrors = status.CompileErrors
+		outcome := compileOutcome{Elapsed: time.Since(start), HasErrors: lastErrors}
+		tracked := baseline.Tracked || status.CompileFinishedAt != 0
 		restarted := baseline.PID != 0 && status.PID != 0 && status.PID != baseline.PID
 		// The compile clock advances when the compilation ends, which is *before* the domain reload
 		// it triggers; the editor only answers again once that reload is over, hence "ready" too.
 		finished := status.State == "ready" && status.CompileFinishedAt > baseline.FinishedAt
 
 		switch {
-		case finished:
-			outcome.Evidence = true
-			_, _ = fmt.Fprintf(logw, "%s\n", compileResultLine(status.CompileErrors))
-			return outcome, nil
 		case restarted:
 			// The editor restarted under the request; its startup compile state is the freshest
-			// answer, but the CLI cannot claim this request caused it.
+			// answer, but the CLI cannot claim this request caused it. Checked before finished:
+			// the reopened process's startup compile also advances the wall clock past the baseline.
 			if status.State != "ready" {
 				continue
 			}
 			outcome.Restarted = true
 			outcome.Untracked = !tracked
+			_, _ = fmt.Fprintf(logw, "%s\n", compileResultLine(status.CompileErrors))
+			return outcome, nil
+		case finished:
+			outcome.Evidence = true
 			_, _ = fmt.Fprintf(logw, "%s\n", compileResultLine(status.CompileErrors))
 			return outcome, nil
 		case !tracked && status.State == "ready":
@@ -476,7 +489,7 @@ func waitForCompileTo(resolve instanceResolver, logw io.Writer, command string, 
 	}
 
 	_, _ = fmt.Fprintf(logw, "Timed out waiting for compilation (%s).\n", compileWaitTimeout)
-	return compileOutcome{TimedOut: true, Elapsed: time.Since(start)}, nil
+	return compileOutcome{TimedOut: true, HasErrors: lastErrors, Elapsed: time.Since(start)}, nil
 }
 
 func compileResultLine(hasErrors bool) string {
@@ -484,4 +497,21 @@ func compileResultLine(hasErrors bool) string {
 		return "Compilation finished with errors."
 	}
 	return "Compilation complete."
+}
+
+// longStartup is when a "starting" editor stops looking like an ordinary cold import. The beater keeps
+// its heartbeat fresh, so age alone never flags a wedged startup.
+const longStartup = 10 * time.Minute
+
+func startingNote(inst *client.Instance) string {
+	note := "the HTTP listener is up; the editor has not run its first update tick yet"
+	age, ok := inst.StartingFor()
+	if !ok {
+		return note
+	}
+	note = fmt.Sprintf("%s (starting for %s)", note, client.FormatAge(age))
+	if age > longStartup {
+		note += "; a cold import can take this long, but if Logs/Editor.log has stopped growing the main thread is wedged — see 'unity-cli dialogs'"
+	}
+	return note
 }

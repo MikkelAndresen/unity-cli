@@ -405,6 +405,83 @@ func TestEditorCmd_RefreshCompileReportsOldConnector(t *testing.T) {
 	}
 }
 
+func TestEditorCmd_RefreshCompileZeroClockIsNotAnOldConnector(t *testing.T) {
+	compileTestBudgets(t)
+	// A connector that echoes compile_finished_at but has not stamped it yet reads 0. The reply key
+	// proves the clock exists, so a zero must not fall back to the old ready-means-done branch.
+	zero := int64(0)
+	f := &fakeEditor{t: t, diagnostics: clean(), echoFinished: &zero, finishedAt: 0}
+
+	resp, err := editorCmd(context.Background(), []string{"refresh", "--compile"}, f.send, f.resolve)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	report := parseCompileReport(t, resp)
+	if !report.NothingToCompile {
+		t.Errorf("report = %+v, want nothing_to_compile until the clock moves", report)
+	}
+	if hasNoteContaining(report.Notes, "does not report when a compile finished") {
+		t.Errorf("notes = %v, want no old-connector note for a connector with a compile clock", report.Notes)
+	}
+}
+
+func TestEditorCmd_RefreshCompileEditorRestartWithStartupCompile(t *testing.T) {
+	compileTestBudgets(t)
+	base := int64(1_000)
+	f := &fakeEditor{
+		t: t, diagnostics: clean(), echoFinished: &base,
+		finishedAt: base, pid: os.Getpid(),
+	}
+	resolveCount := 0
+	resolve := func() (*client.Instance, error) {
+		inst, err := f.resolve()
+		if err != nil {
+			return nil, err
+		}
+		resolveCount++
+		if resolveCount > 1 {
+			inst.PID = os.Getpid() + 1
+			// The reopened editor's startup compile advances the wall clock past the baseline.
+			inst.CompileFinishedAt = 2_000
+		}
+		return inst, nil
+	}
+
+	resp, err := editorCmd(context.Background(), []string{"refresh", "--compile"}, f.send, resolve)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	report := parseCompileReport(t, resp)
+	if !hasNoteContaining(report.Notes, "restarted") {
+		t.Errorf("notes = %v, want the restart reported even though the startup compile moved the clock", report.Notes)
+	}
+}
+
+func TestEditorCmd_RefreshCompileTimeoutStillReportsWhenDiagnosticsStayBusy(t *testing.T) {
+	compileTestBudgets(t)
+	base := int64(1_000)
+	f := &fakeEditor{
+		t: t, diagnostics: clean(), echoFinished: &base, finishedAt: base,
+		stuckState: "compiling", diagnosticsCompiling: true,
+	}
+
+	start := time.Now()
+	resp, err := editorCmd(context.Background(), []string{"refresh", "--compile"}, f.send, f.resolve)
+	if err == nil {
+		t.Fatal("expected an error when the compile never finished")
+	}
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Fatalf("timed-out report took %s; diagnostics must not outlive the compile wait", elapsed)
+	}
+	report := parseCompileReport(t, resp)
+	if !report.TimedOut || report.CompileSucceeded || report.NothingToCompile {
+		t.Errorf("report = %+v, want timed_out and compile_succeeded=false", report)
+	}
+	if !hasNoteContaining(report.Notes, "could not be read") {
+		t.Errorf("notes = %v, want one explaining the missing diagnostics", report.Notes)
+	}
+}
+
 func TestEditorCmd_RefreshCompileEditorRestarted(t *testing.T) {
 	compileTestBudgets(t)
 	base := int64(1_000)
@@ -458,12 +535,13 @@ func TestEditorCmd_RefreshWithoutCompileDoesNotWaitOrClear(t *testing.T) {
 
 func compileTestBudgets(t *testing.T) {
 	t.Helper()
-	origPoll, origWait, origGrace := statusPollInterval, compileWaitTimeout, compileIdleGrace
+	origPoll, origWait, origGrace, origDiag := statusPollInterval, compileWaitTimeout, compileIdleGrace, verifyDiagnosticsWait
 	statusPollInterval = time.Millisecond
 	compileWaitTimeout = 300 * time.Millisecond
 	compileIdleGrace = 20 * time.Millisecond
+	verifyDiagnosticsWait = 20 * time.Millisecond
 	t.Cleanup(func() {
-		statusPollInterval, compileWaitTimeout, compileIdleGrace = origPoll, origWait, origGrace
+		statusPollInterval, compileWaitTimeout, compileIdleGrace, verifyDiagnosticsWait = origPoll, origWait, origGrace, origDiag
 	})
 }
 
@@ -592,7 +670,11 @@ func TestEditorCmd_RefreshCompileReportsStaleAfterCleanRetry(t *testing.T) {
 func TestEditorCmd_RefreshCompileCleanDiscardsTheBuildCache(t *testing.T) {
 	compileTestBudgets(t)
 	base := int64(1_000)
-	f := &fakeEditor{t: t, diagnostics: clean(), echoFinished: &base, finishedAt: 2_000}
+	f := &fakeEditor{t: t, diagnostics: clean(), echoFinished: &base, finishedAt: 2_000,
+		refreshReplies: []map[string]interface{}{{
+			"clean_compile_supported": true,
+			"compile_finished_at":     base,
+		}}}
 
 	resp, err := editorCmd(context.Background(), []string{"refresh", "--compile", "clean"}, f.send, f.resolve)
 	if err != nil {
@@ -603,6 +685,28 @@ func TestEditorCmd_RefreshCompileCleanDiscardsTheBuildCache(t *testing.T) {
 	}
 	if report := parseCompileReport(t, resp); !report.CompileSucceeded {
 		t.Errorf("report = %+v, want the clean compile reported like any other", report)
+	}
+}
+
+// TestEditorCmd_RefreshCompileCleanNeedsAConnectorThatSupportsIt: an older connector ignores the
+// clean mode and answers a plain refresh, so the CLI must refuse rather than report "nothing to
+// compile" (exit 0) for a rebuild that never happened.
+func TestEditorCmd_RefreshCompileCleanNeedsAConnectorThatSupportsIt(t *testing.T) {
+	compileTestBudgets(t)
+	f := &fakeEditor{t: t, diagnostics: clean()}
+
+	resp, err := editorCmd(context.Background(), []string{"refresh", "--compile", "clean"}, f.send, f.resolve)
+	if err == nil {
+		t.Fatal("want an error when the connector does not advertise clean_compile_supported")
+	}
+	if !strings.Contains(err.Error(), "does not support") {
+		t.Errorf("error = %v, want it to say the connector does not support the mode", err)
+	}
+	if resp == nil || resp.Success {
+		t.Errorf("response = %+v, want a failure carrying the explanation", resp)
+	}
+	if len(f.calls) != 2 || f.calls[0] != "console(clear)" || f.calls[1] != "refresh_unity" {
+		t.Errorf("calls = %v, want only the clear and the refresh before refusing", f.calls)
 	}
 }
 
@@ -727,5 +831,42 @@ func TestEditorCmd_UnknownAction(t *testing.T) {
 	_, err := editorCmd(context.Background(), []string{"fly"}, send, resolve)
 	if err == nil {
 		t.Error("expected error for unknown action")
+	}
+}
+
+// TestEditorCmd_RefreshCompileTruncatedErrorsSaySo: the report's error_count is the true total while
+// errors[] is capped, so the JSON carries a note rather than looking complete.
+func TestEditorCmd_RefreshCompileTruncatedErrorsSaySo(t *testing.T) {
+	compileTestBudgets(t)
+	base := int64(1_000)
+	errs := make([]interface{}, 25)
+	for i := range errs {
+		errs[i] = map[string]interface{}{"file": "Assets/Foo.cs", "line": i + 1, "col": 1, "message": "boom"}
+	}
+	f := &fakeEditor{t: t, echoFinished: &base, finishedAt: 2_000,
+		diagnostics: map[bool][]interface{}{true: errs, false: errs}}
+
+	resp, err := editorCmd(context.Background(), []string{"refresh", "--compile"}, f.send, f.resolve)
+	if err == nil {
+		t.Fatal("expected the compile to fail")
+	}
+	report := parseCompileReport(t, resp)
+	if report.ErrorCount != 25 || len(report.Errors) != compileReportMaxDiags {
+		t.Fatalf("report = %d errors, %d listed; want 25 and %d", report.ErrorCount, len(report.Errors), compileReportMaxDiags)
+	}
+	if !hasNoteContaining(report.Notes, "errors[] lists the first 20") {
+		t.Errorf("notes = %v, want the truncation explained", report.Notes)
+	}
+}
+
+// TestEditorCmd_RefreshKeepConsoleNeedsCompile: the flag only affects a compile report, so silently
+// ignoring it would leave the console cleared when the caller asked to keep it.
+func TestEditorCmd_RefreshKeepConsoleNeedsCompile(t *testing.T) {
+	f := &fakeEditor{t: t, diagnostics: clean()}
+	if _, err := editorCmd(context.Background(), []string{"refresh", "--keep-console"}, f.send, f.resolve); err == nil {
+		t.Fatal("want an error for --keep-console without --compile")
+	}
+	if f.called("refresh_unity") {
+		t.Errorf("calls = %v, want nothing sent", f.calls)
 	}
 }

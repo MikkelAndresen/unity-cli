@@ -128,3 +128,37 @@ exit=1
   line below it. Changing that first line would be a larger presentation change outside this follow-up.
 - The live shared editor was not used for the final verification, per the worker instructions, so the
   integration check is the fake-HOME binary run above rather than a wedged real editor.
+
+## Review follow-up
+
+A code review of the #17 stack found one remaining misclassification in this fix. `status` calls an
+editor unresponsive once its heartbeat is 3 s old (`client.BeatSilenceAge`), but the evidence path
+only had a *silent* heartbeat after 10 s (`heartbeatStaleAge`). A 3–10 s gap — an ordinary domain
+reload or compile pause — therefore had a fresh `SessionHeartbeat` and no `StaleHeartbeat`, so the
+report fell through to the lockfile branch and said `editor_starting_or_blocked ... the connector has
+not loaded` about a connector that had demonstrably loaded this session.
+
+`(*client.EditorEvidence).UnresponsiveHeartbeat()` now returns the silent heartbeat, or the session
+heartbeat once it is at least `BeatSilenceAge` old, and `cmd/evidence.go` uses that single predicate
+for the state sentence, the heartbeat line, and the restart advice. A clean `stopped` heartbeat and a
+heartbeat written before the lockfile still read as not-unresponsive, and a heartbeat inside the 3 s
+margin changes nothing.
+
+## Review follow-up (round 2)
+
+- The state sentence now lets the lockfile age decide its wording: a lockfile older than two hours
+  with no heartbeat from this session says the editor probably crashed instead of claiming it is
+  still importing, and the `Next:` line tells the operator to relaunch rather than to look for a
+  startup dialog.
+- `editor_unresponsive` no longer gives dialog advice for an editor that left no lockfile: the
+  report says the project holds no `Temp/UnityLockfile`, that the editor has probably exited, and
+  to relaunch it. README now states exactly when each state applies (the unresponsive one does not
+  require a lockfile).
+- `dialogs` reads the project from the newest heartbeat instead of `client.DiscoverInstance`, so a
+  read-only listing no longer prunes dead-pid instance files or picks an arbitrary project.
+- A click that matches several buttons on one window is reported as such (button count and titles)
+  instead of claiming "matches 2 windows" and listing the same window twice.
+- The click AppleScript already enumerates each window and then its sheets, uses the listing's
+  parent-title fallback, and contains no `continue repeat`. A Go test now asserts that structure
+  and records the list-to-click pid/title/button handoff through an injectable osascript runner;
+  the script itself is still unexecuted because this machine has no osascript (no macOS host run).

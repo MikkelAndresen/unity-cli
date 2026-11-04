@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"strings"
 )
 
 // compileProvenance mirrors the connector's provenance payload (unity-connector
@@ -53,6 +52,11 @@ type staleAssembly struct {
 	Missing             bool   `json:"missing,omitempty"`
 }
 
+// provenanceNotScanned is the connector's scan_note when compile_status answered without walking
+// the source tree (it does that while the editor is compiling). stale_count is then 0 because
+// nothing was looked at, not because nothing is stale.
+const provenanceNotScanned = "source tree not scanned"
+
 // provenanceIn reads the provenance object a compile_diagnostics reply nests under "provenance".
 // It returns it parsed (for the lines the CLI prints) and verbatim (for the JSON reports, which then
 // pass through fields this CLI version does not model and keep the values the connector chose).
@@ -83,9 +87,6 @@ func provenanceIn(data json.RawMessage) (*compileProvenance, json.RawMessage) {
 func fetchProvenance(send sendFn) (*compileProvenance, json.RawMessage) {
 	resp, err := send("compile_status", map[string]interface{}{})
 	if err != nil || resp == nil || !resp.Success || len(resp.Data) == 0 {
-		return nil, nil
-	}
-	if strings.Contains(resp.Message, "Unknown command") {
 		return nil, nil
 	}
 	var p compileProvenance

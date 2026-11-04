@@ -154,12 +154,67 @@ func TestWait_AnEditorThatRestartedDoesNotCountAsItsOwnEvidence(t *testing.T) {
 		{State: "compiling", CompileFinishedAt: 1000, PID: 111},
 		{State: "ready", CompileFinishedAt: 2000, PID: 222},
 	}}
-	code, out := f.run("--compile")
+	code, out := f.run("--compile", "--json")
 	if code != waitIdle {
 		t.Fatalf("exit = %d, want 0; output:\n%s", code, out)
 	}
-	if !strings.Contains(out, "restarted while waiting") {
-		t.Errorf("output = %q, want the note that the clock moved because the editor came back, not because it compiled", out)
+	var r waitResult
+	if err := json.Unmarshal([]byte(out), &r); err != nil {
+		t.Fatalf("output is not the JSON object: %v (%s)", err, out)
+	}
+	if r.CompileLanded {
+		t.Errorf("result = %+v, want the new process's startup compile to not count as the caller's compile", r)
+	}
+	if !strings.Contains(strings.Join(r.Notes, "\n"), "restarted while waiting") {
+		t.Errorf("notes = %q, want the note that the clock moved because the editor came back, not because it compiled", r.Notes)
+	}
+	if !strings.Contains(strings.Join(r.Notes, "\n"), "already in") {
+		t.Errorf("notes = %q, want the source scan to be the proof after a restart", r.Notes)
+	}
+}
+
+func TestWait_ACompileAfterARestartIsStillProof(t *testing.T) {
+	f := &fakeWait{t: t, prov: prov(provLine, 0), states: []client.Instance{
+		{State: "compiling", CompileFinishedAt: 1000, PID: 111},
+		{State: "compiling", CompileFinishedAt: 2000, PID: 222},
+		{State: "compiling", CompileFinishedAt: 2000, PID: 222},
+		{State: "ready", CompileFinishedAt: 3000, PID: 222},
+	}}
+	code, out := f.run("--compile", "--json")
+	if code != waitIdle {
+		t.Fatalf("exit = %d, want 0; output:\n%s", code, out)
+	}
+	var r waitResult
+	if err := json.Unmarshal([]byte(out), &r); err != nil {
+		t.Fatalf("output is not the JSON object: %v (%s)", err, out)
+	}
+	if !r.CompileLanded {
+		t.Errorf("result = %+v, want a compile the restarted process ran to be evidence", r)
+	}
+}
+
+func TestWait_CompileDoesNotTreatACompilingEditorsUnscannedRecordAsProof(t *testing.T) {
+	p := prov(provLine, 0)
+	p.ScanNote = provenanceNotScanned
+	p.ScanComplete = false
+	f := &fakeWait{t: t, prov: p, states: []client.Instance{
+		{State: "ready", CompileFinishedAt: 1000},
+		{State: "ready", CompileFinishedAt: 1000},
+		{State: "ready", CompileFinishedAt: 2000},
+	}}
+	code, out := f.run("--compile", "--json")
+	if code != waitIdle {
+		t.Fatalf("exit = %d, want 0; output:\n%s", code, out)
+	}
+	var r waitResult
+	if err := json.Unmarshal([]byte(out), &r); err != nil {
+		t.Fatalf("output is not the JSON object: %v (%s)", err, out)
+	}
+	if !r.CompileLanded {
+		t.Errorf("result = %+v, want the wait to continue until the compile moved the clock", r)
+	}
+	if strings.Contains(strings.Join(r.Notes, "\n"), "already in") {
+		t.Errorf("notes = %q, want no claim that the edit is in while the connector was compiling", r.Notes)
 	}
 }
 
@@ -249,13 +304,53 @@ func TestWait_SilentHeartbeatExitsTwo(t *testing.T) {
 func TestWait_HeartbeatGoesQuietMidWaitExitsTwo(t *testing.T) {
 	f := &fakeWait{t: t, states: []client.Instance{
 		{State: "ready", CompileFinishedAt: 1000},
-		{State: "reloading", CompileFinishedAt: 1000},
-		{State: "reloading", CompileFinishedAt: 1000, ProjectPath: "/nonexistent/unity-cli-test-project",
+		{State: "compiling", CompileFinishedAt: 1000},
+		{State: "compiling", CompileFinishedAt: 1000, ProjectPath: "/nonexistent/unity-cli-test-project",
 			Timestamp: time.Now().Add(-time.Minute).UnixMilli()},
 	}}
 	code, out := f.run("--compile", "--timeout", "30")
 	if code != waitNoReply || !strings.Contains(out, "not responding") {
 		t.Fatalf("exit = %d, output = %q; want 2 with the unresponsive report", code, out)
+	}
+}
+
+// A reload stops the update-driven heartbeat for as long as it takes, which can outlast the
+// wedge cutoff; only the editor dying in the reload is a reason to stop waiting.
+func TestWait_AReloadLongerThanTheSilenceCutoffIsRiddenOut(t *testing.T) {
+	f := &fakeWait{t: t, prov: prov(provLine, 0), states: []client.Instance{
+		{State: "reloading", CompileFinishedAt: 1000},
+		{State: "reloading", CompileFinishedAt: 1000, Timestamp: time.Now().Add(-time.Minute).UnixMilli()},
+		{State: "ready", CompileFinishedAt: 1000},
+	}}
+	code, out := f.run("--timeout", "5")
+	if code != waitIdle {
+		t.Fatalf("exit = %d, want 0 when the reload finishes; output:\n%s", code, out)
+	}
+	if !strings.Contains(out, "reports a domain reload") {
+		t.Errorf("output = %q, want the note that the silence is the reload, not a wedge", out)
+	}
+}
+
+func TestWait_StaleGraceRestartsWhenTheEditorLeavesIdle(t *testing.T) {
+	states := []client.Instance{
+		{State: "ready", CompileFinishedAt: 1000},
+		{State: "ready", CompileFinishedAt: 1000},
+	}
+	for i := 0; i < 30; i++ {
+		states = append(states, client.Instance{State: "compiling", CompileFinishedAt: 1000})
+	}
+	for i := 0; i < 10; i++ {
+		states = append(states, client.Instance{State: "ready", CompileFinishedAt: 1000})
+	}
+	states = append(states, client.Instance{State: "ready", CompileFinishedAt: 2000})
+
+	f := &fakeWait{t: t, states: states, prov: prov(provLine, 1, "Assets/Foo.cs")}
+	code, out := f.run("--compile", "--timeout", "5")
+	if code != waitIdle {
+		t.Fatalf("exit = %d, want 0 after the compile lands; output:\n%s", code, out)
+	}
+	if strings.Contains(out, "no compilation started within") {
+		t.Errorf("output = %q, want the time spent compiling to not count against the stale grace", out)
 	}
 }
 
@@ -284,6 +379,21 @@ func TestWait_BadTimeoutIsRejected(t *testing.T) {
 	code, out := f.run("--timeout", "soon")
 	if code != waitTimedOut || !strings.Contains(out, "whole number of seconds") {
 		t.Errorf("exit = %d, output = %q; want a usage error", code, out)
+	}
+}
+
+func TestWait_BadTimeoutStillAnswersJSON(t *testing.T) {
+	f := &fakeWait{t: t, states: []client.Instance{{State: "ready"}}}
+	code, out := f.run("--json", "--timeout", "soon")
+	if code != waitTimedOut {
+		t.Fatalf("exit = %d, want 1", code)
+	}
+	var r waitResult
+	if err := json.Unmarshal([]byte(out), &r); err != nil {
+		t.Fatalf("output is not the JSON object: %v (%s)", err, out)
+	}
+	if r.Exit != waitTimedOut || !strings.Contains(r.Error, "whole number of seconds") {
+		t.Errorf("result = %+v, want the usage error inside the JSON object", r)
 	}
 }
 

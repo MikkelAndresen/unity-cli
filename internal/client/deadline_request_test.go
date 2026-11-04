@@ -48,21 +48,24 @@ func TestSendContext_TellsTheConnectorTheRemainingBudget(t *testing.T) {
 func TestSendContext_ShrinksTheBudgetForEveryLaterRequest(t *testing.T) {
 	port, bodies := echoServer(t)
 	inst := &Instance{State: "ready", ProjectPath: t.TempDir(), Port: port, PID: 1}
-	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	// A budget far larger than the sleep below, so a loaded machine cannot expire the context and
+	// turn the assertion into a scheduling test. What is under test is that the second send reports
+	// less than the first, not how many milliseconds elapsed.
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
 	if _, err := SendContext(ctx, inst, "verify", nil, 0); err != nil {
 		t.Fatalf("first send: %v", err)
 	}
 	first := (<-bodies).DeadlineMs
-	time.Sleep(100 * time.Millisecond)
+	time.Sleep(20 * time.Millisecond)
 	if _, err := SendContext(ctx, inst, "verify", nil, 0); err != nil {
 		t.Fatalf("second send: %v", err)
 	}
 	second := (<-bodies).DeadlineMs
 
-	if first <= 0 || first > 300 {
-		t.Errorf("first deadline_ms = %d, want the parent's ~300ms", first)
+	if first <= 0 || first > 60000 {
+		t.Errorf("first deadline_ms = %d, want the parent's ~60s", first)
 	}
 	if second >= first {
 		t.Errorf("deadline_ms must shrink as the invocation deadline runs down: first=%d second=%d", first, second)

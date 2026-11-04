@@ -342,3 +342,11 @@ skipped one is the opt-in real-dialog modal test).
 - The safe-command tests now use `list`/`compile_status` and a connection that is actually dropped,
   so they exercise the EOF + safe-list path rather than a refused dial; a new test covers the
   `console`/`modal` exclusion and a sibling-project `ReconnectInstance` test covers the exact match.
+
+- The retry target now comes from the same newest-record helper as `NewestHeartbeat`
+  (`newestMatching` over the prune-free instance list); the untestable pid tie-break is gone, and
+  both the newer-beat and unchanged-timestamp branches have tests.
+- An explicit `--port` pins the target: if the heartbeat moved to another port, the CLI reports the
+  original failure instead of silently retrying against an instance the caller did not select.
+- When the retry itself fails, the error keeps the first failure reachable, so the original reload
+  diagnosis is not replaced by a bare second refusal.

@@ -151,14 +151,41 @@ func TestStateAfterReloadNote_SaysWhenTheEditorNeverCameBack(t *testing.T) {
 }
 
 func TestStateNoteAppliesSkipsCommandsThatWaitForThemselves(t *testing.T) {
-	for _, category := range []string{"editor", "test", "verify", "build", "wait"} {
-		if stateNoteApplies(category) {
-			t.Errorf("%s reports its own reload wait; the note would print it twice", category)
+	tests := []struct {
+		category string
+		subArgs  []string
+		want     bool
+	}{
+		{"test", nil, false},
+		{"verify", nil, false},
+		{"build", nil, false},
+		{"wait", nil, false},
+		{"editor", []string{"play"}, false},
+		{"editor", []string{"stop", "--no-wait"}, false},
+		{"editor", []string{"refresh", "--compile"}, false},
+		{"editor", []string{"refresh"}, true},
+		{"editor", []string{"pause"}, true},
+		{"editor", nil, true},
+		{"exec", nil, true},
+		{"scene_get", nil, true},
+		{"refresh_unity", nil, true},
+	}
+	for _, tt := range tests {
+		if got := stateNoteApplies(tt.category, tt.subArgs); got != tt.want {
+			t.Errorf("stateNoteApplies(%q, %v) = %v, want %v", tt.category, tt.subArgs, got, tt.want)
 		}
 	}
-	for _, category := range []string{"exec", "scene_get", "refresh_unity"} {
-		if !stateNoteApplies(category) {
-			t.Errorf("%s should get the state note after a reload took its answer", category)
+}
+
+func TestStateAfterReloadNote_NamesTheModalDialogInsteadOfDroppingIt(t *testing.T) {
+	line := stateAfterReloadNote(context.Background(), func() (*client.Instance, error) {
+		return &client.Instance{State: "modal", Port: 8090, Modal: &client.ModalDialog{
+			Kind: "save", Title: "Save scene?", Buttons: []client.ModalButton{{Title: "Save"}, {Title: "Don't Save"}},
+		}}, nil
+	})
+	for _, want := range []string{"modal", "Save scene?", "unity-cli modal answer"} {
+		if !strings.Contains(line, want) {
+			t.Errorf("note %q must contain %q", line, want)
 		}
 	}
 }

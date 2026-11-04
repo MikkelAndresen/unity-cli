@@ -98,10 +98,11 @@ func oneTrailingNewline(s string) string {
 	return strings.TrimRight(s, "\n") + "\n"
 }
 
-// crashLine is the one-sentence form, for places that already print their own message.
-func crashLine(inst *client.Instance, v client.SilenceVerdict) string {
+// crashLine is the one-sentence form for a caller that already printed the report: it names the
+// port and pid and points at that report instead of repeating its Process and Crash log lines.
+func crashLine(inst *client.Instance) string {
 	if inst == nil {
 		return crashState
 	}
-	return fmt.Sprintf("%s (port %d, pid %d): %s", crashState, inst.Port, inst.PID, v.Reason())
+	return fmt.Sprintf("%s (port %d, pid %d): the crash report above names the evidence", crashState, inst.Port, inst.PID)
 }

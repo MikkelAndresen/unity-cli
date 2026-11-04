@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"testing"
+	"time"
 )
 
 // stubIsProcessDead replaces isProcessDead for testing.
@@ -302,6 +303,34 @@ func TestScanInstances_KeepsZeroPID(t *testing.T) {
 	}
 }
 
+// TestDiscoverInstanceKeepingEvidence_KeepsTheDeletedHeartbeat pins the ordering: the crash record
+// is read before ScanInstances deletes the dead-pid file, so a caller can still report the crash.
+func TestDiscoverInstanceKeepingEvidence_KeepsTheDeletedHeartbeat(t *testing.T) {
+	stubIsProcessDead(t, map[int]bool{100: true})
+
+	home := writeInstanceFiles(t, map[string]Instance{
+		"dead.json": {
+			State:       "ready",
+			ProjectPath: "/projects/dead",
+			Port:        8090,
+			PID:         100,
+			Timestamp:   1000,
+		},
+	})
+
+	inst, beat, err := DiscoverInstanceKeepingEvidence("", 0)
+	if err == nil || inst != nil {
+		t.Fatalf("expected no live instance, got %+v, %v", inst, err)
+	}
+	if beat == nil || beat.PID != 100 {
+		t.Fatalf("expected the heartbeat read before the scan, got %+v", beat)
+	}
+	deadPath := filepath.Join(home, ".unity-cli", "instances", "dead.json")
+	if _, statErr := os.Stat(deadPath); !os.IsNotExist(statErr) {
+		t.Error("the scan should have deleted the dead-pid file")
+	}
+}
+
 // TestDiscoverInstance_ProjectPathMatchesSlashVariants verifies --project can
 // match Windows-style backslashes against Unity's forward-slash projectPath.
 func TestDiscoverInstance_ProjectPathMatchesSlashVariants(t *testing.T) {
@@ -493,5 +522,73 @@ func TestRequestNotDelivered(t *testing.T) {
 	}
 	if RequestNotDelivered(io.EOF) {
 		t.Error("EOF after a connection was established must not count as not delivered")
+	}
+}
+
+// TestReconnectInstance_NewerBeatWinsWhateverThePID: the retry target is the newest record, not the
+// one whose pid happens to match the old heartbeat; a pid tie-break would hide a real port move.
+func TestReconnectInstance_NewerBeatWinsWhateverThePID(t *testing.T) {
+	home := writeInstanceFiles(t, map[string]Instance{
+		"old.json": {
+			State:       "ready",
+			ProjectPath: "/projects/current",
+			Port:        8090,
+			PID:         100,
+			Timestamp:   1000,
+		},
+		"new.json": {
+			State:       "ready",
+			ProjectPath: "/projects/current",
+			Port:        8091,
+			PID:         999,
+			Timestamp:   2000,
+		},
+	})
+	t.Setenv("HOME", home)
+
+	got := ReconnectInstance(&Instance{State: "ready", ProjectPath: "/projects/current", Port: 8090, PID: 100, Timestamp: 1000})
+	if got == nil || got.Port != 8091 || got.PID != 999 {
+		t.Fatalf("ReconnectInstance = %+v, want the newer 8091 heartbeat", got)
+	}
+}
+
+// TestReconnectInstance_EqualTimestampKeepsTheFirstRecord pins the branch the retry relies on: an
+// unchanged beat is not evidence of a move, so no newer record appears.
+func TestReconnectInstance_EqualTimestampKeepsTheFirstRecord(t *testing.T) {
+	home := writeInstanceFiles(t, map[string]Instance{
+		"only.json": {
+			State:       "ready",
+			ProjectPath: "/projects/current",
+			Port:        8090,
+			PID:         100,
+			Timestamp:   1000,
+		},
+	})
+	t.Setenv("HOME", home)
+
+	got := ReconnectInstance(&Instance{State: "ready", ProjectPath: "/projects/current", Port: 8090, PID: 100, Timestamp: 1000})
+	if got == nil || got.Timestamp != 1000 || got.Port != 8090 {
+		t.Fatalf("ReconnectInstance = %+v, want the unchanged record", got)
+	}
+}
+
+func TestInstanceStartingFor(t *testing.T) {
+	tests := []struct {
+		name string
+		inst *Instance
+		want time.Duration
+		ok   bool
+	}{
+		{"starting with stamp", &Instance{State: "starting", StartingSince: 1000, Timestamp: 61000}, time.Minute, true},
+		{"ready ignores stamp", &Instance{State: "ready", StartingSince: 1000, Timestamp: 61000}, 0, false},
+		{"old connector", &Instance{State: "starting", Timestamp: 61000}, 0, false},
+		{"beat before stamp", &Instance{State: "starting", StartingSince: 9000, Timestamp: 1000}, 0, false},
+		{"nil", nil, 0, false},
+	}
+	for _, tt := range tests {
+		got, ok := tt.inst.StartingFor()
+		if got != tt.want || ok != tt.ok {
+			t.Errorf("%s: StartingFor() = %v, %v; want %v, %v", tt.name, got, ok, tt.want, tt.ok)
+		}
 	}
 }

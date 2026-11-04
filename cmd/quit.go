@@ -92,20 +92,30 @@ func stopEditor(deps restartDeps, target *restartTarget, save, discard, force bo
 			params["discard"] = true
 		}
 		resp, sendErr := deps.send(target.inst, "quit_editor", params, quitRequestTimeoutMs)
-		if sendErr != nil {
+		switch {
+		case sendErr != nil:
 			// The editor can tear down its HTTP server before the reply reaches us.
 			restartLog(deps.stderr, "Warning: quit request failed (%v); waiting for Unity to exit anyway.\n", sendErr)
-		} else if resp != nil && !resp.Success {
-			return outcome, fmt.Errorf("unity refused to quit: %s", resp.Message)
-		} else if resp != nil {
+		case resp != nil && !resp.Success:
+			// --force asks for the native signal path, so a refusal is just
+			// another failed graceful quit. With --save it is respected: the
+			// refusal may mean unsaved work could not be written.
+			if !force || save {
+				return outcome, fmt.Errorf("unity refused to quit: %s", resp.Message)
+			}
+			restartLog(deps.stderr, "Unity refused to quit (%s); terminating pid %d because --force was given.\n", resp.Message, target.pid)
+			gracefulErr = fmt.Errorf("unity refused to quit: %s", resp.Message)
+		case resp != nil:
 			outcome.EditorData = resp.Data
 		}
 
-		restartLog(deps.stderr, "Waiting for Unity to exit...\n")
-		gracefulErr = deps.waitForExit(waitOpts)
 		if gracefulErr == nil {
-			outcome.Method = stopMethodGraceful
-			return outcome, nil
+			restartLog(deps.stderr, "Waiting for Unity to exit...\n")
+			gracefulErr = deps.waitForExit(waitOpts)
+			if gracefulErr == nil {
+				outcome.Method = stopMethodGraceful
+				return outcome, nil
+			}
 		}
 		if !force {
 			if errors.Is(gracefulErr, editor.ErrEditorModal) {

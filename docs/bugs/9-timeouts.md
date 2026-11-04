@@ -156,9 +156,35 @@ one 4 s budget). `test`/`verify` are no longer `0`; they default to 1800 s and a
 - A client deadline still does not cancel the work inside the editor: the connector may finish the
   queued `exec`/`test` later. The message now says so, but a subsequent call can still see a busy
   editor; that is the connector-side half of the original issue and is not changed here.
-- The watchdog's fallback `os.Exit` fires after 250 ms. A command blocked in a long non-context
-  sleep (for example a build poll sleep) is stopped by that fallback rather than by its own loop.
+- The watchdog's fallback `os.Exit` fires after the signal grace (5 s, not the original 250 ms). A
+  command blocked in a long non-context sleep (for example a build poll sleep) is stopped by that
+  fallback rather than by its own loop; an in-flight stdout write is waited for first, so a slow
+  reader does not get a truncated report.
 - `editor refresh --compile` got the 30-minute default because it waits out a compile; a user who
   explicitly sets a short `--timeout` still gets that shorter overall budget.
-- `test --mode PlayMode` polling now honours the invocation context, but its existing 10-minute
-  result-file limit remains as a second, independent bound.
+- `test --mode PlayMode` polling honours the invocation context only. An explicit `--timeout 0`
+  therefore means no deadline, as the help says; there is no second 10-minute limit.
+
+## Review follow-up
+
+A read-only review of the timeout branch found two remaining deadline/wording holes, both fixed:
+
+- `waitForReadyTo` (verify) and `waitForCompileTo` (`editor refresh --compile`) polled a private
+  5-minute `compileWaitTimeout` with `time.Sleep`, so an explicit short `--timeout` could still run
+  for five minutes before the next request noticed. Both now wait on the invocation context as well
+  and report `timed out waiting for compilation (--timeout)` when it expires.
+- The "timed out after X" sentence was formatted by hand in `waitForAliveTimeout` and
+  `invocationDeadlineError`, so a 60 s budget could read `59.997s`. `internal/client`'s budget
+  formatter is now exported as `FormatBudget` and used by all three producers of that sentence.
+
+The low-severity notes from the same review are now fixed too:
+
+- `--timeout 0` means "no deadline" everywhere, including PlayMode polling. This is a deliberate
+  compatibility break from the old "fail the heartbeat wait immediately"; README documents it.
+- `exec` discovers the editor before reading piped stdin, and the read itself is bounded by the
+  invocation budget, so a producer that never closes cannot hang the command past `--timeout`.
+- The signal fallback waits for an in-flight response write (up to 5 s) instead of exiting on a
+  fixed 250 ms timer.
+- `waitForAlive` and `RequestTimeoutError.Timeout` (test-only shims) are gone, and the budget-shrink
+  test asserts the reported `deadline_ms` rather than stacking wall-clock margins. `client.Send`
+  stays because the quit/restart path uses it for its own non-invocation request budget.

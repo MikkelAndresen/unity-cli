@@ -54,7 +54,7 @@ func findEditorExecutable(version, override string, env resolveEnv) (string, err
 		candidates = append(candidates, candidate{source: source, path: path})
 	}
 
-	add("--editor override", override)
+	add("--editor-path override", override)
 	if fromEnv := env.getenv("UNITY_EDITOR"); fromEnv != "" {
 		add("$UNITY_EDITOR", fromEnv)
 	}
@@ -73,12 +73,12 @@ func findEditorExecutable(version, override string, env resolveEnv) (string, err
 	var b strings.Builder
 	fmt.Fprintf(&b, "unity editor executable not found for version %q; tried:", version)
 	if len(candidates) == 0 {
-		b.WriteString("\n  (no candidates: version, --editor override and $UNITY_EDITOR were all empty)")
+		b.WriteString("\n  (no candidates: version, --editor-path override and $UNITY_EDITOR were all empty)")
 	}
 	for _, c := range candidates {
 		fmt.Fprintf(&b, "\n  %s: %s", c.source, c.path)
 	}
-	b.WriteString("\npass --editor <path> or set $UNITY_EDITOR to the Unity executable")
+	b.WriteString("\npass --editor-path <path> or set $UNITY_EDITOR to the Unity executable")
 	return "", errors.New(b.String())
 }
 

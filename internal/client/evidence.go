@@ -38,6 +38,20 @@ type EditorEvidence struct {
 	SessionHeartbeat *Instance
 }
 
+// sessionStartedAfterBeat reports whether Temp/UnityLockfile is newer than the heartbeat, which
+// makes the heartbeat the record of a previous editor session. Unity rewrites the lockfile when it
+// opens a project, so this is a restart in progress, not a crash of the editor that is starting.
+func sessionStartedAfterBeat(inst *Instance) bool {
+	if inst == nil || inst.ProjectPath == "" || inst.Timestamp <= 0 {
+		return false
+	}
+	info, err := os.Stat(filepath.Join(expandHome(inst.ProjectPath), "Temp", unityLockfileName))
+	if err != nil {
+		return false
+	}
+	return info.ModTime().After(time.UnixMilli(inst.Timestamp))
+}
+
 // Found reports whether anything on disk suggests an open editor.
 func (e *EditorEvidence) Found() bool {
 	return e != nil && (e.LockfilePath != "" || e.StaleHeartbeat != nil)
@@ -74,6 +88,29 @@ func (e *EditorEvidence) SilentHeartbeatThisSession() bool {
 		return false
 	}
 	return e.heartbeatAfterLockfile(e.StaleHeartbeat)
+}
+
+// UnresponsiveHeartbeat returns the heartbeat that proves the connector loaded and then stopped
+// answering, with how long it has been silent. The stale record covers anything past
+// heartbeatStaleAge; the session heartbeat also covers the gap down to BeatSilenceAge, where
+// `status` already calls the editor unresponsive, so an ordinary domain reload is not reported as
+// "the connector never loaded".
+func (e *EditorEvidence) UnresponsiveHeartbeat() (*Instance, time.Duration) {
+	if e == nil {
+		return nil, 0
+	}
+	if e.SilentHeartbeatThisSession() {
+		return e.StaleHeartbeat, e.StaleBeatAge
+	}
+	beat := e.SessionHeartbeat
+	if beat == nil || beat.State == "stopped" || !e.HeartbeatThisSession() {
+		return nil, 0
+	}
+	age := time.Since(time.UnixMilli(beat.Timestamp))
+	if age < BeatSilenceAge {
+		return nil, 0
+	}
+	return beat, age
 }
 
 // Summary is the compact reason an editor looks open, e.g. "Temp/UnityLockfile, age 42s".
@@ -184,23 +221,23 @@ func projectCandidates(project string, port int) []string {
 // project is the --project value (path or substring, "" for any) and port the --port value (0 when
 // unset).
 func NewestHeartbeat(project string, port int) *Instance {
-	var best *Instance
-
-	files, _ := rawInstanceFiles()
-	for _, f := range files {
-		inst := f.Instance
+	return newestMatching(rawInstances(), func(inst Instance) bool {
 		if port > 0 && inst.Port != port {
-			continue
+			return false
 		}
-		if project != "" && !projectMatches(inst.ProjectPath, project) {
-			continue
-		}
-		if best == nil || inst.Timestamp > best.Timestamp {
-			beat := inst
-			best = &beat
-		}
+		return project == "" || projectMatches(inst.ProjectPath, project)
+	})
+}
+
+// rawInstances is rawInstanceFiles as plain records, so the newest-record rule lives in
+// newestMatching rather than being repeated by every caller that reads past the scan.
+func rawInstances() []Instance {
+	files, _ := rawInstanceFiles()
+	out := make([]Instance, 0, len(files))
+	for _, f := range files {
+		out = append(out, f.Instance)
 	}
-	return best
+	return out
 }
 
 // findStaleHeartbeat returns the newest heartbeat for the target that stopped arriving.
@@ -237,33 +274,21 @@ func findStaleHeartbeat(project string, port int) (*Instance, string) {
 // ReconnectInstance returns the heartbeat a request should be retried against after a reload or port
 // change: the newest non-stopped record for the same project (or port when the project is unknown).
 // It reads past ScanInstances so a heartbeat the scan is about to prune is still visible as the old
-// record, never as the retry target. A matching pid wins a timestamp tie.
+// record, never as the retry target. A newer beat wins; an equal timestamp keeps the first record,
+// because the caller refuses to retry unless the beat actually advanced.
 func ReconnectInstance(old *Instance) *Instance {
 	if old == nil {
 		return nil
 	}
-
-	files, _ := rawInstanceFiles()
-	var best *Instance
-	for _, f := range files {
-		inst := f.Instance
+	return newestMatching(rawInstances(), func(inst Instance) bool {
 		if inst.State == "stopped" || inst.Timestamp <= 0 {
-			continue
+			return false
 		}
 		if old.ProjectPath != "" {
-			if !sameProject(inst.ProjectPath, old.ProjectPath) {
-				continue
-			}
-		} else if inst.Port != old.Port {
-			continue
+			return sameProject(inst.ProjectPath, old.ProjectPath)
 		}
-		if best == nil || inst.Timestamp > best.Timestamp ||
-			(inst.Timestamp == best.Timestamp && inst.PID == old.PID && best.PID != old.PID) {
-			beat := inst
-			best = &beat
-		}
-	}
-	return best
+		return inst.Port == old.Port
+	})
 }
 
 func projectMatches(projectPath, needle string) bool {

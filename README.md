@@ -253,7 +253,7 @@ from inside a command handler shares the command's fate: the reply and the shutd
 race, and an exit vetoed by `EditorApplication.wantsToQuit` has no way to report
 itself. `editor quit` sends `quit_editor`, which answers first and schedules the
 exit for a later editor tick. It then waits until the heartbeat reports `stopped`
-or the process is gone, and fails if neither happens within 60 seconds
+or stops advancing, and fails if neither happens within 60 seconds
 (`--timeout` overrides it).
 
 Without `--save`, dirty scenes are discarded; the reply lists them under
@@ -264,9 +264,12 @@ default. The reply also lists any visible `EditorApplication.wantsToQuit`
 subscribers, and the connector logs an error naming them if Unity is still alive
 after the scheduled `Exit` - that is what a veto looks like from outside.
 
-With `--force`, an editor that does not exit in time, or that is parked on a
-modal dialog, is terminated (SIGTERM on macOS/Linux, `TerminateProcess` on
-Windows). Unsaved changes are lost. The CLI only signals a PID whose process
+With `--force`, an editor that does not exit in time, that refuses the
+`quit_editor` request, or that is parked on a modal dialog, is terminated
+(SIGTERM on macOS/Linux, `TerminateProcess` on
+Windows). Unsaved changes are lost. A `--save` request that the connector refuses
+is not overridden by `--force`, because the refusal may mean unsaved work could
+not be written. The CLI only signals a PID whose process
 name contains `Unity`. When the CLI runs in a container that cannot see the host
 editor's PID, `--force` fails and Unity has to be stopped from the host. The final
 JSON reports `method`: `graceful` or `terminate`, and `editor` carries the
@@ -288,11 +291,12 @@ unity-cli editor restart --clean
 unity-cli editor restart --editor-path /Applications/Unity/Hub/Editor/6000.1.0f1/Unity.app/Contents/MacOS/Unity
 ```
 
-`editor restart` resolves the project before stopping the editor (from the running
-instance, `--project`, or the current directory), quits it, optionally removes
-`Library/` and `Temp/`, relaunches it, and waits until the new editor reports
-`ready`. Progress and removed paths go to stderr; the final JSON contains the
-project path, old and new PIDs, cleaned paths, and elapsed time.
+`editor restart` resolves the project (from the running instance, `--project`, or
+the current directory) and the launch executable before stopping the editor,
+then quits it, optionally removes `Library/` and `Temp/`, relaunches it, and
+waits until the new editor reports `ready`. Progress and removed paths go to
+stderr; the final JSON contains the project path, old and new PIDs, cleaned
+paths, and elapsed time.
 
 The default wait budget is 5 minutes, or 15 minutes with `--clean`; `--timeout`
 overrides both that and the 60-second quit wait. Restart stops Unity the same way
@@ -733,7 +737,7 @@ unity-cli test --allow-stale
 
 Requires the Unity Test Framework package. Tests are blocked by default when any open scene has unsaved changes. Use `--auto-save-scenes` to save them first, or `--allow-dirty-scenes` to run anyway. They are also blocked when a project assembly under test is older than its sources — a stale DLL runs old code and looks exactly like a real result. Rebuild with `unity-cli editor refresh --compile`, or pass `--allow-stale` deliberately. PlayMode tests trigger a domain reload — the CLI polls for results automatically.
 
-Tests run for minutes, so `test`'s invocation budget defaults to 30 minutes instead of the global 120 s. `--timeout <ms>` overrides it, and `--timeout 0` means no deadline; a run that exceeds the budget is reported as a client deadline, not as a lost editor.
+Tests run for minutes, so `test`'s invocation budget defaults to 30 minutes instead of the global 120 s. `--timeout <ms>` overrides it, and `--timeout 0` means no deadline (PlayMode result polling included); a run that exceeds the budget is reported as a client deadline, not as a lost editor.
 
 ### Verify
 
@@ -955,15 +959,18 @@ AppleScript and System Events (Accessibility), so it works with no connector and
 It runs only on macOS; on any other system it says so and tells you to run it on the host, because
 an agent sandbox is granted no Accessibility permission.
 
-When no heartbeat answers but the project's `Temp/UnityLockfile` says an editor is open, every
-command names which situation it is instead of saying "no Unity instance found":
+When no heartbeat answers, every command names which situation it is instead of saying "no Unity
+instance found", using the heartbeat records and the project's `Temp/UnityLockfile`:
 
 - `editor_starting_or_blocked` — the lockfile exists but no heartbeat newer than it, so the connector
   never loaded this session. The editor is still importing/compiling, or a startup dialog (license,
-  safe mode, "project already open", package resolution) is waiting.
+  safe mode, "project already open", package resolution) is waiting. A lockfile older than 2 hours
+  with no heartbeat from this session says instead that the editor probably crashed rather than
+  still starting.
 - `editor_unresponsive` — a heartbeat written this session exists but went silent. The connector
   did load, then stopped answering: the main thread is likely blocked by a long exec/build/import, a
-  modal dialog is open, or the editor hung.
+  modal dialog is open, or the editor hung. This one does not need the lockfile; when the lockfile
+  is gone the report says the editor has probably exited and to relaunch it.
 
 ```
 editor_starting_or_blocked: Unity appears open for /Users/me/Work/MyGame (Temp/UnityLockfile, age 42s)
@@ -981,16 +988,18 @@ open, or the editor hung.
 ```
 
 `Temp/UnityLockfile` is written once when Unity opens the project, so its age is the length of the
-session, not evidence of a crash. The CLI only hints "probably crashed" from an old lockfile when no
-heartbeat from that session exists; once a heartbeat postdates the lockfile, a silence is reported as
-`editor_unresponsive` instead.
+session, not evidence of a crash. The CLI only says "probably crashed" from a lockfile older than
+2 hours when no heartbeat from that session exists; once a heartbeat postdates the lockfile, a
+silence is reported as `editor_unresponsive` instead.
 
 Windows are narrowed to the requested project by matching the project folder name in the window
 title; when nothing matches, every Unity window is listed, because startup dialogs rarely name the
-project. If Accessibility is missing, the error names the exact grant (System Settings → Privacy &
-Security → Accessibility, for `/usr/bin/osascript` and the app running the command). Button matching
-is exact-title first, then case- and apostrophe-insensitive, and an ambiguous title is reported
-instead of clicking a possibly-wrong dialog.
+project. A click in that unfiltered listing needs `--window` unless all listed windows belong to one
+Unity process, so it cannot press a button in another project's editor. If Accessibility is missing,
+the error names the exact grant (System Settings → Privacy & Security → Accessibility, for
+`/usr/bin/osascript` and the app running the command). Button matching is exact-title first, then
+case- and apostrophe-insensitive from the start of the title (so `Save` cannot press `Don't Save`),
+and an ambiguous title is reported instead of clicking a possibly-wrong dialog.
 
 Windows Unity draws itself (IMGUI panels, some Safe Mode prompts) expose no native buttons to
 Accessibility: `dialogs` lists their title and texts, but there is nothing to click, and only a
@@ -1006,12 +1015,14 @@ unity-cli list
 
 ### Passing Parameters
 
-Every command accepts `--params '<json object>'` as an alternative to individual flags. The CLI
-sends the resulting object to the connector as the tool's parameters.
+`exec`, `build`, and custom tools called by name accept `--params '<json object>'` as an
+alternative to individual flags. The CLI sends the resulting object to the connector as the tool's
+parameters. Built-in commands with their own flags (`test`, `verify`, `editor`, `wait`) build their
+parameters from those flags and do not read `--params`.
 
 ```bash
-# Equivalent to: unity-cli test --assembly MyGame.Tests.Editor
-unity-cli test --params '{"assembly":"MyGame.Tests.Editor"}'
+# exec with JSON parameters
+unity-cli exec --params '{"code":"return 42;"}'
 
 # Repeated --params objects are merged in order, so later keys win
 unity-cli exec --params '{"code":"return 42;"}' --params '{"await_timeout":1000}'
@@ -1054,9 +1065,15 @@ The CLI also checks Unity's state automatically before sending any command. If U
 
 ```bash
 unity-cli status
-# Output: Unity (port 8090): crashed (last heartbeat 30s ago)
+# The report goes to stderr; stdout stays empty for this case.
+# crashed: the Unity editor died for /Users/me/Work/MyGame (heartbeat last seen 30s ago, pid 65279) with no "stopped" marker.
+#   Heartbeat: /Users/me/.unity-cli/instances/1f0c….json (state "ready", pid 65279, last beat 30s ago)
+#   Process:   pid 65279 is not in this machine's process table, which still lists Unity as pid 12345
 #   Crash log: /Users/me/Work/MyGame/mono_crash.1b6a4e0a.0.json (mono_crash, written 25s ago)
 #              signal 11 (SIGSEGV); System.NullReferenceException: Object reference not set to an instance of an object
+#   Next:      Unity has to be relaunched by the user — no CLI call brings it back. Editor.log rotates when it does, so read the crash log above first.
+# Error: crashed (port 8090, pid 65279): the crash report above names the evidence
+# (exit 1)
 ```
 
 A hard crash, a domain reload and a dropped socket all look the same over HTTP: `EOF`. Before reporting
@@ -1144,7 +1161,7 @@ the wait exceeded a second.
 |------|-------------|---------|
 | `--port <N>` | Select Unity instance by active heartbeat port | auto |
 | `--project <path>` | Select Unity instance by project path | latest |
-| `--timeout <ms>` | One budget per invocation, shared by discovery, waiting for a fresh heartbeat, and the request. The remaining budget is sent to the Connector as `deadline_ms`, so it answers a queued command before this deadline does — see [Queued Commands and Server-Side Deadlines](#queued-commands-and-server-side-deadlines). A client deadline is reported as `timed out ... (the editor may still be running it)`, not as a connection failure. `test`, `verify` and `editor refresh --compile` default to 1800000 (30 min); an explicit `0` means no deadline (the Connector still answers a queued command after its 60 s default). `wait --timeout` and build polling keep their own budgets. For `editor quit`/`restart` it is also the wait-to-exit and startup budget. | 120000 |
+| `--timeout <ms>` | One budget per invocation, shared by discovery, waiting for a fresh heartbeat, and the request. The remaining budget is sent to the Connector as `deadline_ms`, so it answers a queued command before this deadline does — see [Queued Commands and Server-Side Deadlines](#queued-commands-and-server-side-deadlines). A client deadline is reported as `timed out ... (the editor may still be running it)`, not as a connection failure. `test`, `verify` and `editor refresh --compile` default to 1800000 (30 min); an explicit `0` means no deadline (the Connector still answers a queued command after its 60 s default). That is a compatibility break from older releases, where `--timeout 0` made the heartbeat wait fail at once; a script that relied on the old meaning must pass a small positive value. `wait --timeout` and build polling keep their own budgets. For `editor quit`/`restart` it is also the wait-to-exit and startup budget. | 120000 |
 | `--ignore-version-mismatch` | Suppress the version-drift warning (and the refusal for a connector older than 0.7.0) | false |
 | `--meta` | Print the response's `meta` (how the call was served, e.g. `exec`'s compile cache state) to stderr | false |
 
@@ -1162,8 +1179,10 @@ unity-cli --ignore-version-mismatch exec 'return 1 + 1;'
 CLI and connector versions do not have to match exactly. A patch difference in the same major.minor
 is accepted silently. A different minor or major version is accepted with one warning on stderr that
 names both versions, the CLI binary and the fix; diagnostic commands (`status`, `console`,
-`compile_diagnostics`, `compile_status`, `modal`, `tools`, `tool_describe`, `wait`, `dialogs`, `list`)
-never fail on it. The CLI refuses only a connector older than 0.7.0, the oldest protocol it speaks.
+`compile_diagnostics`, `compile_status`, `api`, `burst_status`, `modal`, `tools`, `tool_describe`,
+`wait`, `dialogs`, `list`) never fail on it. (`status` and `dialogs` answer before the gate runs at
+all, and `help`/`version`/`update` likewise.) The CLI refuses only a connector older than 0.7.0, the
+oldest protocol it speaks.
 `status` always prints both versions and the compatibility verdict.
 
 Use `--help` on any command for detailed usage:

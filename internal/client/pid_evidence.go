@@ -28,9 +28,18 @@ const (
 // without being mistaken for the editor itself.
 func unityProcessNames() []string { return []string{"unity", "unity.exe"} }
 
-// processTable reads this OS's process table. Defaults to the platform implementation; overridden in
-// tests, like isProcessDead.
-var processTable = readProcessTable
+// ProcessEntry is one row of a process table. Zombie marks a process that has exited but has not
+// been reaped by its parent yet: on a Linux host a crashed Unity child stays listed as "Unity" with
+// state Z, and treating that row as a running editor hides the crash.
+type ProcessEntry struct {
+	Name   string
+	Zombie bool
+}
+
+// ProcessTable reads this OS's process table. It is a variable so a fake table can be installed by
+// tests — including the cmd package's, which cannot reach an unexported seam, and whose fake
+// heartbeat would otherwise be judged against a real Unity on the developer's own machine.
+var ProcessTable = readProcessTable
 
 // judgePID answers whether the editor process named by pid still exists — but only when this CLI can
 // actually see the machine the editor runs on. note says why the answer counts, or why it does not,
@@ -40,21 +49,23 @@ func judgePID(pid int) (proof pidProof, note string) {
 		return pidUnproven, "the heartbeat records no pid"
 	}
 
-	table := processTable()
+	table := ProcessTable()
 	if table == nil {
 		return pidUnproven, "no process table is readable here, so a pid proves nothing"
 	}
 
-	if name, ok := table[pid]; ok {
+	if entry, ok := table[pid]; ok {
 		switch {
-		case isUnityExecutable(name):
-			return pidAlive, fmt.Sprintf("pid %d is running %s on this machine", pid, name)
-		case name == "":
+		case isUnityExecutable(entry.Name) && entry.Zombie:
+			return pidGone, fmt.Sprintf("pid %d is a zombie Unity process (already exited, not yet reaped), so the editor is over", pid)
+		case isUnityExecutable(entry.Name):
+			return pidAlive, fmt.Sprintf("pid %d is running %s on this machine", pid, entry.Name)
+		case entry.Name == "":
 			return pidUnproven, fmt.Sprintf("pid %d exists here but its executable name is unreadable", pid)
 		default:
 			// The id is taken by something that is not Unity: either the pid was reused after the
 			// editor died, or this table is not the editor's. Neither proves the editor died.
-			return pidUnproven, fmt.Sprintf("pid %d exists here but runs %q, not Unity", pid, name)
+			return pidUnproven, fmt.Sprintf("pid %d exists here but runs %q, not Unity", pid, entry.Name)
 		}
 	}
 
@@ -78,11 +89,11 @@ func isUnityExecutable(name string) bool {
 	return false
 }
 
-// firstUnityPID returns any Unity editor pid listed in the table, which is the proof that the table
-// describes the machine the editor lives on.
-func firstUnityPID(table map[int]string) int {
-	for pid, name := range table {
-		if isUnityExecutable(name) {
+// firstUnityPID returns any live Unity editor pid listed in the table, which is the proof that the
+// table describes the machine the editor lives on. A zombie row is a dead process, not proof.
+func firstUnityPID(table map[int]ProcessEntry) int {
+	for pid, entry := range table {
+		if !entry.Zombie && isUnityExecutable(entry.Name) {
 			return pid
 		}
 	}

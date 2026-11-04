@@ -118,6 +118,26 @@ func restartCmd(args []string, deps restartDeps) (*client.CommandResponse, error
 		if err := deps.canManage(target.pid); err != nil {
 			return nil, fmt.Errorf("cannot manage the running Unity editor from this process: %w\nRun `editor restart` on the host where Unity is running; `editor quit` still works over HTTP, and --force works only on the host", err)
 		}
+	}
+
+	// Resolve the executable before anything irreversible. A project whose
+	// installed editor cannot be found must not lose its running editor (and,
+	// with --clean, its Library/) before restart discovers it cannot relaunch.
+	version, versionErr := deps.readVersion(target.projectPath)
+	if versionErr != nil {
+		if target.unityVersion != "" {
+			version = target.unityVersion
+		} else {
+			restartLog(deps.stderr, "Warning: %v\n", versionErr)
+		}
+	}
+
+	exe, err := deps.findExecutable(version, flags["editor-path"])
+	if err != nil {
+		return nil, err
+	}
+
+	if target.pid > 0 {
 		if _, err := stopEditor(deps, target, save, discard, subFlagEnabled(flags, "force"), quitTimeout, "editor restart"); err != nil {
 			return nil, err
 		}
@@ -136,20 +156,6 @@ func restartCmd(args []string, deps restartDeps) (*client.CommandResponse, error
 		for _, path := range removed {
 			restartLog(deps.stderr, "Removed %s\n", path)
 		}
-	}
-
-	version, versionErr := deps.readVersion(target.projectPath)
-	if versionErr != nil {
-		if target.unityVersion != "" {
-			version = target.unityVersion
-		} else {
-			restartLog(deps.stderr, "Warning: %v\n", versionErr)
-		}
-	}
-
-	exe, err := deps.findExecutable(version, flags["editor-path"])
-	if err != nil {
-		return nil, err
 	}
 
 	restartLog(deps.stderr, "Launching %s...\n", exe)

@@ -160,3 +160,12 @@ exit=1
   merged by the CLI.
 - A key supplied both by `--params` and by a plain flag keeps the old
   `--params`-wins precedence; this fix does not add a warning for that case.
+
+## Review follow-up
+
+- The `--params` documentation was narrowed to the paths that actually consume it (`exec`, `build`,
+  and custom tools). The false `test --params '{"assembly":…}'` example is gone; `test`, `verify`,
+  `editor` and `wait` build their parameters from their own flags and do not read `--params`.
+- `verify` now writes a subcommand usage error to stderr instead of stdout, so `--json` output stays
+  a single parseable object (`wait` does the same for its parser errors).
+- The invalid-JSON test now asserts the occurrence number (`#1`, `#2`), not just the message prefix.

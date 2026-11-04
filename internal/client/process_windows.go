@@ -70,10 +70,11 @@ func checkProcessDead(pid int) bool {
 	return exitCode != stillActive
 }
 
-// readProcessTable lists the processes this machine can see, as pid -> executable name, or nil when
-// the snapshot could not be taken. nil is deliberately not the same as an empty map: judgePID may
-// treat a missing row as proof of death only when the table itself was readable.
-func readProcessTable() map[int]string {
+// readProcessTable lists the processes this machine can see, as pid -> entry, or nil when the
+// snapshot could not be taken. nil is deliberately not the same as an empty map: judgePID may treat
+// a missing row as proof of death only when the table itself was readable. Windows has no zombie
+// state: an exited process is gone from the snapshot outright.
+func readProcessTable() map[int]ProcessEntry {
 	handle, _, err := procCreateToolhelp32Snapshot.Call(th32SnapProcess, 0)
 	if err != nil || handle == 0 || handle == ^uintptr(0) {
 		return nil
@@ -88,10 +89,10 @@ func readProcessTable() map[int]string {
 		return nil
 	}
 
-	table := map[int]string{}
+	table := map[int]ProcessEntry{}
 	for {
 		if entry.pid != 0 {
-			table[int(entry.pid)] = utf16ToString(entry.exeFile[:])
+			table[int(entry.pid)] = ProcessEntry{Name: utf16ToString(entry.exeFile[:])}
 		}
 		// ret == 0 ends the walk, normally with ERROR_NO_MORE_FILES. Whatever was collected before the
 		// walk stopped is still a table the caller can reason about.
