@@ -71,7 +71,11 @@ func isIdleState(state string) bool {
 // edit — either a compilation finished after wait started, or no source file is newer than the last
 // one.
 func waitCmd(args []string, send sendFn, resolve instanceResolver, out io.Writer) int {
-	flags := parseSubFlags(args)
+	flags, err := parseSubFlags(args)
+	if err != nil {
+		_, _ = fmt.Fprintf(out, "wait: %v\n", err)
+		return waitTimedOut
+	}
 	_, wantCompile := flags["compile"]
 	_, asJSON := flags["json"]
 

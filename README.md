@@ -846,6 +846,26 @@ count) so an editor window does not flood the output.
 unity-cli list
 ```
 
+### Passing Parameters
+
+Every command accepts `--params '<json object>'` as an alternative to individual flags. The CLI
+sends the resulting object to the connector as the tool's parameters.
+
+```bash
+# Equivalent to: unity-cli test --assembly MyGame.Tests.Editor
+unity-cli test --params '{"assembly":"MyGame.Tests.Editor"}'
+
+# Repeated --params objects are merged in order, so later keys win
+unity-cli exec --params '{"code":"return 42;"}' --params '{"await_timeout":1000}'
+# sends both code and await_timeout
+```
+
+`--params` is the only repeatable subcommand flag. Any other subcommand flag may be given
+once; a second occurrence (for example `--filter a --filter b`) is an error instead of silently
+replacing the first value.
+Invalid JSON in any `--params` object is also an error. When the same key comes from both a plain
+flag and `--params`, the `--params` value wins.
+
 ### Custom Tools
 
 ```bash

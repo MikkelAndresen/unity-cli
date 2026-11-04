@@ -261,21 +261,45 @@ func metaLine(meta json.RawMessage, enabled bool) string {
 
 // parseSubFlags parses --key value and --flag (boolean) pairs from subcommand args.
 // Non-flag args (no "--" prefix) are silently ignored.
-func parseSubFlags(args []string) map[string]string {
-	flags := map[string]string{}
+func parseSubFlags(args []string) (map[string]string, error) {
+	flags, paramsJSON, _, err := parseFlagArgs(args)
+	if err != nil {
+		return nil, err
+	}
+	if len(paramsJSON) > 0 {
+		flags["params"] = paramsJSON[len(paramsJSON)-1]
+	}
+	return flags, nil
+}
+
+// parseFlagArgs separates --flag values, repeated --params JSON strings, and positional args.
+// Only --params may repeat (its objects are merged by buildParams); every other flag names one
+// value, so a second occurrence is an error rather than a silent overwrite.
+func parseFlagArgs(args []string) (flags map[string]string, paramsJSON, positional []string, err error) {
+	flags = map[string]string{}
 	for i := 0; i < len(args); i++ {
 		a := args[i]
-		if strings.HasPrefix(a, "--") {
-			key := a[2:]
-			if i+1 < len(args) && !strings.HasPrefix(args[i+1], "--") {
-				flags[key] = args[i+1]
-				i++
-			} else {
-				flags[key] = "true"
-			}
+		if !strings.HasPrefix(a, "--") {
+			positional = append(positional, a)
+			continue
 		}
+
+		key := a[2:]
+		value := "true"
+		if i+1 < len(args) && !strings.HasPrefix(args[i+1], "--") {
+			value = args[i+1]
+			i++
+		}
+		if key == "params" {
+			paramsJSON = append(paramsJSON, value)
+			continue
+		}
+		if previous, exists := flags[key]; exists {
+			return nil, nil, nil, fmt.Errorf("duplicate flag --%s (first %q, then %q); only --params may be repeated", key, previous, value)
+		}
+		flags[key] = value
 	}
-	return flags
+	return flags, paramsJSON, positional, nil
 }
 
 // execRequestTimeout widens the HTTP request timeout so it outlasts the connector's
@@ -314,38 +338,29 @@ func execRequestTimeout(flagTimeoutMs int, params map[string]interface{}) int {
 }
 
 // buildParams parses --flag value pairs and positional args from args and merges with base params.
+// Repeated --params objects are merged in order, so a later key replaces an earlier one without
+// dropping the rest of the parameters.
 func buildParams(args []string, base map[string]interface{}) (map[string]interface{}, error) {
+	flags, paramsJSON, positional, err := parseFlagArgs(args)
+	if err != nil {
+		return nil, err
+	}
+
 	params := map[string]interface{}{}
 	for k, v := range base {
 		params[k] = v
 	}
 
-	var positional []string
-	flags := map[string]string{}
-	for i := 0; i < len(args); i++ {
-		a := args[i]
-		if strings.HasPrefix(a, "--") {
-			key := a[2:]
-			if i+1 < len(args) && !strings.HasPrefix(args[i+1], "--") {
-				flags[key] = args[i+1]
-				i++
-			} else {
-				flags[key] = "true"
-			}
-		} else {
-			positional = append(positional, a)
+	for i, raw := range paramsJSON {
+		var object map[string]interface{}
+		if jsonErr := json.Unmarshal([]byte(raw), &object); jsonErr != nil {
+			return nil, fmt.Errorf("invalid JSON in --params #%d: %w", i+1, jsonErr)
 		}
-	}
-
-	if raw, ok := flags["params"]; ok {
-		if jsonErr := json.Unmarshal([]byte(raw), &params); jsonErr != nil {
-			return nil, fmt.Errorf("invalid JSON in --params: %w", jsonErr)
+		for k, v := range object {
+			params[k] = v
 		}
 	}
 	for k, v := range flags {
-		if k == "params" {
-			continue
-		}
 		if _, exists := params[k]; exists {
 			continue
 		}
@@ -593,7 +608,7 @@ Startup Dialogs (macOS host, no connector needed):
 Custom Tools:
   list                          List all registered tools with parameter schemas
   <name>                        Call a custom tool directly
-  <name> --params '{"k":"v"}'   Call with JSON parameters
+  <name> --params '{"k":"v"}'   Call with JSON parameters (repeatable; objects merge, later keys win)
 
 Status:
   status                        Show Unity Editor state (ready, compiling, etc.)
@@ -620,6 +635,7 @@ Notes:
   - Unity must be open with the Connector package installed
   - Multiple Unity instances: use --port or --project to select
   - Custom tools: any [UnityCliTool] class is auto-discovered
+  - A subcommand flag other than --params may be given once; repeating it is an error, not a silent overwrite
   - Run 'list' to see all available tools
 `)
 }

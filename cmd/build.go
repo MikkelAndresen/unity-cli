@@ -86,7 +86,10 @@ func buildCmd(args []string, send, poll sendFn, resolve instanceResolver, logw i
 
 	// The flags are parsed twice on purpose: parseSubFlags gives strings for the up-front
 	// validation, buildParams also understands --params '{"profile":"macOS"}'.
-	flags := parseSubFlags(args)
+	flags, err := parseSubFlags(args)
+	if err != nil {
+		return nil, err
+	}
 	if _, viaJSON := flags["params"]; !viaJSON {
 		if err := checkBuildFlags(flags); err != nil {
 			return nil, err

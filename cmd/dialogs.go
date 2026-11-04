@@ -183,7 +183,10 @@ var dialogsTimeout = 30 * time.Second
 // dialogsArgs reads this command's own flags. A bare --click parses as the value "true", which
 // no Unity button is titled, so it is reported as a missing value instead of a failed lookup.
 func dialogsArgs(args []string) (wantClick, windowNeedle string, err error) {
-	flags := parseSubFlags(args)
+	flags, err := parseSubFlags(args)
+	if err != nil {
+		return "", "", err
+	}
 	wantClick = strings.TrimSpace(flags["click"])
 	if wantClick == "true" {
 		return "", "", fmt.Errorf(`--click needs a button title, e.g. --click "Continue" (run 'unity-cli dialogs' first to list them)`)

@@ -25,7 +25,10 @@ func editorCmd(args []string, send sendFn, resolve instanceResolver) (*client.Co
 	}
 
 	action := args[0]
-	flags := parseSubFlags(args[1:])
+	flags, err := parseSubFlags(args[1:])
+	if err != nil {
+		return nil, err
+	}
 
 	switch action {
 	case "play":

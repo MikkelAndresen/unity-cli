@@ -27,7 +27,10 @@ func (s *suppressWriter) Write(p []byte) (int, error) {
 }
 
 func testCmd(args []string, send sendFn, port int) (*client.CommandResponse, error) {
-	flags := parseSubFlags(args)
+	flags, err := parseSubFlags(args)
+	if err != nil {
+		return nil, err
+	}
 
 	mode := "EditMode"
 	if m, ok := flags["mode"]; ok {
