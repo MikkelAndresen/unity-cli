@@ -142,6 +142,35 @@ func TestEditorCmd_RefreshCompileReportsErrorsAndFails(t *testing.T) {
 	}
 }
 
+// The report's error objects must carry the connector's hint: it is what tells the caller what to
+// write, and dropping it here would leave the compile failure without its answer.
+func TestEditorCmd_RefreshCompileReportCarriesHints(t *testing.T) {
+	compileTestBudgets(t)
+	base := int64(1_000)
+	errs := []interface{}{map[string]interface{}{
+		"file": "Assets/CliScratch/Hints.cs", "line": 12, "col": 29,
+		"severity": "error", "code": "CS0619",
+		"message": "'Object.GetInstanceID()' is obsolete: 'Use GetEntityId instead.'",
+		"hint":    "use UnityEngine.Object.GetEntityId()",
+	}}
+	f := &fakeEditor{
+		t: t, compileErrors: true, diagnostics: map[bool][]interface{}{true: errs, false: errs},
+		echoFinished: &base, finishedAt: 2_000,
+	}
+
+	resp, err := editorCmd([]string{"refresh", "--compile"}, f.send, f.resolve)
+	if err == nil {
+		t.Fatal("expected a non-zero-worthy error when the compile fails")
+	}
+	report := parseCompileReport(t, resp)
+	if len(report.Errors) != 1 || report.Errors[0].Hint != "use UnityEngine.Object.GetEntityId()" {
+		t.Errorf("errors = %+v, want the hint on the single error", report.Errors)
+	}
+	if !strings.Contains(string(resp.Data), `"hint":"use UnityEngine.Object.GetEntityId()"`) {
+		t.Errorf("report json = %s, want the hint key", string(resp.Data))
+	}
+}
+
 func TestEditorCmd_RefreshCompileHeartbeatErrorsWithoutDiagnostics(t *testing.T) {
 	compileTestBudgets(t)
 	base := int64(1_000)

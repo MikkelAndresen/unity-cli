@@ -8,7 +8,8 @@ namespace UnityCliConnector.Tools
     [UnityCliTool(
         Description = "Errors (and optionally warnings) from the latest compilation: live CompilationPipeline messages " +
                       "plus the console, which also carries Burst errors. While the editor compiles, returns " +
-                      "compiling=true and no entries.",
+                      "compiling=true and no entries. Missing members/types and obsolete APIs come with a hint " +
+                      "naming the closest real ones.",
         // Reports compile errors; gating it on them would hide them behind the gate's error response.
         SkipCompilationGate = true)]
     public static class CompileDiagnostics
@@ -29,6 +30,12 @@ namespace UnityCliConnector.Tools
 
             [ToolParameter("Milliseconds the provenance source scan may take before it reports itself incomplete (default 200)")]
             public int ScanBudget { get; set; }
+
+            [ToolParameter("Name the closest real member/type for a missing or obsolete API (default: true)")]
+            public bool IncludeHints { get; set; }
+
+            [ToolParameter("Milliseconds the whole hint pass may take (default 100)")]
+            public int HintBudget { get; set; }
         }
 
         public static object HandleCommand(JObject @params)
@@ -41,6 +48,9 @@ namespace UnityCliConnector.Tools
             bool includeProvenance = ParamCoercion.CoerceBoolNullable(
                 p.GetRaw("include_provenance") ?? p.GetRaw("includeProvenance")) ?? true;
             int scanBudget = p.GetInt("scan_budget") ?? CompileProvenance.DefaultScanBudgetMs;
+            bool includeHints = ParamCoercion.CoerceBoolNullable(
+                p.GetRaw("include_hints") ?? p.GetRaw("includeHints")) ?? true;
+            int hintBudget = p.GetInt("hint_budget") ?? p.GetInt("hintBudget") ?? CompileHints.DefaultBudgetMs;
 
             if (EditorApplication.isCompiling)
                 return new SuccessResponse("Editor is compiling; call again when it finishes.", new
@@ -53,7 +63,7 @@ namespace UnityCliConnector.Tools
                     provenance = CompileProvenance.BuildPayload(false, 0),
                 });
 
-            var diags = CompilationGate.GetLiveDiagnostics(includeWarnings)
+            var diags = CompilationGate.GetLiveDiagnostics(includeWarnings, includeHints ? hintBudget : -1)
                 .Where(d => !sourceTreeOnly || !IsThirdParty(d.File))
                 .ToList();
 
@@ -69,6 +79,7 @@ namespace UnityCliConnector.Tools
                     severity = d.Severity,
                     code = d.Code,
                     message = d.Message,
+                    hint = string.IsNullOrEmpty(d.Hint) ? null : d.Hint,
                 }).ToList(),
                 // One provenance line per compile-related result is the point: the caller must not
                 // have to make a second call to know whether this answer covers its own edit.

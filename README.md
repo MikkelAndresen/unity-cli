@@ -147,6 +147,7 @@ Before compiling or reloading, the Connector records the state (`compiling`, `re
 | `input` | Inject new-Input-System keyboard/mouse/gamepad/touch state in Play mode and pump the player loop |
 | `console` | Read, filter, and clear console logs (newest 50 entries, capped stack traces) |
 | `exec` | Run arbitrary C# code inside Unity |
+| `api` | What a loaded type or member actually is: kind, assembly, and C# signatures of every overload |
 | `test` | Run EditMode/PlayMode tests |
 | `verify` | Compile, list errors in your code, run tests: one call, brief output |
 | `wait` | Block until the editor is idle, then say what the last compile covers |
@@ -191,7 +192,8 @@ unity-cli editor refresh --force
 
 `editor refresh --compile` waits for the compilation and answers with one report instead of a bare
 `refresh_triggered`: `compile_requested`, `compile_succeeded`, `error_count`, `errors[]`
-(file/line/col/severity/code/message, from the connector's `compile_diagnostics` tool), `timed_out`
+(file/line/col/severity/code/message, plus `hint` for the error codes the connector can answer —
+see [Verify](#verify)), `timed_out`
 and `elapsed_ms`, plus the [compile provenance](#compile-provenance-and-wait) (`provenance`,
 `provenance_line`, and `stale_line` when a source file was written after the compile). `timed_out: true` means the wait gave up after 5 minutes — not that the compile
 failed. `nothing_to_compile: true` means no compilation was seen to run after the request, in which
@@ -376,6 +378,43 @@ Waits are bounded by `--await_timeout <ms>` (default 30000; `0` waits forever). 
 
 Because `exec` compiles and runs real C#, it can do anything a custom tool can — inspect ECS entities, modify assets, call internal APIs, run editor utilities. For AI agents, this means **zero-friction access to Unity's entire runtime** without writing a single line of tool code. Piping via stdin avoids shell escaping headaches with complex code.
 
+### API Lookup
+
+What an API actually is, read off the assemblies the editor has loaded — the same set the project's code compiles against. Grepping `Library/PackageCache/com.unity.<pkg>@<hash>/…` is slower, and it disagrees with what compiled (hashed folder names, stubs, `#if` branches); reflection cannot.
+
+```bash
+# kind, namespace, assembly, base type, interfaces, member counts
+unity-cli api Vector3
+
+# every overload of one member, in C#: modifiers, generics + constraints, ref/out/in/params
+unity-cli api Vector3.Lerp
+
+# a property, a nested type — or a bare member name: which types declare it
+unity-cli api EditorApplication.isCompiling
+unity-cli api GetSingletonBuffer --assembly Entities
+
+# narrow the search, and ask for the XML docs Unity ships for its own modules
+unity-cli api List.Add --assembly mscorlib --limit 5
+unity-cli api UnityEngine.Object.FindObjectOfType --docs
+```
+
+```json
+{
+  "summary": "UnityEngine.Vector3 (struct, UnityEngine.CoreModule): 2 'Lerp' matches",
+  "types": [{
+    "type": "UnityEngine.Vector3", "kind": "struct", "assembly": "UnityEngine.CoreModule",
+    "members": [
+      { "name": "Lerp", "signature": "public static Vector3 Lerp(in Vector3 a, in Vector3 b, float t)" },
+      { "name": "Lerp", "signature": "public static Vector3 Lerp(Vector3 a, Vector3 b, float t)" }
+    ]
+  }]
+}
+```
+
+A type query accepts the simple name, the full name, and either spelling of a generic (`BufferLookup`, `BufferLookup<T>`, `` BufferLookup`1 ``). When several types match, each one is described, best match first (up to `--max_types`, default 5). `[Obsolete]` members report the message, whether it is an error, and the replacement when the notice names one (`Use X instead`, `(UnityUpgradable) -> X`). `--docs` adds the `<summary>` from the `.xml` sitting next to the assembly — Unity ships one for its own modules, most third-party assemblies ship none, and a missing doc file prints nothing.
+
+The index is built lazily and cached for the editor session. `--budget <ms>` (default 1500) bounds one call; `index.complete: false` means the budget ran out before every assembly was searchable, so raise the budget or ask again. The command stays available while the project does not compile: the loaded assemblies are the last good ones, which is exactly when the real API is wanted.
+
 ### Menu Items
 
 ```bash
@@ -554,6 +593,16 @@ unity-cli verify --json
 compile: 1 error(s)
   Assets/Scripts/Player.cs:42:13 CS0103 The name 'speed' does not exist in the current context
 ```
+
+When the error is one an agent can act on — a member or type the compiler could not find, or an API that is obsolete — the connector looks the answer up in the loaded assemblies and prints it under the error:
+
+```
+compile: 1 error(s)
+  Assets/Scripts/Player.cs:12:9 CS1061 'Transform' does not contain a definition for 'positon' and no accessible extension method …
+    hint: closest: Transform.position, Transform.localPosition, Rigidbody.position
+```
+
+That covers `CS0117`/`CS1061` (member not found: the closest members on the named type first, then the same name on other types), `CS0246`/`CS0234` (type or namespace not found: the closest real types, with the assembly each lives in) and `CS0619`/`CS0618` (obsolete: the replacement the notice names, resolved to a real signature — `hint: use UnityEngine.Object.GetEntityId()`). At most three candidates per error and 200 characters per hint; the whole pass has a 100 ms budget per result (`compile_diagnostics --hint_budget <ms>`, `--include_hints false` to switch it off), and lookups repeat from cache. A hint appears only when there is a real answer: a message the parser does not recognize, or a deprecation notice that names no member, prints nothing extra.
 
 A clean C# compile also gets a Burst line, because Burst compiles outside script compilation and a `BCxxxx` error can arrive after it looked clean:
 

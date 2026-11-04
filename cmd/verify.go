@@ -24,6 +24,9 @@ type verifyDiag struct {
 	Severity string `json:"severity"`
 	Code     string `json:"code"`
 	Message  string `json:"message"`
+	// Hint names the closest real members/types (or the replacement for an obsolete API) when the
+	// code is one an agent can act on: CS0117/CS1061/CS0246/CS0234/CS0619/CS0618.
+	Hint string `json:"hint,omitempty"`
 }
 
 type verifyResult struct {
@@ -348,6 +351,9 @@ func printCompile(out io.Writer, ok bool, total int, diags []verifyDiag, source 
 			code = d.Code + " "
 		}
 		_, _ = fmt.Fprintf(out, "  %s%s%s\n", where, code, d.Message)
+		if d.Hint != "" {
+			_, _ = fmt.Fprintf(out, "    hint: %s\n", d.Hint)
+		}
 	}
 }
 

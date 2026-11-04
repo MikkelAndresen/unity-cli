@@ -22,6 +22,7 @@ internal/client/      # Unity HTTP client, instance discovery, Temp/UnityLockfil
 unity-connector/      # C# Unity Editor package (UPM)
   Editor/
     Core/             # Shared utilities (Response, ParamCoercion, ToolParams, StringCaseUtility, StackTraceFilter, CompileProvenance)
+                      # ApiIndex/ApiReflection/XmlDocLookup back `api`; CompileHints reuses them for compile-error hints
     Tools/            # Tool implementations (auto-registered via [UnityCliTool] attribute)
     Burst/            # burst_status tool; own asmdef, only compiles when com.unity.burst is present
     BuildJobs/        # Player build jobs: job record, Temp/ persistence across reloads, runner off the command lock
