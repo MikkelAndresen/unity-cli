@@ -14,10 +14,12 @@ namespace UnityCliConnector.Tests
     public class ApiIndexTests
     {
         [Test]
-        public void EnsureIndexed_WithEnoughBudget_CoversTheWholeDomain()
+        public void EnsureIndexed_WithAnUnboundedBudget_CoversTheWholeDomain()
         {
-            var stats = ApiIndex.EnsureIndexed(5000);
-            Assert.IsTrue(stats.Complete, $"a 5 s scan should finish the domain; got {stats}");
+            // An effectively infinite budget instead of a wall-clock one: the assertion is about
+            // the scan covering every eligible assembly, not about how fast this machine is.
+            var stats = ApiIndex.EnsureIndexed(int.MaxValue);
+            Assert.IsTrue(stats.Complete, $"the scan should finish the domain; got {stats}");
             Assert.Greater(stats.TypesIndexed, 10000, "the editor loads Unity plus the test framework");
             Assert.Greater(stats.AssembliesIndexed, 20);
         }
@@ -25,7 +27,7 @@ namespace UnityCliConnector.Tests
         [Test]
         public void EnsureIndexed_SpentBudget_KeepsWhatWasAlreadyIndexed()
         {
-            var warmed = ApiIndex.EnsureIndexed(5000);
+            var warmed = ApiIndex.EnsureIndexed(int.MaxValue);
             var again = ApiIndex.EnsureIndexed(0);
             Assert.AreEqual(warmed.TypesIndexed, again.TypesIndexed, "a spent budget must not lose work");
             Assert.IsTrue(again.Complete, "everything eligible is already indexed");
@@ -34,7 +36,7 @@ namespace UnityCliConnector.Tests
         [Test]
         public void FindTypes_RanksUnitysOwnTypeFirst()
         {
-            ApiIndex.EnsureIndexed(5000);
+            ApiIndex.EnsureIndexed(int.MaxValue);
             var found = ApiIndex.FindTypes("Vector3", 5);
             Assert.AreNotEqual(0, found.Count);
             Assert.AreEqual(typeof(Vector3), found[0], "UnityEngine.CoreModule leads the lookup order");
@@ -43,7 +45,7 @@ namespace UnityCliConnector.Tests
         [Test]
         public void FindTypes_ListsEveryTypeTheQueryNames()
         {
-            ApiIndex.EnsureIndexed(5000);
+            ApiIndex.EnsureIndexed(int.MaxValue);
             var found = ApiIndex.FindTypes("List", 10);
             Assert.IsTrue(found.Any(t => t == typeof(System.Collections.Generic.List<>)),
                 "the open generic is what a type query names");
@@ -53,7 +55,7 @@ namespace UnityCliConnector.Tests
         [Test]
         public void FindTypes_ExactOnlyMode_RefusesTypoNeighbours()
         {
-            ApiIndex.EnsureIndexed(5000);
+            ApiIndex.EnsureIndexed(int.MaxValue);
             Assert.AreEqual(0, ApiIndex.FindTypes("Vectr3", 5, 0).Count,
                 "nothing is named Vectr3, so an exact lookup finds nothing");
             Assert.IsTrue(ApiIndex.FindTypes("Vectr3", 5).Any(t => t == typeof(Vector3)),
@@ -63,7 +65,7 @@ namespace UnityCliConnector.Tests
         [Test]
         public void FindTypes_AritySpellingAndNamespacePrefix_MatchTheSameType()
         {
-            ApiIndex.EnsureIndexed(5000);
+            ApiIndex.EnsureIndexed(int.MaxValue);
             foreach (var query in new[] { "List", "List<>", "List`1",
                           "Collections.Generic.List<T>", "System.Collections.Generic.List<T>" })
             {
@@ -108,7 +110,7 @@ namespace UnityCliConnector.Tests
         [Test]
         public void TypesWithMember_FindsTheTypeDeclaringAnExactMemberName()
         {
-            ApiIndex.EnsureIndexed(5000);
+            ApiIndex.EnsureIndexed(int.MaxValue);
             var types = ApiIndex.TypesWithMember("isCompiling", 10, new Deadline(3000));
             Assert.IsTrue(types.Contains(typeof(EditorApplication)),
                 "the member-name reading is how 'api <Member>' answers at all");
@@ -117,7 +119,7 @@ namespace UnityCliConnector.Tests
         [Test]
         public void FindMembersByName_IsCaseInsensitiveAndDeclaredOnly()
         {
-            ApiIndex.EnsureIndexed(5000);
+            ApiIndex.EnsureIndexed(int.MaxValue);
             var assembly = typeof(Vector3).Assembly;
             var found = ApiIndex.FindMembersByName(assembly, "lerp");
             Assert.IsTrue(found.Any(m => m.DeclaringType == typeof(Vector3) && m.Name == "Lerp"),

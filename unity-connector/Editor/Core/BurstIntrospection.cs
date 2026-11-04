@@ -109,7 +109,7 @@ namespace UnityCliConnector.Tools
 
         /// Reflection into a private API: any failure to invoke a member means it is unusable in this
         /// Burst build, which is the same outcome as the member being absent.
-        static bool TryInvoke(MethodInfo method, object target, object[] args, out object result)
+        internal static bool TryInvoke(MethodInfo method, object target, object[] args, out object result)
         {
             result = null;
             if (method == null) return false;
@@ -196,7 +196,7 @@ namespace UnityCliConnector.Tools
 
         /// "MyGame.HeavyJob - (IJobFor)" -> "MyGame.HeavyJob"; a static-method target's
         /// "MyGame.Util.Run(int)" is returned whole and resolved by its Scope instead.
-        static string TypePart(string fullName)
+        internal static string TypePart(string fullName)
         {
             if (string.IsNullOrEmpty(fullName)) return "";
             var dash = fullName.IndexOf(" - (", StringComparison.Ordinal);
@@ -263,7 +263,7 @@ namespace UnityCliConnector.Tools
             return targets;
         }
 
-        static object DefaultAssemblyOptions(Type optionsType)
+        internal static object DefaultAssemblyOptions(Type optionsType)
         {
             if (!optionsType.IsEnum) return Activator.CreateInstance(optionsType);
             return Enum.ToObject(optionsType, 0);

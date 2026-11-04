@@ -90,7 +90,7 @@ namespace UnityCliConnector.Tests
         private void IgnoreFailingLogs() => LogAssert.ignoreFailingMessages = true;
 
         [Test]
-        public void Lines_LimitsToTheNewestEntriesAndCountsTheRest()
+        public void Lines_LimitsToTheNewestEntriesAndSaysTheTotalIsALowerBound()
         {
             IgnoreFailingLogs();
             LogMarker("lines", 3);
@@ -100,11 +100,56 @@ namespace UnityCliConnector.Tests
             // The one entry must be the last one logged, not the first: LogEntries is oldest-first.
             Assert.AreEqual($"{Marker}_lines 2", data["entries"][0].Value<string>());
             Assert.AreEqual(1, data["entries_returned"].Value<int>());
-            Assert.GreaterOrEqual(data["entries_total"].Value<int>(), 3);
-            Assert.GreaterOrEqual(data["entries_omitted"].Value<int>(), 2);
+            Assert.IsTrue(data["entries_total_is_lower_bound"].Value<bool>(),
+                "the scan stops at --lines, so older matches were neither read nor counted");
+            Assert.AreEqual(1, data["entries_total"].Value<int>());
             Assert.IsTrue(data["truncated"].Value<bool>());
             Assert.That(data["truncated_by"].Values<string>(), Does.Contain("lines"));
             Assert.AreEqual(1, data["limits"]["lines"].Value<int>());
+        }
+
+        [Test]
+        public void Lines_ReportsAnExactTotalWhenTheScanReachesTheOldestEntry()
+        {
+            IgnoreFailingLogs();
+            LogMarker("exact", 3);
+
+            var data = Run(new JObject { ["type"] = "error", ["lines"] = 500, ["stacktrace"] = "none" });
+
+            Assert.IsFalse(data["entries_total_is_lower_bound"].Value<bool>());
+            Assert.GreaterOrEqual(data["entries_total"].Value<int>(), 3,
+                "without an early stop the total counts every matching entry");
+        }
+
+        [Test]
+        public void FailedFilterRestore_IsReportedInsteadOfLeavingTheConsoleWidenedSilently()
+        {
+            IgnoreFailingLogs();
+            RequireConsoleFilterBindings();
+            SetConsoleWindowFilter(0, "");
+
+            var calls = 0;
+            ReadConsole.SetFlagsForTests = _ => ++calls == 1;
+            try
+            {
+                var response = ReadConsole.HandleCommand(new JObject
+                {
+                    ["type"] = "error",
+                    ["lines"] = 1,
+                    ["stacktrace"] = "none",
+                }) as SuccessResponse;
+
+                Assert.IsNotNull(response);
+                var data = JObject.FromObject(response.data);
+                Assert.IsNotNull(data["console_filter_restore_error"],
+                    "a restore that fails must not be swallowed: the user's Console stays widened");
+                StringAssert.Contains("could not be restored", data["console_filter_restore_error"].Value<string>());
+                StringAssert.Contains("could not be restored", response.message);
+            }
+            finally
+            {
+                ReadConsole.SetFlagsForTests = null;
+            }
         }
 
         [Test]

@@ -179,3 +179,18 @@ consumes.
   file lock, but it has not been compiled or run in this worktree.
 - `waitForAlive` still accepts other busy states (`compiling`, `refreshing`, `reloading`, `building`)
   as alive, as before; only `starting` is held back because it means no main-thread update has run.
+
+## Review follow-up
+
+- The startup beater is kept. A cold import can legitimately hold the main thread for many minutes,
+  and #16 was exactly that case being reported as dead; bounding it would reintroduce the bug. The
+  long startup is made visible instead: while the heartbeat state is `starting` the connector now
+  also publishes `startingSince` (unix ms, the moment the listener came up), and `status`/`wait`
+  print "starting for <age>" from it and point at Editor.log/dialogs after 10 minutes.
+- `Heartbeat.ProjectRoot()` now strips only a trailing `/Assets` instead of every `/Assets` segment,
+  matching `internal/editor/heartbeat.go`. For an ordinary `<project>/Assets` dataPath the hash is
+  unchanged (pinned by `HeartbeatPayloadTests.InstanceFileNameFor_StripsOnlyTheDataPathAssetsSuffix`
+  and verified live: this project's heartbeat file name and hash match).
+- A routine domain reload no longer re-emits `starting`: a `SessionState` marker records that this
+  process has ticked, so only the process's first listener start uses `starting`. This removes the
+  `reloading -> starting -> ready` flicker that made `reloadNote` report "still starting".

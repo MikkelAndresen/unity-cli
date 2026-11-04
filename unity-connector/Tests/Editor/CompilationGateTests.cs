@@ -533,8 +533,9 @@ namespace UnityCliConnector.Tests
             CompilationGate.NoteCompileFinishedForTests();
             var after = CompilationGate.LastCompileFinishedAt;
 
-            Assert.That(after, Is.GreaterThan(before),
-                "a finished compile has to be visible to the CLI's before/after comparison");
+            Assert.That(after, Is.GreaterThanOrEqualTo(before),
+                "a finished compile has to be visible to the CLI's before/after comparison; " +
+                "equal is possible when both stamps land in the same millisecond");
             // Unix ms, not EditorApplication.timeSinceStartup: the CLI compares this against the
             // heartbeat's own timestamps, across a domain reload that resets the static.
             Assert.That(after, Is.EqualTo(System.DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()).Within(5000),

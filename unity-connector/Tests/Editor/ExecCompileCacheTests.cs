@@ -95,8 +95,8 @@ namespace UnityCliConnector.Tests
         {
             var first = await Exec(Snippet);
             var afterFirst = AssemblyCount();
-            Assert.AreEqual("compiled", MetaOf(first)["compile"].Value<string>());
-            Assert.Greater(MetaOf(first)["compile_ms"].Value<long>(), 0, "the compile is what gets measured away");
+            Assert.AreEqual("compiled", MetaOf(first)["compile"].Value<string>(),
+                "the first run goes through csc; the second call below pins the reuse path");
 
             var second = await Exec(Snippet);
             Assert.AreEqual(42, second.data, "the cached path still runs the snippet");

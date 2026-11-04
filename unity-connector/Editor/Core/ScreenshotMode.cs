@@ -15,19 +15,20 @@ namespace UnityCliConnector
         internal readonly struct Resolution
         {
             internal readonly ScreenshotMode Mode;
-            /// True when neither mode nor view was named, so the play state chose this.
-            internal readonly bool FromDefault;
+            /// Non-null when the bare-call default had to fall back to another mode, e.g. "paused"
+            /// for a paused game whose Game view has no frame to capture.
+            internal readonly string Fallback;
             internal readonly string Error;
 
-            internal Resolution(ScreenshotMode mode, bool fromDefault = false, string error = null)
+            internal Resolution(ScreenshotMode mode, string fallback = null, string error = null)
             {
                 Mode = mode;
-                FromDefault = fromDefault;
+                Fallback = fallback;
                 Error = error;
             }
         }
 
-        internal static Resolution Resolve(string mode, string view, bool isPlaying)
+        internal static Resolution Resolve(string mode, string view, bool isPlaying, bool isPaused = false)
         {
             string raw;
             bool fromModeParam;
@@ -45,8 +46,12 @@ namespace UnityCliConnector
             else
             {
                 // Edit mode keeps the historical bare-call default (the Scene view camera);
-                // a running game is better read through its own Game view.
-                return new Resolution(isPlaying ? ScreenshotMode.GameView : ScreenshotMode.Scene, fromDefault: true);
+                // a running game is better read through its own Game view. A paused game renders
+                // no frame for ScreenCapture, so the offscreen camera is the only usable bare call.
+                if (!isPlaying) return new Resolution(ScreenshotMode.Scene);
+                return isPaused
+                    ? new Resolution(ScreenshotMode.Camera, fallback: "paused")
+                    : new Resolution(ScreenshotMode.GameView);
             }
 
             switch (Normalize(raw))

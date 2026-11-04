@@ -422,8 +422,8 @@ namespace UnityCliConnector
             }
             catch (Exception ex)
             {
-                // A queued request that dies here (bad JSON, a crash while queueing) must still be
-                // answered, or its ticket would sit in the tracker until a reload names it.
+                // The ticket was already tracked, so nothing else would answer it before a reload
+                // names it.
                 result = new ErrorResponse($"Request error: {ex.Message}");
                 response.StatusCode = 500;
                 if (ticket != null) ticket.TryAnswer(result);

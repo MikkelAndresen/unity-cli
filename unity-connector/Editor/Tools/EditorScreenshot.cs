@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Threading.Tasks;
 using Newtonsoft.Json.Linq;
@@ -47,7 +48,8 @@ namespace UnityCliConnector.Tools
                 @params = new JObject();
 
             var p = new ToolParams(@params);
-            var resolution = ScreenshotModes.Resolve(p.Get("mode"), p.Get("view"), EditorApplication.isPlaying);
+            var resolution = ScreenshotModes.Resolve(p.Get("mode"), p.Get("view"),
+                EditorApplication.isPlaying, EditorApplication.isPaused);
             if (resolution.Error != null)
                 return new ErrorResponse(resolution.Error);
 
@@ -81,7 +83,7 @@ namespace UnityCliConnector.Tools
                     case ScreenshotMode.Scene:
                         return CaptureSceneView(width, height, outputPath);
                     case ScreenshotMode.Camera:
-                        return CaptureMainCamera(width, height, outputPath);
+                        return CaptureMainCamera(width, height, outputPath, resolution.Fallback);
                     case ScreenshotMode.GameView:
                         return await CaptureRunningGameAsync(outputPath, sizeRequested);
                     default:
@@ -119,7 +121,7 @@ namespace UnityCliConnector.Tools
             return CaptureCamera(camera, width, height, outputPath, ScreenshotMode.Scene);
         }
 
-        private static object CaptureMainCamera(int width, int height, string outputPath)
+        private static object CaptureMainCamera(int width, int height, string outputPath, string fallback = null)
         {
             var camera = Camera.main;
             if (!camera)
@@ -133,11 +135,11 @@ namespace UnityCliConnector.Tools
                     return new ErrorResponse("No camera found in scene.");
             }
 
-            return CaptureCamera(camera, width, height, outputPath, ScreenshotMode.Camera);
+            return CaptureCamera(camera, width, height, outputPath, ScreenshotMode.Camera, fallback);
         }
 
         private static object CaptureCamera(Camera camera, int width, int height, string outputPath,
-            ScreenshotMode mode)
+            ScreenshotMode mode, string fallback = null)
         {
             var previousRT = camera.targetTexture;
             RenderTexture rt = null;
@@ -156,15 +158,19 @@ namespace UnityCliConnector.Tools
 
                 File.WriteAllBytes(outputPath, tex.EncodeToPNG());
 
-                return new SuccessResponse($"Screenshot saved to {outputPath}",
-                    new
-                    {
-                        path = outputPath,
-                        mode = ScreenshotModes.Label(mode),
-                        width,
-                        height,
-                        size_bytes = new FileInfo(outputPath).Length,
-                    });
+                var data = new Dictionary<string, object>
+                {
+                    ["path"] = outputPath,
+                    ["mode"] = ScreenshotModes.Label(mode),
+                    ["width"] = width,
+                    ["height"] = height,
+                    ["size_bytes"] = new FileInfo(outputPath).Length,
+                };
+                if (fallback != null) data["fallback"] = fallback;
+                var message = fallback == null
+                    ? $"Screenshot saved to {outputPath}"
+                    : $"Screenshot saved to {outputPath} (mode camera: the game is paused, so the bare call fell back from the Game view)";
+                return new SuccessResponse(message, data);
             }
             finally
             {
@@ -384,17 +390,7 @@ namespace UnityCliConnector.Tools
         /// </summary>
         private static Task NextEditorUpdate(Action onMainThread)
         {
-            var tcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
-
-            void Handler()
-            {
-                EditorApplication.update -= Handler;
-                onMainThread();
-                tcs.TrySetResult(true);
-            }
-
-            EditorApplication.update += Handler;
-            return tcs.Task;
+            return EditorUpdateAwaiter.Next(onMainThread, offContext: true);
         }
 
         /// -1 when the file is missing or its size cannot be read while Unity writes it.

@@ -10,12 +10,17 @@ namespace UnityCliConnector.Tests
         {
             var playing = ScreenshotModes.Resolve(null, null, isPlaying: true);
             Assert.AreEqual(ScreenshotMode.GameView, playing.Mode);
-            Assert.IsTrue(playing.FromDefault);
+            Assert.IsNull(playing.Fallback);
             Assert.IsNull(playing.Error);
+
+            var paused = ScreenshotModes.Resolve(null, null, isPlaying: true, isPaused: true);
+            Assert.AreEqual(ScreenshotMode.Camera, paused.Mode,
+                "a paused game renders no Game view frame, so the bare call must still capture");
+            Assert.AreEqual("paused", paused.Fallback);
 
             var editing = ScreenshotModes.Resolve(null, null, isPlaying: false);
             Assert.AreEqual(ScreenshotMode.Scene, editing.Mode);
-            Assert.IsTrue(editing.FromDefault);
+            Assert.IsNull(editing.Fallback);
         }
 
         [Test]
@@ -23,7 +28,12 @@ namespace UnityCliConnector.Tests
         {
             var resolution = ScreenshotModes.Resolve("scene", null, isPlaying: true);
             Assert.AreEqual(ScreenshotMode.Scene, resolution.Mode);
-            Assert.IsFalse(resolution.FromDefault);
+            Assert.IsNull(resolution.Fallback);
+
+            var explicitGameView = ScreenshotModes.Resolve("gameview", null, isPlaying: true, isPaused: true);
+            Assert.AreEqual(ScreenshotMode.GameView, explicitGameView.Mode,
+                "an explicit --mode gameview while paused still reports that there is no frame");
+            Assert.IsNull(explicitGameView.Fallback);
         }
 
         [Test]

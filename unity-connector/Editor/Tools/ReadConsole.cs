@@ -169,11 +169,13 @@ namespace UnityCliConnector.Tools
 
         private static object GetEntries(List<string> types, StackTraceFilter.StacktraceMode mode, Limits limits)
         {
+            // Newest-first: the Console is oldest-first, but a flood is only interesting at its
+            // tail, and stopping at the line cap is what keeps `--lines 5` from reading a 100k-entry
+            // console. Entries are formatted after the scan so byte-truncated ones are never shaped.
             var matched = new List<int>();
             var texts = new List<string>();
-            int lineLimitedCount = 0;
-            bool cutByBytes = false;
-            int framesOmitted = 0, framesOverCap = 0, charsOmitted = 0, bytes = 0;
+            bool cutByBytes = false, stoppedAtLineCap = false;
+            int framesOmitted = 0, framesOverCap = 0, charsOmitted = 0, bytes = 0, scanned = 0;
 
             var filterScope = EnterConsoleFilterOverride();
             try
@@ -182,29 +184,33 @@ namespace UnityCliConnector.Tools
                 int total = (int)_getCountMethod.Invoke(null, null);
                 object logEntry = Activator.CreateInstance(_logEntryType);
 
-                for (int i = 0; i < total; i++)
+                int index = total - 1;
+                for (; index >= 0; index--)
                 {
-                    _getEntryMethod.Invoke(null, new object[] { i, logEntry });
+                    scanned++;
+                    _getEntryMethod.Invoke(null, new object[] { index, logEntry });
                     int entryMode = (int)_modeField.GetValue(logEntry);
-                    string message = (string)_messageField.GetValue(logEntry);
-                    if (string.IsNullOrEmpty(message)) continue;
 
                     LogType logType = GetLogTypeFromMode(entryMode);
                     bool want = logType == LogType.Exception || logType == LogType.Assert
                         ? types.Contains("error")
                         : types.Contains(logType.ToString().ToLowerInvariant());
+                    if (!want) continue;
 
-                    if (want) matched.Add(i);
+                    string message = (string)_messageField.GetValue(logEntry);
+                    if (string.IsNullOrEmpty(message)) continue;
+
+                    matched.Add(index);
+                    if (limits.Lines > 0 && matched.Count >= limits.Lines)
+                    {
+                        stoppedAtLineCap = index > 0;
+                        break;
+                    }
                 }
 
-                // The console is read oldest-first, but a flood is only interesting at its tail: the
-                // caps keep the most recent entries, so they are formatted newest-first and older ones
-                // are dropped by the line and byte budgets without being shaped at all.
-                lineLimitedCount = limits.Lines > 0 ? Math.Min(matched.Count, limits.Lines) : matched.Count;
-                int lineStart = matched.Count - lineLimitedCount;
-                for (int k = matched.Count - 1; k >= lineStart; k--)
+                foreach (var entryIndex in matched)
                 {
-                    _getEntryMethod.Invoke(null, new object[] { matched[k], logEntry });
+                    _getEntryMethod.Invoke(null, new object[] { entryIndex, logEntry });
                     string message = (string)_messageField.GetValue(logEntry);
                     var formatted = StackTraceFilter.Format(message, mode, limits.Frames, limits.EntryChars);
                     framesOmitted += formatted.FramesOmitted;
@@ -230,20 +236,32 @@ namespace UnityCliConnector.Tools
             texts.Reverse();
 
             var truncatedBy = new List<string>();
-            if (matched.Count > lineLimitedCount) truncatedBy.Add("lines");
+            if (stoppedAtLineCap) truncatedBy.Add("lines");
             if (cutByBytes) truncatedBy.Add("bytes");
             if (framesOverCap > 0) truncatedBy.Add("frames");
             if (charsOmitted > 0) truncatedBy.Add("chars");
 
-            string summary = truncatedBy.Count == 0
-                ? $"Retrieved {texts.Count} entries."
-                : $"Retrieved {texts.Count} of {matched.Count} entries (cut by {string.Join(",", truncatedBy)}): pass --full for everything.";
+            string summary;
+            if (stoppedAtLineCap)
+            {
+                summary = $"Retrieved {texts.Count} of the newest {matched.Count} matching entries " +
+                          "(stopped at --lines; older matches were not counted or read): raise --lines for more.";
+            }
+            else
+            {
+                summary = truncatedBy.Count == 0
+                    ? $"Retrieved {texts.Count} entries."
+                    : $"Retrieved {texts.Count} of {matched.Count} entries (cut by {string.Join(",", truncatedBy)}): pass --full for everything.";
+            }
             if (filterScope.Note != null) summary += $" ({filterScope.Note})";
+            if (filterScope.RestoreError != null) summary += $" (warning: {filterScope.RestoreError})";
 
             var data = new Dictionary<string, object>
             {
                 ["entries"] = texts,
                 ["entries_total"] = matched.Count,
+                ["entries_total_is_lower_bound"] = stoppedAtLineCap,
+                ["entries_scanned"] = scanned,
                 ["entries_returned"] = texts.Count,
                 ["entries_omitted"] = matched.Count - texts.Count,
                 ["frames_omitted"] = framesOmitted,
@@ -261,6 +279,8 @@ namespace UnityCliConnector.Tools
             };
             if (filterScope.Changed || filterScope.FilterUnavailable)
                 data["console_window_filter"] = filterScope.Details;
+            if (filterScope.RestoreError != null)
+                data["console_filter_restore_error"] = filterScope.RestoreError;
             return new SuccessResponse(summary, data);
         }
 
@@ -321,6 +341,7 @@ namespace UnityCliConnector.Tools
 
         private static bool TrySetConsoleFlags(int flags)
         {
+            if (SetFlagsForTests != null) return SetFlagsForTests(flags);
             try
             {
                 var type = _consoleFlagsProperty.PropertyType;
@@ -329,6 +350,13 @@ namespace UnityCliConnector.Tools
                 return true;
             }
             catch { return false; }
+        }
+
+        internal static Func<int, bool> SetFlagsForTests;
+
+        static void ReportRestoreFailure(string error)
+        {
+            if (error != null) Debug.LogWarning("[UnityCliConnector] console: " + error);
         }
 
         private sealed class ConsoleFilterScope : IDisposable
@@ -365,6 +393,10 @@ namespace UnityCliConnector.Tools
 
             public bool FilterUnavailable => _unavailable;
 
+            // Non-null when the user's Console window settings could not be put back: the window is
+            // left widened, which is exactly the state the override must not leave behind silently.
+            public string RestoreError { get; private set; }
+
             public string Note
             {
                 get
@@ -392,11 +424,15 @@ namespace UnityCliConnector.Tools
 
             public void Dispose()
             {
-                if (_restoreFlags)
-                    TrySetConsoleFlags(_savedFlags);
+                if (_restoreFlags && !TrySetConsoleFlags(_savedFlags))
+                    RestoreError = "the Console window's Log/Warning/Error toggles could not be restored; set them back in the Console window";
                 if (_restoreFilter)
                 {
-                    try { _setFilteringTextMethod.Invoke(null, new object[] { _savedFilter }); } catch { }
+                    try { _setFilteringTextMethod.Invoke(null, new object[] { _savedFilter }); }
+                    catch
+                    {
+                        RestoreError ??= "the Console window's search text could not be restored";
+                    }
                 }
             }
         }
@@ -484,6 +520,7 @@ namespace UnityCliConnector.Tools
             {
                 try { _endGettingEntriesMethod.Invoke(null, null); } catch { }
                 filterScope.Dispose();
+                ReportRestoreFailure(filterScope.RestoreError);
             }
         }
 
@@ -517,6 +554,7 @@ namespace UnityCliConnector.Tools
             {
                 try { _endGettingEntriesMethod.Invoke(null, null); } catch { }
                 filterScope.Dispose();
+                ReportRestoreFailure(filterScope.RestoreError);
             }
         }
 

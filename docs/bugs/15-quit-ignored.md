@@ -159,3 +159,15 @@ What was **not** verified:
   accidentally visible and named `Unity` inside a container, restart would proceed.
 - A quit that completes faster than the 0.5 s reply-flush delay is still possible, though the delay
   was chosen from the branch's live measurements.
+
+## Review follow-up
+
+- `--save` in play mode saved assets but no scene, yet the reply reported `save: true`. The reply is
+  now built by `QuitEditor.BuildReport` and reports `save: false`, `saveSkipped: "playmode"`,
+  `savedAssets: true` and lists the dirty scenes under `discardedScenes`.
+- Whether `EditorApplication.Exit` invokes the managed `wantsToQuit` event could not be settled
+  without quitting the shared editor (the task forbids it). Reflection shows `Exit(int)` is a native
+  `extern` with no managed body, while `Internal_EditorApplicationQuit` is the managed path that
+  walks quit events; nothing proves the native side consults `wantsToQuit`. The veto report therefore
+  now says a handler "may have returned false" instead of naming it the documented cause. A live
+  quit with a vetoing handler is still the only way to settle it.

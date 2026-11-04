@@ -98,11 +98,53 @@ namespace UnityCliConnector.Tests
         }
 
         [Test]
-        public void IsBurstErrorText_MatchesTheInspectorTest()
+        public void IsProjectTarget_RequiresTheResolvedAssemblyToBeTheProjectsOwn()
         {
-            Assert.IsTrue(BurstErrors.IsBurstErrorText("While compiling MyGame.Job\nAssets/Job.cs(12,9): Burst error BC1370: throw"));
-            Assert.IsFalse(BurstErrors.IsBurstErrorText("// --- Disassembly for MyGame.Job ---\nmov rax, rbx"));
-            Assert.IsFalse(BurstErrors.IsBurstErrorText(null));
+            var project = new[] { "Game", "Game.Tests.Editor" };
+            // Burst 1.8 sets Assembly from the job type for package and engine targets too, so an
+            // assembly name alone must not make a target "the project's own".
+            Assert.IsTrue(BurstTargets.IsProjectTarget(Target("Game.HeavyJob", "Game.HeavyJob", "Game"), project));
+            Assert.IsFalse(BurstTargets.IsProjectTarget(Target("Unity.Jobs.Sample", "Unity.Jobs.Sample", "Unity.Entities"), project));
+            Assert.IsFalse(BurstTargets.IsProjectTarget(Target("Unresolved", "Unresolved", ""), project));
+        }
+
+        [Test]
+        public void Matches_AppliesTypeNamespaceAndAssemblyFilters()
+        {
+            var target = Target("MyGame.HeavyJob - (IJobFor)", "MyGame.Jobs.HeavyJob", "Game");
+
+            Assert.IsTrue(BurstTargets.Matches(target, null, null, null));
+            Assert.IsTrue(BurstTargets.Matches(target, "heavy", null, null));
+            Assert.IsFalse(BurstTargets.Matches(target, "Other", null, null));
+            Assert.IsTrue(BurstTargets.Matches(target, null, "MyGame", null));
+            Assert.IsFalse(BurstTargets.Matches(target, null, "Other", null));
+            Assert.IsTrue(BurstTargets.Matches(target, null, null, new[] { "game" }));
+            Assert.IsFalse(BurstTargets.Matches(target, null, null, new[] { "Unity.Entities" }));
+        }
+
+        [Test]
+        public void StatusOf_FailedWins_AndAnIdleQueueMakesTheRestCompiled()
+        {
+            var target = Target("MyGame.HeavyJob", "MyGame.Jobs.HeavyJob", "Game");
+            var error = new BurstErrorEntry
+            {
+                File = "Assets/Job.cs", Line = 1, Col = 1, Code = "BC1051",
+                Message = "Assets/Job.cs(1,1): Burst error BC1051 while compiling `MyGame.Jobs.HeavyJob`",
+            };
+
+            Assert.AreEqual(BurstTargets.StatusFailed, BurstTargets.StatusOf(target, new[] { error }, true, true));
+            Assert.AreEqual(BurstTargets.StatusCompiled, BurstTargets.StatusOf(target, new BurstErrorEntry[0], true, true));
+            Assert.AreEqual(BurstTargets.StatusNotCompiled, BurstTargets.StatusOf(target, new BurstErrorEntry[0], true, false));
+            Assert.AreEqual(BurstTargets.StatusUnknown, BurstTargets.StatusOf(target, new BurstErrorEntry[0], false, false));
+        }
+
+        [Test]
+        public void IsPackageSourcePath_RecognisesRegistryEmbeddedAndFilePackages()
+        {
+            Assert.IsTrue(BurstTargets.IsPackageSourcePath("Packages/com.unity.entities/Job.cs", null));
+            Assert.IsTrue(BurstTargets.IsPackageSourcePath("/p/Library/PackageCache/com.unity.entities@1/Job.cs", null));
+            Assert.IsTrue(BurstTargets.IsPackageSourcePath("/p/LocalPackages/unity-cli/Job.cs", new[] { "/p/LocalPackages/unity-cli" }));
+            Assert.IsFalse(BurstTargets.IsPackageSourcePath("/p/Assets/Job.cs", new[] { "/p/LocalPackages/unity-cli" }));
         }
 
         [Test]

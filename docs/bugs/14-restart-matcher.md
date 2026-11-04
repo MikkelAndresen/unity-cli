@@ -83,9 +83,9 @@ reconstructed the matcher from the live process tree.
    Unity 30244 ... TCP 127.0.0.1:8090 (LISTEN)
    Unity 30244 ... TCP 127.0.0.1:56244 (LISTEN)
    ```
-   The worker is listening on the connector's default port 8090 while the editor heartbeat says
-   8091. That means `HttpServer`'s `[InitializeOnLoad]` constructor ran inside the
-   `AssetImportWorker` (nothing else in the project binds 8090). No — this is a second bug, found
+   The worker is listening on `127.0.0.1:8090`, which is the connector's default port (this
+   attribution is unverified: nothing else in this project is known to bind that port). The
+   heartbeat reports 8091, so the worker and the editor would be listening separately. No — this is a second bug, found
    while investigating.
 
 6. **Checked whether the worker overwrites the heartbeat.** Polled the instance file every 100 ms
@@ -108,12 +108,13 @@ re-triggered because `unity-restart` is forbidden here.
 
 ## Root cause
 
-- **Owner of the refusal (out of this repo):** the host daemon resolves "the editor for this
-  project" by scanning process arguments. On macOS a Hub-launched editor has `-projectpath`
-  (lowercase), or no project argument at all, while every `AssetImportWorker` child has
-  `-projectPath` (capital `P`) and `-parentPid <editor pid>`. A case-sensitive search for
-  `-projectPath`, or any matcher that requires the main editor's argv to name the project, sees the
-  worker but not the editor. That produces the "running, but not for this project" refusal.
+- **Owner of the refusal (out of this repo, unverified):** the host daemon probably resolves "the
+  editor for this project" by scanning process arguments. On macOS a Hub-launched editor has
+  `-projectpath` (lowercase), or no project argument at all, while every `AssetImportWorker` child
+  has `-projectPath` (capital `P`) and `-parentPid <editor pid>`. A case-sensitive search for
+  `-projectPath`, or any matcher that requires the main editor's argv to name the project, would see
+  the worker but not the editor, which could produce the "running, but not for this project" refusal.
+  The daemon source could not be read, so this remains a reconstruction.
 - **This repo's contribution:** the `[InitializeOnLoad]` constructors in
   `unity-connector/Editor/HttpServer.cs:49` and `unity-connector/Editor/Heartbeat.cs:41` had no
   `AssetDatabase.IsAssetImportWorkerProcess()` guard, so an import worker loaded the whole
@@ -226,3 +227,17 @@ Two additional behaviours make future refusals diagnosable, as the issue asks:
 - `scan`/`judgePID` in the Go CLI identifies Unity by executable base name, so an import worker's pid
   would also pass as "Unity alive". That is harmless while the heartbeat pid is the editor's, and it
   is what the new `Heartbeat` guard guarantees.
+
+## Review follow-up
+
+- Step 5's `lsof` output proves that worker pid 30244 held `127.0.0.1:8090`; naming that "the
+  connector's default port" is an inference from `HttpServer`'s default, not part of the
+  observation, and remains `unverified`.
+- The primary attribution (the host daemon matches `-projectPath` case-sensitively, or otherwise
+  picks the worker) is a reconstruction from the process tree and the refusal text: the daemon's
+  source is outside this repo, so the refusal itself was never reproduced. The worker guards are a
+  real, independently justified fix; they are not proof that the daemon refusal is caused by argv
+  matching.
+- In a live `exec` probe, `AssetDatabase.IsAssetImportWorkerProcess()` returned false in the main
+  editor and the heartbeat pid was the editor's, so the heartbeat-based attribution the CLI uses is
+  sound; the failure is on the daemon's side.

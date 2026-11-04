@@ -443,7 +443,10 @@ cut the reply says what and how much, so a caller knows how to widen the query i
 ```
 
 `entries` is oldest-first and holds the newest entries the caps allowed; `entries_total` counts the
-entries matching `--type`, before any cap. The tool temporarily turns on the Console window's
+entries matching `--type`, before any cap. The scan stops once `--lines` matches are found, so when
+that happens `entries_total_is_lower_bound` is true and `entries_total` counts only the newest matches
+that were read (`entries_scanned` says how many console entries were examined); without an early stop
+the total is exact. The tool temporarily turns on the Console window's
 Log/Warning/Error toggles, clears its search text and disables collapse for the read, then restores
 the window exactly as it was. `--type` therefore narrows every entry, not just the ones the window
 currently shows. When anything had to be overridden the reply says so in `console_window_filter`
@@ -577,7 +580,7 @@ unity-cli screenshot
 | `camera` | `Camera.main` rendered offscreen into a render texture at `--width`/`--height` | that camera's render only | the game's GUI (OnGUI/IMGUI) — measured: all 2,073,600 pixels of a 1920x1080 frame were the flat background color while the Game view was showing a HUD — plus Scene-view gizmos, Handles and editor overlays |
 | `scene` | the Scene view camera rendered offscreen at `--width`/`--height` | the scene as the current scene camera sees it | gizmos and Handles (toggling `SceneView.drawGizmos` leaves the file byte-identical), the Scene view's overlay UI, any game GUI |
 
-`gameview` is the default in Play mode, `scene` in Edit mode (what a bare `screenshot` has always done). `gameview` needs Play mode: in Edit mode no game frame is produced and Unity never writes the file, which the tool reports instead of hanging. A paused game produces no frame either, so `gameview` reports that too; use `--mode camera`, which renders without the game loop. Unity writes the capture to a sibling `*.partial.png` and the tool moves it onto `--output_path` only once the file is complete (its PNG trailer is there), so a failed or timed-out capture leaves an existing screenshot at that path untouched. Because the write is asynchronous, the tool pumps editor updates and answers as soon as the complete file is there (bounded at 5 s), reporting path, byte count and dimensions — without blocking the editor's main thread.
+`gameview` is the default in Play mode, `scene` in Edit mode (what a bare `screenshot` has always done). `gameview` needs Play mode: in Edit mode no game frame is produced and Unity never writes the file, which the tool reports instead of hanging. A paused game produces no frame either, so an explicit `--mode gameview` reports that too; a bare `screenshot` (no `--mode`) falls back to `camera` while paused and says so in the reply (`"mode":"camera","fallback":"paused"`). `--mode camera` renders without the game loop. Unity writes the capture to a sibling `*.partial.png` and the tool moves it onto `--output_path` only once the file is complete (its PNG trailer is there), so a failed or timed-out capture leaves an existing screenshot at that path untouched. Because the write is asynchronous, the tool pumps editor updates and answers as soon as the complete file is there (bounded at 5 s), reporting path, byte count and dimensions — without blocking the editor's main thread.
 
 Compare pixels inside one capture, not across modes: the `gameview` frame is what the game's own pipeline wrote to its backbuffer, while `camera`/`scene` read a plain render texture, and the same background color comes out at different values.
 

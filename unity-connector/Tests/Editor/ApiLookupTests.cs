@@ -107,7 +107,7 @@ namespace UnityCliConnector.Tests
         [Test]
         public void AssemblyFilter_IsAppliedBeforeTheTypeLimit()
         {
-            ApiIndex.EnsureIndexed(5000);
+            ApiIndex.EnsureIndexed(int.MaxValue);
             var data = Run("Vector3", ("assembly", "System.Numerics"), ("max_types", 1));
             var types = (JArray)data["types"];
             Assert.IsNotEmpty(types, "--max_types must not truncate away the only assembly the filter allows");

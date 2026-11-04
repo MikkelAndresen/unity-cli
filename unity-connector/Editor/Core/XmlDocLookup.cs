@@ -78,7 +78,7 @@ namespace UnityCliConnector
                 foreach (var member in xml.Root?.Element("members")?.Elements("member") ??
                                       Enumerable.Empty<XElement>())
                 {
-                    var name = member.Attribute("name")?.Value;
+                    var name = NormalizeKey(member.Attribute("name")?.Value);
                     if (string.IsNullOrEmpty(name)) continue;
                     var summary = Clean(member.Element("summary")?.Value);
                     if (summary.Length == 0) continue;
@@ -102,6 +102,15 @@ namespace UnityCliConnector
         }
 
         // ─── Doc file keys ────────────────────────────────────
+
+        /// Unity's own doc files spell a constructed generic with angle brackets
+        /// (`Span`1<Keyframe>`), while the XML-doc ID convention every other producer emits uses
+        /// braces. Both are mapped to the convention MemberKey builds so one lookup serves both.
+        internal static string NormalizeKey(string name)
+        {
+            if (string.IsNullOrEmpty(name)) return name;
+            return name.Replace('<', '{').Replace('>', '}');
+        }
 
         public static string TypeKey(Type type) => type == null ? null : "T:" + RefName(type);
 
@@ -146,7 +155,7 @@ namespace UnityCliConnector
         private static string ParamName(ParameterInfo parameter)
         {
             var type = parameter.ParameterType;
-            if (type.IsByRef) return RefName(type.GetElementType()) + "&";
+            if (type.IsByRef) return RefName(type.GetElementType()) + "@";
             if (type.IsPointer) return RefName(type.GetElementType()) + "*";
             if (type.IsArray)
             {
@@ -156,28 +165,33 @@ namespace UnityCliConnector
             return RefName(type);
         }
 
-        /// <summary>The reflection spelling the doc files use: "System.Int32", "A+B" for nested
-        /// types, "List`1[System.Int32]" for a constructed generic, "!0"/"!!0" for parameters.
-        /// <see cref="Type.FullName"/> spells a constructed generic's arguments assembly-qualified,
-        /// which the doc files never do, so that case is built by hand.</summary>
+        /// <summary>The doc-ID spelling: "System.Int32", "A.B" for nested types,
+        /// "List`1{System.Int32}" for a constructed generic, "`0"/"``0" for generic parameters and
+        /// "@" for a by-reference parameter. Unity's shipped files use these except that they write
+        /// constructed generics with angle brackets, which <see cref="NormalizeKey"/> maps back.
+        /// <see cref="Type.FullName"/> spells a constructed generic's arguments assembly-qualified and
+        /// a nested type with '+', so those cases are built by hand.</summary>
         private static string RefName(Type type)
         {
             if (type == null) return "";
             if (type.IsGenericParameter)
-                return type.DeclaringMethod != null ? "!!" + type.GenericParameterPosition : "!" + type.GenericParameterPosition;
+                return type.DeclaringMethod != null
+                    ? "``" + type.GenericParameterPosition
+                    : "`" + type.GenericParameterPosition;
             if (type.IsArray)
             {
                 var rank = type.GetArrayRank();
                 return RefName(type.GetElementType()) + "[" + new string(',', Math.Max(0, rank - 1)) + "]";
             }
-            if (type.IsByRef) return RefName(type.GetElementType()) + "&";
+            if (type.IsByRef) return RefName(type.GetElementType()) + "@";
             if (type.IsPointer) return RefName(type.GetElementType()) + "*";
             if (type.IsGenericType && !type.IsGenericTypeDefinition)
             {
                 var definition = type.GetGenericTypeDefinition().FullName ?? type.GetGenericTypeDefinition().Name;
-                return definition + "[" + string.Join(",", type.GetGenericArguments().Select(RefName)) + "]";
+                return definition.Replace('+', '.') + "{" +
+                       string.Join(",", type.GetGenericArguments().Select(RefName)) + "}";
             }
-            return type.FullName ?? type.Name;
+            return (type.FullName ?? type.Name).Replace('+', '.');
         }
 
         private sealed class DocFile

@@ -4,6 +4,7 @@ using System.ComponentModel;
 using System.Diagnostics;
 using System.IO;
 using System.Text;
+using System.Threading;
 using System.Threading.Tasks;
 
 namespace UnityCliConnector
@@ -149,13 +150,26 @@ namespace UnityCliConnector
                 ObserveFault(stderrTask);
 
                 var exited = ExitedTask(proc);
-                var timedOut = !ReferenceEquals(await Task.WhenAny(exited, Task.Delay(timeoutMs)).ConfigureAwait(false), exited);
+                bool timedOut;
+                using (var timeoutCts = new CancellationTokenSource())
+                {
+                    // Cancel the losing delay: without that the timer for a 2 s compile keeps a
+                    // thread-pool timer alive for the whole 30 s timeout.
+                    var timeoutTask = Task.Delay(timeoutMs, timeoutCts.Token);
+                    timedOut = !ReferenceEquals(await Task.WhenAny(exited, timeoutTask).ConfigureAwait(false), exited);
+                    if (!timedOut) timeoutCts.Cancel();
+                }
                 if (timedOut) TryKill(proc);
 
                 // Give the readers a moment to finish after the kill before the process is
                 // disposed under them; a lingering one is detached and its fault observed.
-                await Task.WhenAny(Task.WhenAll(stdoutTask, stderrTask), Task.Delay(StreamDrainGraceMs))
-                    .ConfigureAwait(false);
+                var drained = Task.WhenAll(stdoutTask, stderrTask);
+                using (var drainCts = new CancellationTokenSource())
+                {
+                    var grace = Task.Delay(StreamDrainGraceMs, drainCts.Token);
+                    if (!ReferenceEquals(await Task.WhenAny(drained, grace).ConfigureAwait(false), drained))
+                        drainCts.Cancel();
+                }
 
                 var stdout = Finished(stdoutTask) ? stdoutTask.Result : string.Empty;
                 var stderr = Finished(stderrTask) ? stderrTask.Result : string.Empty;

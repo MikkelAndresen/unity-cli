@@ -43,8 +43,6 @@ namespace UnityCliConnector.Tests
             }
         }
 
-        // ─── The compile record ───────────────────────────────────────────
-
         [Test]
         public void NoteCompileFinished_CapturesStartDurationAndRebuiltAssemblies()
         {
@@ -82,7 +80,7 @@ namespace UnityCliConnector.Tests
         {
             CompileProvenance.NoteCompileStarted();
             CompileProvenance.NoteAssemblyCompiled("/p/Library/ScriptAssemblies/Game.dll");
-            CompileProvenance.NoteCompileFinished(false);
+            CompileProvenance.NoteCompileFinished(false, willReload: true);
             var finished = CompileProvenance.SnapshotForTests().finished_at_ms;
             var previous = CompileProvenance.SnapshotForTests().previous_finished_at_ms;
 
@@ -99,6 +97,23 @@ namespace UnityCliConnector.Tests
                 "a restamp must not consume the record's own finish as the previous compile");
             CollectionAssert.AreEqual(new[] { "Game" }, record.rebuilt,
                 "the assemblies survive the reload they were compiled into");
+        }
+
+        [Test]
+        public void NoteCompileFinished_ReloadWithoutACompileDoesNotMoveTheClock()
+        {
+            CompileProvenance.NoteCompileStarted();
+            CompileProvenance.NoteCompileFinished(false, willReload: false);
+            var finished = CompileProvenance.SnapshotForTests().finished_at_ms;
+            System.Threading.Thread.Sleep(5);
+
+            // A package resolve reloads the domain too. Moving the clock for it would make every
+            // source written since the last real compile look as if that compile had built it.
+            CompileProvenance.ResetForTests();
+            CompileProvenance.ReloadFromSessionForTests();
+            CompileProvenance.NoteCompileFinished(true);
+
+            Assert.That(CompileProvenance.SnapshotForTests().finished_at_ms, Is.EqualTo(finished));
         }
 
         [Test]
@@ -141,8 +156,6 @@ namespace UnityCliConnector.Tests
             Assert.AreEqual(3.0, payload["age_seconds"].Value<double>());
             Assert.AreEqual(2, payload["changed_since_previous_compile"].Value<int>());
         }
-
-        // ─── The lines the CLI prints ─────────────────────────────────────
 
         [Test]
         public void ProvenanceLine_StatesWhenTookChangedAndWhatWasRebuilt()
@@ -231,8 +244,6 @@ namespace UnityCliConnector.Tests
             Assert.IsFalse(payload["scan_complete"].Value<bool>());
         }
 
-        // ─── The source scan ──────────────────────────────────────────────
-
         [Test]
         public void ScanRoots_CountsChangesSinceThePreviousCompile_AndListsSourcesNewerThanIt()
         {
@@ -251,8 +262,9 @@ namespace UnityCliConnector.Tests
             var scan = CompileProvenance.ScanRoots(new[] { _tmp }, _tmp, previous, finished, 5_000);
 
             Assert.IsTrue(scan.complete);
-            Assert.AreEqual(3, scan.changed_since_previous,
-                ".cs files written after the previous compile, counting neither .meta nor older files");
+            Assert.AreEqual(1, scan.changed_since_previous,
+                ".cs files written between the previous compile and this one; " +
+                "Stale.cs/Nested.cs came after it and are already counted as stale");
             Assert.AreEqual(3, scan.stale_count, ".cs, .asmdef and nested sources written after the compile");
             CollectionAssert.AreEquivalent(
                 new[] { "Stale.cs", "Stale.asmdef", Path.Combine("Sub", "Nested.cs") }.Select(p => p.Replace('\\', '/')).ToArray(),

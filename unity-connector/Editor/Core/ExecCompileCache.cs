@@ -24,10 +24,9 @@ namespace UnityCliConnector
     /// <summary>
     /// Compiled-snippet lookup for exec. The key covers everything that decides what csc
     /// produces: the generated source (its usings and Execute signature included), the
-    /// reference set handed to the compiler, the compiler override, and the identity of the
-    /// domain that loads the bytes. Nothing else has to invalidate an entry — a script
-    /// recompile reloads the domain, which drops this table along with the assemblies the
-    /// cached IL binds to.
+    /// reference set handed to the compiler, and the compiler override. Nothing else has to
+    /// invalidate an entry — a script recompile reloads the domain, which drops this table along
+    /// with the assemblies the cached IL binds to.
     ///
     /// Only reached from the editor main thread (exec runs on HttpServer's command queue),
     /// so the table is unsynchronized by design.
@@ -43,10 +42,6 @@ namespace UnityCliConnector
         static readonly Dictionary<string, CompiledSnippet> s_Entries = new();
         static readonly Queue<string> s_EvictionOrder = new();
 
-        // A snippet's IL binds to the assembly copies of the domain that compiled it, so an
-        // entry must never be handed to a different domain even if its key matches there.
-        static readonly string s_DomainId = Guid.NewGuid().ToString("N");
-
         internal static int Count => s_Entries.Count;
 
         internal static string KeyFor(string source, string cscPath, string dotnetPath,
@@ -58,7 +53,6 @@ namespace UnityCliConnector
             if (references == null) throw new ArgumentNullException(nameof(references));
 
             var sb = new StringBuilder();
-            sb.Append(s_DomainId).Append('\n');
             sb.Append(cscPath ?? string.Empty).Append('\n');
             sb.Append(dotnetPath ?? string.Empty).Append('\n');
 

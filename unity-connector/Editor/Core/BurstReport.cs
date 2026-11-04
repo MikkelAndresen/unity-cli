@@ -82,10 +82,6 @@ namespace UnityCliConnector.Tools
             @"^(?<file>[^()]+)\((?<line>\d+),(?<col>\d+)\):\s*Burst\s+error\s+(?<code>BC\d+):\s*(?<msg>.*)$",
             RegexOptions.Compiled);
 
-        // The Burst Inspector's own "did this compile fail" test on a disassembly reply.
-        private static readonly Regex DisassemblyPattern = new Regex(
-            @"\(\d+,\d+\):\s*Burst\s+error", RegexOptions.Compiled);
-
         // Names Burst quotes in its messages: "the struct `MyGame.HeavyJob`".
         private static readonly Regex QuotedNamePattern = new Regex(
             @"`(?<name>[A-Za-z_][\w.+]*)`", RegexOptions.Compiled);
@@ -99,11 +95,6 @@ namespace UnityCliConnector.Tools
         // Burst errors inside a job's generated producer cite the engine's own job struct; that path
         // is not the user's code, so a frame outside it is preferred.
         private const string EnginePathMarker = "build/output/unity";
-
-        public static bool IsBurstErrorText(string text)
-        {
-            return text != null && DisassemblyPattern.IsMatch(text);
-        }
 
         /// Reads a Burst error out of a full console message (head plus stack trace). A BCxxxx code
         /// without a parseable header still counts as Burst; its position then comes from the first

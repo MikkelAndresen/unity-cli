@@ -119,3 +119,9 @@ Updated the `console` section of `README.md` to describe the override and the ne
   must not hide compile errors from the gate. Ungated tools (`api`, `screenshot`, `editor stop`)
   do not run the gate and are unaffected. A failed restore remains best-effort exactly like the
   existing `EndGettingEntries` cleanup; it is not a new failure mode.
+
+- A Console-filter restore that fails is no longer silent. `ConsoleFilterScope.Dispose` records the
+  failure, `console` replies carry `console_filter_restore_error` and a `warning:` clause in the
+  message, and the compile-gate/`burst_status` entry iterators log it as a connector warning. The
+  widening failure already reported `console_window_filter.available=false`; this covers the other
+  half, where the user's Log/Warning/Error toggles or search text stay changed.

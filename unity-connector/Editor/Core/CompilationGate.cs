@@ -52,6 +52,10 @@ namespace UnityCliConnector
 
 		public static long LastCompileFinishedAt => s_State.finished_at_ms;
 
+		/// When the last compile the gate observed started. Heartbeat keeps a requested "compiling"
+		/// state until this moves, so a compile queued behind an import is not reported as nothing.
+		public static long LastCompileStartedAt => s_State.started_at_ms;
+
 		/// "ordinal" while a console ordinal boundary pins the last compile; "timestamp" when the
 		/// gate has to fall back to console time-of-day, which cannot separate entries a day apart.
 		public static string ConsoleFreshnessMode => s_State.boundary_known ? "ordinal" : "timestamp";
@@ -114,7 +118,18 @@ namespace UnityCliConnector
 				s_State.snapshot_max = last;
 			}
 			Save();
-			CompileProvenance.NoteCompileFinished(afterReload);
+			// Only a successful compile reloads the domain. A failed one ends here and never
+			// reaches afterAssemblyReload, so it must not leave a reload pending for the next one.
+			CompileProvenance.NoteCompileFinished(afterReload,
+				willReload: !afterReload && s_State.rebuilt && !AnyErrors());
+		}
+
+		private static bool AnyErrors()
+		{
+			foreach (var messages in ByAssembly.Values)
+				if (HasErrors(messages))
+					return true;
+			return false;
 		}
 
 		private static void ObserveConsoleRange(int first, int last)

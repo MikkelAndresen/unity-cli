@@ -50,7 +50,6 @@ namespace UnityCliConnector.Tools
 
         private const float DefaultForceWait = 60f;
         private const int DefaultLimit = 20;
-        private const float PollIntervalMs = 100f;
 
         public static async Task<object> HandleCommand(JObject parameters)
         {
@@ -200,19 +199,10 @@ namespace UnityCliConnector.Tools
         /// Bounded wait on Burst's own queue, not on Unity's script compilation. Yields instead of
         /// sleeping: the handler runs on the main thread, so blocking it would also stop the script
         /// compile whose completion IsIdle is waiting for (and freeze the heartbeat and the UI).
-        private static async Task<(bool IdleKnown, bool Idle, int WaitedMs, bool TimedOut)> WaitForIdle(BurstIntrospection burst, float waitSeconds)
+        private static Task<(bool IdleKnown, bool Idle, int WaitedMs, bool TimedOut)> WaitForIdle(
+            BurstIntrospection burst, float waitSeconds)
         {
-            var idleKnown = burst.CanQueryIdle;
-            var start = DateTime.UtcNow;
-            var deadline = start.AddSeconds(waitSeconds);
-            var idle = idleKnown && IsIdle(burst);
-            while (idleKnown && !idle && DateTime.UtcNow < deadline)
-            {
-                await Task.Delay(TimeSpan.FromMilliseconds(PollIntervalMs));
-                idle = IsIdle(burst);
-            }
-            var waited = (int)(DateTime.UtcNow - start).TotalMilliseconds;
-            return (idleKnown, idle, waited, idleKnown && !idle && waitSeconds > 0f);
+            return BurstWait.ForIdleAsync(() => burst.CanQueryIdle, () => IsIdle(burst), waitSeconds);
         }
 
         static string EagerName(BurstIntrospection.EagerState state)

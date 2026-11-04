@@ -1,3 +1,5 @@
+using System;
+using System.IO;
 using Newtonsoft.Json.Linq;
 using NUnit.Framework;
 using UnityCliConnector;
@@ -43,6 +45,100 @@ namespace UnityCliConnector.Tests
                 Heartbeat.BuildStatus("starting", false, 0, null)));
 
             Assert.AreEqual("starting", json["state"].Value<string>());
+        }
+
+        [Test]
+        public void BuildStatus_CarriesStartingSinceOnlyWhileStarting()
+        {
+            var starting = JObject.FromObject(Heartbeat.BuildStatus("starting", false, 0, null, null, 1_700_000_000_000L));
+            Assert.AreEqual(1_700_000_000_000L, starting["startingSince"].Value<long>(),
+                "status derives 'starting for <age>' from timestamp - startingSince");
+
+            var settings = new Newtonsoft.Json.JsonSerializerSettings { NullValueHandling = Newtonsoft.Json.NullValueHandling.Ignore };
+            var ready = JObject.Parse(Newtonsoft.Json.JsonConvert.SerializeObject(
+                Heartbeat.BuildStatus("ready", false, 0, null), settings));
+            Assert.IsFalse(ready.ContainsKey("startingSince"), "the stamp must not outlive the starting state");
+        }
+
+        [Test]
+        public void MarkCompileRequested_KeepsCompilingUntilTheCompileStartsOrFinishes()
+        {
+            CompilationGate.ResetForTests();
+            Heartbeat.ResetStartupForTests();
+            try
+            {
+                CompilationGate.SeedCompileClockForTests(100, 0);
+                Heartbeat.MarkCompileRequested();
+                Heartbeat.TickForTests();
+
+                Assert.AreEqual("compiling", Heartbeat.LastState,
+                    "a compile queued behind an import must not be reported as nothing_to_compile");
+
+                CompilationGate.SeedCompileClockForTests(200, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
+                Heartbeat.ResetTickIntervalForTests();
+                Heartbeat.TickForTests();
+                Assert.AreNotEqual("compiling", Heartbeat.LastState, "a finished compile releases the forced state");
+            }
+            finally
+            {
+                Heartbeat.TickForTests();
+                CompilationGate.ResetForTests();
+            }
+        }
+
+        [Test]
+        public void OnListenerStarted_WritesStartingAndTheStampBeforeTheFirstTick()
+        {
+            Heartbeat.ResetStartupForTests();
+            try
+            {
+                Heartbeat.OnListenerStarted();
+
+                var json = JObject.Parse(File.ReadAllText(Heartbeat.FilePathForTests()));
+                Assert.AreEqual("starting", json["state"].Value<string>());
+                var since = json["startingSince"].Value<long>();
+                Assert.That(since, Is.GreaterThan(0), "without a stamp the CLI cannot show how long startup has been stuck");
+                Assert.That(json["timestamp"].Value<long>(), Is.GreaterThanOrEqualTo(since));
+                Assert.AreEqual("starting", Heartbeat.LastState);
+            }
+            finally
+            {
+                Heartbeat.TickForTests();
+            }
+        }
+
+        [Test]
+        public void OnListenerStarted_AfterATickDoesNotReportStartingAgain()
+        {
+            // A domain reload re-enters OnListenerStarted; the editor has ticked before, so the
+            // reload must not make a routine compile look like a hung launch.
+            Heartbeat.ResetStartupForTests();
+            Heartbeat.MarkTickedForTests();
+            try
+            {
+                Heartbeat.OnListenerStarted();
+                Assert.AreNotEqual("starting", Heartbeat.LastState);
+            }
+            finally
+            {
+                Heartbeat.TickForTests();
+            }
+        }
+
+        [Test]
+        public void InstanceFileNameFor_StripsOnlyTheDataPathAssetsSuffix()
+        {
+            Assert.AreEqual("/Users/me/MyGame", Heartbeat.ProjectRootFromDataPath("/Users/me/MyGame/Assets"));
+            Assert.AreEqual("/Users/me/Assets/MyGame",
+                Heartbeat.ProjectRootFromDataPath("/Users/me/Assets/MyGame/Assets"),
+                "a project directory called Assets is part of the hash key");
+            Assert.AreEqual("/Users/me/MyGame",
+                Heartbeat.ProjectRootFromDataPath("/Users/me/MyGame/Assets/"),
+                "a trailing separator is the only other thing removed");
+
+            // Pins the file name the Go CLI looks for; changing the key would orphan every heartbeat.
+            Assert.AreEqual("0b6009a1027df197.json", Heartbeat.InstanceFileNameFor("/Users/me/MyGame"));
+            Assert.AreEqual("9608307a62cc0695.json", Heartbeat.InstanceFileNameFor("/Users/me/Assets/MyGame"));
         }
 
         [Test]

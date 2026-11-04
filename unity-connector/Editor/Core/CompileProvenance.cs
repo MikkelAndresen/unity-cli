@@ -46,6 +46,8 @@ namespace UnityCliConnector
             public long previous_finished_at_ms;
             public List<string> rebuilt = new();
             public bool rebuilt_truncated;
+            // Persisted because the reload that reads it wipes the statics that could hold it.
+            public bool reload_expected;
         }
 
         internal sealed class SourceScan
@@ -65,8 +67,6 @@ namespace UnityCliConnector
         {
             Load();
         }
-
-        // ─── Compilation pipeline feed (called by CompilationGate) ─────────
 
         internal static void NoteCompileStarted()
         {
@@ -92,7 +92,11 @@ namespace UnityCliConnector
         /// that call re-stamps the finish time of the compile that already updated the record —
         /// keeping this clock in step with CompilationGate.LastCompileFinishedAt, which the CLI
         /// polls from the heartbeat.</param>
-        internal static void NoteCompileFinished(bool afterReload)
+        /// <param name="willReload">true when this finish came from a compile that succeeded and
+        /// will therefore be followed by a domain reload. A reload without that flag was not a
+        /// compile's (for example one triggered by a package resolve), and moving the clock for it
+        /// would make sources written since the last real compile look covered.</param>
+        internal static void NoteCompileFinished(bool afterReload, bool willReload = false)
         {
             var now = NowMs();
             if (!afterReload || s_Record.finished_at_ms == 0)
@@ -101,13 +105,17 @@ namespace UnityCliConnector
                 s_Record.started_at_ms = s_PendingStartedMs;
                 s_Record.rebuilt = new List<string>(s_RebuiltNames);
                 s_Record.rebuilt_truncated = s_RebuiltTruncated;
+                s_Record.finished_at_ms = now;
             }
-            s_Record.finished_at_ms = now;
+            else if (s_Record.reload_expected)
+            {
+                s_Record.finished_at_ms = now;
+            }
+
+            s_Record.reload_expected = !afterReload && willReload;
             s_PendingStartedMs = 0;
             Save();
         }
-
-        // ─── Payload ──────────────────────────────────────────────────────
 
         /// The object every compile-related result carries: compile_status returns it flat, and
         /// compile_diagnostics nests it under "provenance". The Go CLI prints provenance_line and
@@ -252,8 +260,6 @@ namespace UnityCliConnector
             return ms / 60_000 + " min";
         }
 
-        // ─── Source tree scan ─────────────────────────────────────────────
-
         /// Counts .cs files written since the previous compile finished, and lists sources (.cs,
         /// .asmdef, .asmref) written after the reported compile finished. Runs on the calling thread
         /// with a wall-clock budget; the counts stay a lower bound when it runs out.
@@ -304,7 +310,9 @@ namespace UnityCliConnector
 
                     scan.scanned_files++;
                     var wroteMs = new DateTimeOffset(info.LastWriteTimeUtc).ToUnixTimeMilliseconds();
-                    if (isSource && scan.have_previous && wroteMs > previousMs) scan.changed_since_previous++;
+                    if (isSource && scan.have_previous && wroteMs > previousMs &&
+                        (finishedMs <= 0 || wroteMs <= finishedMs))
+                        scan.changed_since_previous++;
                     if (finishedMs <= 0 || wroteMs <= finishedMs) continue;
 
                     scan.stale_count++;
@@ -357,10 +365,7 @@ namespace UnityCliConnector
             roots.Add(path);
         }
 
-        static string ProjectRoot()
-        {
-            return Application.dataPath.Replace("/Assets", "");
-        }
+        static string ProjectRoot() => Heartbeat.ProjectRootFromDataPath(Application.dataPath);
 
         static string DisplayPath(string path, string projectRoot)
         {
@@ -372,8 +377,6 @@ namespace UnityCliConnector
         }
 
         static long NowMs() => DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
-
-        // ─── Persistence across the domain reload a compile ends with ─────
 
         static void Save()
         {
@@ -400,8 +403,6 @@ namespace UnityCliConnector
                 s_Record = new Record();
             }
         }
-
-        // ─── Testing hooks ────────────────────────────────────────────────
 
         internal static Record SnapshotForTests() => s_Record;
 
