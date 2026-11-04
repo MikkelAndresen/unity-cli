@@ -251,7 +251,7 @@ func ReconnectInstance(old *Instance) *Instance {
 			continue
 		}
 		if old.ProjectPath != "" {
-			if !projectMatches(inst.ProjectPath, old.ProjectPath) {
+			if !sameProject(inst.ProjectPath, old.ProjectPath) {
 				continue
 			}
 		} else if inst.Port != old.Port {
@@ -268,6 +268,13 @@ func ReconnectInstance(old *Instance) *Instance {
 
 func projectMatches(projectPath, needle string) bool {
 	return strings.Contains(filepath.ToSlash(projectPath), filepath.ToSlash(needle))
+}
+
+// sameProject compares two heartbeat project paths for identity. projectMatches answers the
+// --project substring question; reusing it here would let "/work/Game2" pass as "/work/Game"
+// and send a retry into a different editor.
+func sameProject(a, b string) bool {
+	return filepath.Clean(filepath.ToSlash(a)) == filepath.Clean(filepath.ToSlash(b))
 }
 
 // expandHome resolves a leading "~" so an agent can pass the same path shape it sees in shell.

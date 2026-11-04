@@ -93,7 +93,21 @@ func testCmd(ctx context.Context, args []string, send sendFn, port int) (*client
 	log.SetOutput(&suppressWriter{w: os.Stderr, suppress: "Unsolicited response received on idle HTTP channel"})
 	defer log.SetOutput(original)
 
-	return pollTestResults(ctx, port)
+	return pollTestResults(ctx, testResultsPort(resp, port))
+}
+
+// testResultsPort is the port the connector stamped the run with: a compile or reload between the
+// resolve before the send and the send itself can move the connector, so polling the pre-send port
+// would wait ten minutes for a result file the run never writes. Connectors that predate the port
+// in the reply fall back to the caller's port.
+func testResultsPort(resp *client.CommandResponse, fallback int) int {
+	var data struct {
+		Port int `json:"port"`
+	}
+	if len(resp.Data) > 0 && json.Unmarshal(resp.Data, &data) == nil && data.Port > 0 {
+		return data.Port
+	}
+	return fallback
 }
 
 func pollTestResults(ctx context.Context, port int) (*client.CommandResponse, error) {

@@ -291,15 +291,14 @@ type sendFn func(command string, params interface{}) (*client.CommandResponse, e
 // retrySafeCommands may be sent again after an answer was lost: they are reads or idempotent
 // diagnostics, so a second delivery cannot apply an effect twice. State-changing commands are not
 // here; those are retried only when the connection never carried the request (RequestNotDelivered).
+// The key is the command alone, so a tool with any mutating action stays out: `console --clear`
+// and `modal --action answer` apply their effect again on a resend.
 var retrySafeCommands = map[string]struct{}{
+	"api":                 {},
+	"burst_status":        {},
 	"compile_diagnostics": {},
 	"compile_status":      {},
-	"console":             {},
 	"list":                {},
-	"modal":               {},
-	"status":              {},
-	"tool_describe":       {},
-	"tools":               {},
 }
 
 // sendAfterReload makes one request against the freshest heartbeat and, when the connection died to a

@@ -451,6 +451,31 @@ func TestReconnectInstance_FollowsTheNewestLiveProjectFile(t *testing.T) {
 	}
 }
 
+func TestReconnectInstance_DoesNotFollowSiblingProjectWithSharedPrefix(t *testing.T) {
+	home := writeInstanceFiles(t, map[string]Instance{
+		"game.json": {
+			State:       "ready",
+			ProjectPath: "/projects/Game",
+			Port:        8090,
+			PID:         100,
+			Timestamp:   1000,
+		},
+		"game2.json": {
+			State:       "ready",
+			ProjectPath: "/projects/Game2",
+			Port:        8092,
+			PID:         200,
+			Timestamp:   2000,
+		},
+	})
+	t.Setenv("HOME", home)
+
+	got := ReconnectInstance(&Instance{State: "ready", ProjectPath: "/projects/Game", Port: 8090, PID: 100, Timestamp: 1000})
+	if got == nil || got.Port != 8090 {
+		t.Fatalf("ReconnectInstance = %+v, want the Game heartbeat, not the newer /projects/Game2 one", got)
+	}
+}
+
 func TestRequestNotDelivered(t *testing.T) {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
