@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Reflection;
+using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
 using UnityEditor;
 using UnityEngine;
@@ -11,6 +12,16 @@ namespace UnityCliConnector.Tools
     [UnityCliTool(Name = "console", Description = "Read or clear Unity console logs.", SkipCompilationGate = true)]
     public static class ReadConsole
     {
+        // Defaults keep a chatty editor inside one tool output: 50 of the newest entries, at most
+        // 6 stack frames each, 1 KB per entry, 15 KB of entry text in total. --full removes them.
+        // 15 KB rather than 16 KB: the CLI re-encodes the entries (indentation, \u003c escaping of
+        // the angle brackets in generic frame names), so the printed reply is a few percent larger
+        // than the entry bytes counted here.
+        private const int DefaultLines = 50;
+        private const int DefaultFrames = 6;
+        private const int DefaultEntryChars = 1000;
+        private const int DefaultMaxBytes = 15360;
+
         private static MethodInfo _startGettingEntriesMethod, _endGettingEntriesMethod, _clearMethod, _getCountMethod, _getEntryMethod;
         private static FieldInfo _modeField, _messageField, _fileField, _lineField;
         private static Type _logEntryType;
@@ -58,14 +69,55 @@ namespace UnityCliConnector.Tools
             [ToolParameter("Comma-separated log types: error, warning, log. Default: error,warning,log")]
             public string Type { get; set; }
 
-            [ToolParameter("Maximum number of log entries to return")]
+            [ToolParameter("Most recent N entries to return (0 = no limit). Default: 50")]
             public int Lines { get; set; }
 
-            [ToolParameter("Stack trace mode: none (first line), user (user code frames only), full (raw). Default: user")]
+            [ToolParameter("Stack trace mode: none (first line), user (user code frames only, engine frames collapsed), full (raw). Default: user")]
             public string Stacktrace { get; set; }
+
+            [ToolParameter("Stack frames kept per entry (0 = none, -1 = all). Default: 6")]
+            public int Frames { get; set; }
+
+            [ToolParameter("Max characters per entry before it is cut (0 = no limit). Default: 1000")]
+            public int EntryChars { get; set; }
+
+            [ToolParameter("Max total bytes of entry text in the response (0 = no limit). Default: 15360")]
+            public int MaxBytes { get; set; }
+
+            [ToolParameter("Return everything: turns off the lines/frames/entry_chars/max_bytes caps")]
+            public bool Full { get; set; }
 
             [ToolParameter("Clear console")]
             public bool Clear { get; set; }
+        }
+
+        // Caps applied to the entry list. Lines/EntryChars/MaxBytes treat 0 (or less) as "no
+        // limit", matching how an absent --lines meant unlimited before; Frames uses
+        // StackTraceFilter.UnlimitedFrames for "every frame" so that 0 can mean "no frames".
+        private readonly struct Limits
+        {
+            public readonly int Lines;
+            public readonly int Frames;
+            public readonly int EntryChars;
+            public readonly int MaxBytes;
+
+            public Limits(int lines, int frames, int entryChars, int maxBytes)
+            {
+                Lines = Math.Max(0, lines);
+                Frames = frames;
+                EntryChars = Math.Max(0, entryChars);
+                MaxBytes = Math.Max(0, maxBytes);
+            }
+
+            public static Limits Resolve(ToolParams p, bool full)
+            {
+                if (full) return new Limits(0, StackTraceFilter.UnlimitedFrames, 0, 0);
+                return new Limits(
+                    p.GetInt("lines") ?? p.GetInt("count") ?? DefaultLines,
+                    p.GetInt("frames") ?? DefaultFrames,
+                    p.GetInt("entry_chars") ?? DefaultEntryChars,
+                    p.GetInt("max_bytes") ?? DefaultMaxBytes);
+            }
         }
 
         public static object HandleCommand(JObject @params)
@@ -90,15 +142,20 @@ namespace UnityCliConnector.Tools
             var type = p.Get("type", "error,warning,log").ToLower();
             var types = type.Split(',').Select(t => t.Trim()).Where(t => t.Length > 0).ToList();
 
-            int? count = p.GetInt("lines") ?? p.GetInt("count");
-            string stacktrace = p.Get("stacktrace", "user").ToLower();
+            if (!StackTraceFilter.TryParseMode(p.Get("stacktrace", "user"), out var mode))
+                return new ErrorResponse("Unknown stacktrace mode. Use none, user, or full.");
 
-            return GetEntries(types, count, stacktrace);
+            return GetEntries(types, mode, Limits.Resolve(p, p.GetBool("full")));
         }
 
-        private static object GetEntries(List<string> types, int? count, string stacktrace)
+        private static object GetEntries(List<string> types, StackTraceFilter.StacktraceMode mode, Limits limits)
         {
-            var entries = new List<string>();
+            var matched = new List<int>();
+            var texts = new List<string>();
+            int lineLimitedCount = 0;
+            bool cutByBytes = false;
+            int framesOmitted = 0, framesOverCap = 0, charsOmitted = 0, bytes = 0;
+
             try
             {
                 _startGettingEntriesMethod.Invoke(null, null);
@@ -108,20 +165,40 @@ namespace UnityCliConnector.Tools
                 for (int i = 0; i < total; i++)
                 {
                     _getEntryMethod.Invoke(null, new object[] { i, logEntry });
-                    int mode = (int)_modeField.GetValue(logEntry);
+                    int entryMode = (int)_modeField.GetValue(logEntry);
                     string message = (string)_messageField.GetValue(logEntry);
                     if (string.IsNullOrEmpty(message)) continue;
 
-                    LogType logType = GetLogTypeFromMode(mode);
+                    LogType logType = GetLogTypeFromMode(entryMode);
                     bool want = logType == LogType.Exception || logType == LogType.Assert
                         ? types.Contains("error")
                         : types.Contains(logType.ToString().ToLowerInvariant());
 
-                    if (!want) continue;
+                    if (want) matched.Add(i);
+                }
 
-                    entries.Add(FormatMessage(message, stacktrace));
+                // The console is read oldest-first, but a flood is only interesting at its tail: the
+                // caps keep the most recent entries, so they are formatted newest-first and older ones
+                // are dropped by the line and byte budgets without being shaped at all.
+                lineLimitedCount = limits.Lines > 0 ? Math.Min(matched.Count, limits.Lines) : matched.Count;
+                int lineStart = matched.Count - lineLimitedCount;
+                for (int k = matched.Count - 1; k >= lineStart; k--)
+                {
+                    _getEntryMethod.Invoke(null, new object[] { matched[k], logEntry });
+                    string message = (string)_messageField.GetValue(logEntry);
+                    var formatted = StackTraceFilter.Format(message, mode, limits.Frames, limits.EntryChars);
+                    framesOmitted += formatted.FramesOmitted;
+                    framesOverCap += formatted.FramesOverCap;
+                    charsOmitted += formatted.CharsOmitted;
 
-                    if (count.HasValue && entries.Count >= count.Value) break;
+                    int cost = JsonConvert.ToString(formatted.Text).Length;
+                    if (limits.MaxBytes > 0 && texts.Count > 0 && bytes + cost > limits.MaxBytes)
+                    {
+                        cutByBytes = true;
+                        break;
+                    }
+                    bytes += cost;
+                    texts.Add(formatted.Text);
                 }
             }
             finally
@@ -129,37 +206,37 @@ namespace UnityCliConnector.Tools
                 try { _endGettingEntriesMethod.Invoke(null, null); } catch { }
             }
 
-            return new SuccessResponse($"Retrieved {entries.Count} entries.", entries);
-        }
+            texts.Reverse();
 
-        private static string FormatMessage(string message, string mode)
-        {
-            switch (mode)
+            var truncatedBy = new List<string>();
+            if (matched.Count > lineLimitedCount) truncatedBy.Add("lines");
+            if (cutByBytes) truncatedBy.Add("bytes");
+            if (framesOverCap > 0) truncatedBy.Add("frames");
+            if (charsOmitted > 0) truncatedBy.Add("chars");
+
+            string summary = truncatedBy.Count == 0
+                ? $"Retrieved {texts.Count} entries."
+                : $"Retrieved {texts.Count} of {matched.Count} entries (cut by {string.Join(",", truncatedBy)}): pass --full for everything.";
+
+            return new SuccessResponse(summary, new
             {
-                case "full":
-                    return message;
-
-                case "user":
-                    var lines = message.Split(new[] { '\n', '\r' }, StringSplitOptions.RemoveEmptyEntries);
-                    var sb = new System.Text.StringBuilder();
-                    foreach (var line in lines)
-                    {
-                        // Skip Unity/system internal frames
-                        if (line.Contains("UnityEngine.Debug:") ||
-                            line.Contains("UnityEditor.EditorGUIUtility:") ||
-                            line.Contains("Unity.Entities.SystemState:") ||
-                            line.Contains("(at Library/") ||
-                            line.Contains("(at ./Library/"))
-                            continue;
-                        if (sb.Length > 0) sb.Append('\n');
-                        sb.Append(line);
-                    }
-                    return sb.ToString();
-
-                default: // "none"
-                    string[] firstLine = message.Split(new[] { '\n', '\r' }, StringSplitOptions.RemoveEmptyEntries);
-                    return firstLine.Length > 0 ? firstLine[0] : message;
-            }
+                entries = texts,
+                entries_total = matched.Count,
+                entries_returned = texts.Count,
+                entries_omitted = matched.Count - texts.Count,
+                frames_omitted = framesOmitted,
+                chars_omitted = charsOmitted,
+                truncated = truncatedBy.Count > 0,
+                truncated_by = truncatedBy,
+                limits = new
+                {
+                    lines = limits.Lines,
+                    frames = limits.Frames,
+                    entry_chars = limits.EntryChars,
+                    max_bytes = limits.MaxBytes,
+                    stacktrace = StackTraceFilter.ModeName(mode),
+                },
+            });
         }
 
         private const int ErrorMask =

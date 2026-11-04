@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -22,6 +23,7 @@ type fakeEditor struct {
 	stuckState    string                 // heartbeat state while polling (default "ready")
 	diagnostics   map[bool][]interface{} // compile_diagnostics by source_tree_only; nil: tool unknown (old connector)
 	console       []string               // console error entries (old-connector fallback)
+	consoleCapped bool                   // console reply wraps the entries in the capped object
 	tests         map[string]interface{} // run_tests summary; nil: tests not expected
 	testsSuccess  bool
 	testsMessage  string
@@ -50,6 +52,14 @@ func (f *fakeEditor) send(command string, params interface{}) (*client.CommandRe
 	case "console":
 		if p["clear"] == true {
 			return &client.CommandResponse{Success: true, Message: "Console cleared."}, nil
+		}
+		if f.consoleCapped {
+			return &client.CommandResponse{Success: true, Data: data(map[string]interface{}{
+				"entries":          f.console,
+				"entries_total":    len(f.console),
+				"entries_returned": len(f.console),
+				"truncated":        false,
+			})}, nil
 		}
 		return &client.CommandResponse{Success: true, Data: data(f.console)}, nil
 	case "refresh_unity":
@@ -223,6 +233,41 @@ func TestVerify_OldConnectorFallsBackToConsoleErrors(t *testing.T) {
 	want := "compile: 1 error(s) (connector < 0.7.0: console errors shown)\n  Assets/Foo.cs(1,1): error CS0103: x\n"
 	if out != want {
 		t.Errorf("output = %q, want %q", out, want)
+	}
+}
+
+func TestVerify_CappedConnectorConsoleErrorsAreReadFromEntries(t *testing.T) {
+	f := &fakeEditor{t: t, compileErrors: true, consoleCapped: true,
+		console: []string{"Assets/Foo.cs(1,1): error CS0103: x\nat stack"}}
+	code, out := f.run()
+	if code != verifyFailed {
+		t.Fatalf("exit = %d, want 1", code)
+	}
+	want := "compile: 1 error(s) (connector < 0.7.0: console errors shown)\n  Assets/Foo.cs(1,1): error CS0103: x\n"
+	if out != want {
+		t.Errorf("output = %q, want %q", out, want)
+	}
+}
+
+func TestConsoleEntryMessages(t *testing.T) {
+	tests := []struct {
+		name string
+		data string
+		want []string
+	}{
+		{"bare array", `["a","b"]`, []string{"a", "b"}},
+		{"capped object", `{"entries":["a","b"],"truncated":true}`, []string{"a", "b"}},
+		{"capped object without entries", `{"entries":[],"truncated":true}`, []string{}},
+		{"empty", ``, nil},
+		{"unreadable", `not json`, nil},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := consoleEntryMessages([]byte(tt.data))
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("entries = %v, want %v", got, tt.want)
+			}
+		})
 	}
 }
 
