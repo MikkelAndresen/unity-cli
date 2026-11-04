@@ -210,3 +210,57 @@ func TestFormatAge(t *testing.T) {
 		}
 	}
 }
+
+func TestEditorEvidence_HeartbeatThisSession(t *testing.T) {
+	beat := time.Now().Add(-10 * time.Minute).Truncate(time.Millisecond)
+
+	tests := []struct {
+		name       string
+		lockfileAt time.Time
+		hasLock    bool
+		want       bool
+	}{
+		{name: "heartbeat after the lockfile", lockfileAt: beat.Add(-8 * time.Hour), hasLock: true, want: true},
+		{name: "heartbeat at the lockfile stamp counts as this session", lockfileAt: beat, hasLock: true, want: true},
+		{name: "heartbeat before the lockfile is a previous session", lockfileAt: beat.Add(time.Hour), hasLock: true},
+		{name: "no lockfile to compare", hasLock: false, want: true},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ev := &EditorEvidence{
+				StaleHeartbeat: &Instance{Timestamp: beat.UnixMilli()},
+				LockfileMTime:  tc.lockfileAt,
+			}
+			if tc.hasLock {
+				ev.LockfilePath = "/project/Temp/UnityLockfile"
+			}
+			if got := ev.HeartbeatThisSession(); got != tc.want {
+				t.Errorf("HeartbeatThisSession(): got %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestEditorEvidence_AnyHeartbeatThisSessionButNotSilent(t *testing.T) {
+	lockfileAt := time.Now().Add(-8 * time.Hour).Truncate(time.Millisecond)
+	newer := &Instance{Timestamp: time.Now().Truncate(time.Millisecond).UnixMilli()}
+	older := &Instance{Timestamp: lockfileAt.Add(-time.Hour).UnixMilli()}
+
+	ev := &EditorEvidence{
+		LockfilePath:     "/project/Temp/UnityLockfile",
+		LockfileMTime:    lockfileAt,
+		SessionHeartbeat: newer,
+	}
+	if !ev.HeartbeatThisSession() {
+		t.Error("a fresh or stopped heartbeat after the lockfile is still this session")
+	}
+	if ev.SilentHeartbeatThisSession() {
+		t.Error("without a silent heartbeat there is nothing to call unresponsive")
+	}
+
+	ev.SessionHeartbeat = older
+	if ev.HeartbeatThisSession() {
+		t.Error("a heartbeat from before the lockfile belongs to the previous session")
+	}
+}

@@ -98,7 +98,7 @@ func TestAnnotateNoEditor_StaleLockfileIsFlagged(t *testing.T) {
 	}
 }
 
-func TestAnnotateNoEditor_StaleHeartbeatWithoutLockfile(t *testing.T) {
+func TestAnnotateNoEditor_StaleHeartbeatWithoutLockfileIsUnresponsive(t *testing.T) {
 	project := t.TempDir()
 	writeInstanceFile(t, client.Instance{
 		State:       "compiling",
@@ -110,17 +110,110 @@ func TestAnnotateNoEditor_StaleHeartbeatWithoutLockfile(t *testing.T) {
 
 	msg := annotateNoEditor(errors.New("no active instance on port 8090"), "", 8090).Error()
 	for _, want := range []string{
-		"editor_starting_or_blocked",
-		"connector stopped answering",
-		"heartbeat last seen 4m0s ago",
+		"editor_unresponsive",
+		"stopped answering 4m0s ago",
 		"no active instance on port 8090",
+		"unity-restart",
 	} {
 		if !strings.Contains(msg, want) {
 			t.Errorf("message missing %q:\n%s", want, msg)
 		}
 	}
+	if strings.Contains(msg, "editor_starting_or_blocked") {
+		t.Errorf("a loaded connector must not read as startup:\n%s", msg)
+	}
 	if !strings.Contains(msg, "none at "+filepath.Join(project, "Temp", "UnityLockfile")) {
 		t.Errorf("expected the missing lockfile path:\n%s", msg)
+	}
+}
+
+// TestAnnotateNoEditor_OldLockfileWithSessionHeartbeatIsUnresponsive pins the live misreading: an
+// editor open for hours is not a crash, and a heartbeat written after its lockfile proves the
+// connector loaded this session and then went silent.
+func TestAnnotateNoEditor_OldLockfileWithSessionHeartbeatIsUnresponsive(t *testing.T) {
+	isolatedHome(t)
+	dir := openUnityProjectDir(t, 8*time.Hour)
+	writeInstanceFile(t, client.Instance{
+		State:       "ready",
+		ProjectPath: dir,
+		Port:        8090,
+		PID:         65279,
+		Timestamp:   time.Now().Add(-16 * time.Minute).UnixMilli(),
+	})
+
+	msg := annotateNoEditor(errors.New("no active instance on port 8090"), "", 8090).Error()
+	for _, want := range []string{
+		"editor_unresponsive",
+		"stopped answering 16m0s ago",
+		"pid 65279",
+		`last state "ready"`,
+		"unity-cli dialogs",
+		"unity-restart",
+	} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("message missing %q:\n%s", want, msg)
+		}
+	}
+	for _, unwanted := range []string{
+		"editor_starting_or_blocked",
+		"probably crashed",
+		"connector has not loaded",
+	} {
+		if strings.Contains(msg, unwanted) {
+			t.Errorf("message must not contain %q for a loaded connector:\n%s", unwanted, msg)
+		}
+	}
+}
+
+// TestAnnotateNoEditor_AnySessionHeartbeatSuppressesCrashHint covers the heartbeats that are not
+// "silent": fresh or cleanly stopped, but still written this session. They prove the connector
+// loaded, so the old lockfile must not be read as a crash.
+func TestAnnotateNoEditor_AnySessionHeartbeatSuppressesCrashHint(t *testing.T) {
+	for _, state := range []string{"ready", "stopped"} {
+		t.Run(state, func(t *testing.T) {
+			isolatedHome(t)
+			dir := openUnityProjectDir(t, 6*time.Hour)
+			writeInstanceFile(t, client.Instance{
+				State:       state,
+				ProjectPath: dir,
+				Port:        8090,
+				PID:         os.Getpid(),
+				Timestamp:   time.Now().UnixMilli(),
+			})
+
+			msg := annotateNoEditor(errors.New("no active instance on port 8090"), "", 8090).Error()
+			if strings.Contains(msg, "probably crashed") {
+				t.Errorf("a %q heartbeat this session rules out the lockfile crash hint:\n%s", state, msg)
+			}
+		})
+	}
+}
+
+// TestAnnotateNoEditor_OldLockfileWithOlderHeartbeatIsStartup covers a restart: the heartbeat on
+// disk belongs to the previous session, so the lockfile age may still hint at a crash.
+func TestAnnotateNoEditor_OldLockfileWithOlderHeartbeatIsStartup(t *testing.T) {
+	isolatedHome(t)
+	dir := openUnityProjectDir(t, 6*time.Hour)
+	writeInstanceFile(t, client.Instance{
+		State:       "ready",
+		ProjectPath: dir,
+		Port:        8090,
+		PID:         65279,
+		Timestamp:   time.Now().Add(-8 * time.Hour).UnixMilli(),
+	})
+
+	msg := annotateNoEditor(errors.New("no active instance on port 8090"), "", 8090).Error()
+	for _, want := range []string{
+		"editor_starting_or_blocked",
+		"probably crashed",
+		"connector has not loaded",
+	} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("message missing %q:\n%s", want, msg)
+		}
+	}
+	if strings.Contains(msg, editorUnresponsiveState) {
+		t.Errorf("a heartbeat from before the lockfile must not count as this session:\n%s", msg)
 	}
 }
 
@@ -160,5 +253,26 @@ func TestStaleHeartbeatReport_AddsEvidenceLine(t *testing.T) {
 	}
 	if !strings.Contains(got, "editor_starting_or_blocked") {
 		t.Errorf("expected the evidence line:\n%s", got)
+	}
+}
+
+func TestStaleHeartbeatReport_AfterSessionHeartbeatSaysUnresponsive(t *testing.T) {
+	isolatedHome(t)
+	dir := openUnityProjectDir(t, time.Hour)
+	writeInstanceFile(t, client.Instance{
+		State:       "ready",
+		ProjectPath: dir,
+		Port:        8090,
+		PID:         65279,
+		Timestamp:   time.Now().Add(-20 * time.Minute).UnixMilli(),
+	})
+	ev := client.FindEditorEvidence(dir, 8090)
+
+	got := staleHeartbeatReport(&client.Instance{Port: 8090, ProjectPath: dir}, 20*time.Minute, ev)
+	if !strings.Contains(got, editorUnresponsiveState) {
+		t.Errorf("expected the unresponsive state:\n%s", got)
+	}
+	if strings.Contains(got, "probably crashed") {
+		t.Errorf("a heartbeat this session rules out the lockfile crash hint:\n%s", got)
 	}
 }

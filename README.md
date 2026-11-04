@@ -909,9 +909,15 @@ AppleScript and System Events (Accessibility), so it works with no connector and
 It runs only on macOS; on any other system it says so and tells you to run it on the host, because
 an agent sandbox is granted no Accessibility permission.
 
-When no heartbeat answers but the project's `Temp/UnityLockfile` (or a heartbeat that went silent)
-says an editor is open, every command reports the state `editor_starting_or_blocked` instead of
-"no Unity instance found", naming the evidence and its age:
+When no heartbeat answers but the project's `Temp/UnityLockfile` says an editor is open, every
+command names which situation it is instead of saying "no Unity instance found":
+
+- `editor_starting_or_blocked` — the lockfile exists but no heartbeat newer than it, so the connector
+  never loaded this session. The editor is still importing/compiling, or a startup dialog (license,
+  safe mode, "project already open", package resolution) is waiting.
+- `editor_unresponsive` — a heartbeat written this session exists but went silent. The connector
+  did load, then stopped answering: the main thread is likely blocked by a long exec/build/import, a
+  modal dialog is open, or the editor hung.
 
 ```
 editor_starting_or_blocked: Unity appears open for /Users/me/Work/MyGame (Temp/UnityLockfile, age 42s)
@@ -920,7 +926,18 @@ safe mode, "project already open", package resolution) is waiting.
   Lockfile: /Users/me/Work/MyGame/Temp/UnityLockfile (written 2026-11-04T04:26:32Z)
   Next:     run 'unity-cli dialogs' on the macOS host to read the dialog's title and buttons,
             or ask the user to look at the editor.
+
+editor_unresponsive: Unity's connector for /Users/me/Work/MyGame stopped answering 16m0s ago, pid 65279
+(last state "ready") — the main thread is likely blocked (long exec/build/import), a modal dialog is
+open, or the editor hung.
+  Next:     try 'unity-cli dialogs' on the macOS host; if it stays silent, restart the editor
+            ('unity-restart' in agent-sandbox).
 ```
+
+`Temp/UnityLockfile` is written once when Unity opens the project, so its age is the length of the
+session, not evidence of a crash. The CLI only hints "probably crashed" from an old lockfile when no
+heartbeat from that session exists; once a heartbeat postdates the lockfile, a silence is reported as
+`editor_unresponsive` instead.
 
 Windows are narrowed to the requested project by matching the project folder name in the window
 title; when nothing matches, every Unity window is listed, because startup dialogs rarely name the
@@ -985,7 +1002,7 @@ unity-cli status
 #   PID:     12345
 ```
 
-The CLI also checks Unity's state automatically before sending any command. If Unity is busy (compiling, reloading), it waits for Unity to become responsive. If a modal dialog is open (state `modal`), it fails immediately and shows the dialog; see [Modal Dialogs](#modal-dialogs-macos). If a player build has the main thread (state `building`), the job id, phase and elapsed time are printed with it; see [Build a Player](#build-a-player-long-running). If nothing answers but the project looks open (`Temp/UnityLockfile`, or a heartbeat that went silent), the state is `editor_starting_or_blocked`; see [Startup Dialogs](#startup-dialogs-macos-host). If the editor's process died instead, the state is `crashed`; see [Editor Crashes](#editor-crashes).
+The CLI also checks Unity's state automatically before sending any command. If Unity is busy (compiling, reloading), it waits for Unity to become responsive. If a modal dialog is open (state `modal`), it fails immediately and shows the dialog; see [Modal Dialogs](#modal-dialogs-macos). If a player build has the main thread (state `building`), the job id, phase and elapsed time are printed with it; see [Build a Player](#build-a-player-long-running). If nothing answers but the project looks open, the state names why: `editor_starting_or_blocked` when the connector never loaded this session, `editor_unresponsive` when a heartbeat from this session stopped answering; see [Startup Dialogs](#startup-dialogs-macos-host). If the editor's process died instead, the state is `crashed`; see [Editor Crashes](#editor-crashes).
 
 ### Editor Crashes
 

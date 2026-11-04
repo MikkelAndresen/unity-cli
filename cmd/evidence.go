@@ -15,16 +15,24 @@ import (
 // in-editor modal handler is not running yet, so the CLI must speak from on-disk evidence.
 const editorStartingState = "editor_starting_or_blocked"
 
+// editorUnresponsiveState names a different failure from startup: the connector loaded this
+// session, then stopped answering. The distinction decides whether an agent waits for a startup
+// dialog or looks for a wedged main thread.
+const editorUnresponsiveState = "editor_unresponsive"
+
 // startupDialogCauses is what an agent is told to consider, in the order an agent can act on them.
 const startupDialogCauses = `a startup dialog (license, safe mode, "project already open", package resolution) is waiting`
 
 // staleLockfileAge is when a Temp/UnityLockfile stops reading as "Unity is starting" and starts
-// reading as "Unity died". A cold import of a large project stays well under this.
+// reading as "Unity died". A cold import of a large project stays well under this. The lockfile is
+// written once at editor start, so its age is the session age; this only applies when no heartbeat
+// this session proves the connector loaded.
 const staleLockfileAge = 2 * time.Hour
 
-// annotateNoEditor turns a "no Unity instance" failure into editor_starting_or_blocked when the
-// disk shows an editor open for the target. Without that evidence the original message stands:
-// it is the right answer for a project that is simply not open.
+// annotateNoEditor turns a "no Unity instance" failure into editor_starting_or_blocked (or
+// editor_unresponsive after a connector loaded this session) when the disk shows an editor open
+// for the target. Without that evidence the original message stands: it is the right answer for a
+// project that is simply not open.
 //
 // A crash is checked first because it outranks the starting-or-blocked reading: both have a silent
 // heartbeat, and only one of them is worth waiting for.
@@ -54,6 +62,14 @@ func evidenceSentence(ev *client.EditorEvidence) string {
 	if project == "" {
 		project = "this project"
 	}
+	if ev.SilentHeartbeatThisSession() {
+		pid := ""
+		if ev.StaleHeartbeat.PID > 0 {
+			pid = fmt.Sprintf(", pid %d", ev.StaleHeartbeat.PID)
+		}
+		return fmt.Sprintf("%s: Unity's connector for %s stopped answering %s ago%s (last state %q) — the main thread is likely blocked (long exec/build/import), a modal dialog is open, or the editor hung.",
+			editorUnresponsiveState, project, client.FormatAge(ev.StaleBeatAge), pid, ev.StaleHeartbeat.State)
+	}
 	if ev.LockfilePath != "" {
 		return fmt.Sprintf("%s: Unity appears open for %s (%s) but the connector has not loaded — it is still importing/compiling, or %s.",
 			editorStartingState, project, ev.Summary(), startupDialogCauses)
@@ -64,6 +80,9 @@ func evidenceSentence(ev *client.EditorEvidence) string {
 
 // evidenceHint is the one-line form, for paths that already print their own message.
 func evidenceHint(ev *client.EditorEvidence) string {
+	if ev.SilentHeartbeatThisSession() {
+		return fmt.Sprintf("%s Try 'unity-cli dialogs' on the macOS host; if it stays silent, restart the editor ('unity-restart' in agent-sandbox).", evidenceSentence(ev))
+	}
 	return fmt.Sprintf("%s Run 'unity-cli dialogs' on the macOS host, or ask the user.", evidenceSentence(ev))
 }
 
@@ -76,7 +95,7 @@ func evidenceReport(ev *client.EditorEvidence, discovery error) string {
 
 	if ev.LockfilePath != "" {
 		fmt.Fprintf(&b, "  Lockfile: %s (written %s)\n", ev.LockfilePath, ev.LockfileMTime.UTC().Format(time.RFC3339))
-		if ev.LockfileAge > staleLockfileAge {
+		if ev.LockfileAge > staleLockfileAge && !ev.HeartbeatThisSession() {
 			fmt.Fprintf(&b, "            older than %s: Unity probably crashed instead of quitting\n", staleLockfileAge)
 		}
 	} else if ev.ProjectPath != "" {
@@ -90,6 +109,10 @@ func evidenceReport(ev *client.EditorEvidence, discovery error) string {
 	if discovery != nil {
 		fmt.Fprintf(&b, "  Lookup:   %s\n", strings.ReplaceAll(discovery.Error(), "\n", " "))
 	}
-	b.WriteString("  Next:     run 'unity-cli dialogs' on the macOS host to read the dialog's title and buttons, or ask the user to look at the editor.")
+	if ev.SilentHeartbeatThisSession() {
+		b.WriteString("  Next:     try 'unity-cli dialogs' on the macOS host; if it stays silent, restart the editor ('unity-restart' in agent-sandbox).")
+	} else {
+		b.WriteString("  Next:     run 'unity-cli dialogs' on the macOS host to read the dialog's title and buttons, or ask the user to look at the editor.")
+	}
 	return b.String()
 }
