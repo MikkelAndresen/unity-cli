@@ -86,7 +86,14 @@ namespace UnityCliConnector
 		///
 		/// Prefer this over scraping Editor.log: the log is append-only, so a fixed
 		/// error's lines linger in the file long after a clean recompile.
+		///
+		/// Diagnostics the agent can act on get a `hint` (see <see cref="CompileHints"/>):
+		/// the closest real members/types, bounded by <paramref name="hintBudgetMs"/> for the
+		/// whole call, not per diagnostic. A negative budget means "no hints at all".
 		public static IReadOnlyList<ConsoleLogEntries.CompileDiag> GetLiveDiagnostics(bool includeWarnings = false)
+			=> GetLiveDiagnostics(includeWarnings, CompileHints.DefaultBudgetMs);
+
+		public static IReadOnlyList<ConsoleLogEntries.CompileDiag> GetLiveDiagnostics(bool includeWarnings, int hintBudgetMs)
 		{
 			var result = new List<ConsoleLogEntries.CompileDiag>();
 			var seen = new HashSet<string>();
@@ -123,7 +130,26 @@ namespace UnityCliConnector
 					if (seen.Add(DedupKey(d.File, d.Line, d.Col)))
 						result.Add(d);
 
+			AttachHints(result, hintBudgetMs);
 			return result;
+		}
+
+		/// Hints for the codes an agent can act on: a member or type it could not find, an API that
+		/// is obsolete. One budget for the whole call; the lookups behind a hint are cached per
+		/// domain, so the repeat verifies of a fix loop pay nothing.
+		private static void AttachHints(List<ConsoleLogEntries.CompileDiag> diags, int hintBudgetMs)
+		{
+			if (hintBudgetMs < 0) return;
+			var budget = new Deadline(hintBudgetMs);
+			for (var i = 0; i < diags.Count; i++)
+			{
+				if (!string.IsNullOrEmpty(diags[i].Hint)) continue;
+				var hint = CompileHints.ForDiagnostic(diags[i].Code, diags[i].Message, budget);
+				if (string.IsNullOrEmpty(hint)) continue;
+				var diag = diags[i];
+				diag.Hint = hint;
+				diags[i] = diag;
+			}
 		}
 
 		private static List<object> CollectErrors()

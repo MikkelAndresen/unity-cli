@@ -491,6 +491,18 @@ Tests:
   test --auto-save-scenes         Save dirty open scenes before running tests
   test --assembly <a,b>           Only tests in these assemblies
 
+API lookup (reflection over the assemblies the editor loaded):
+  api <Type>                  Kind, namespace, assembly, base, interfaces, member summary
+  api <Type>.<Member>         Every overload with its C# signature (params, generics, constraints)
+  api <Type> --assembly <a>   Only assemblies whose name contains <a>
+  api <Type> --docs           Add the XML doc <summary> where Unity ships the doc file
+
+  Examples:
+    api Vector3.Lerp
+    api EditorApplication.isCompiling
+    api List.Add --limit 5
+    api UnityEngine.Object.FindObjectOfType --docs
+
 Verify (compile + tests, brief output for agents):
   verify                          Compile, list errors in your code, run EditMode tests
   verify --no-tests               Stop after the compile
@@ -506,6 +518,11 @@ Wait / compile provenance (what a result covers):
   Every compile result carries one provenance line:
     compiled 14:02:11 (3 s ago, took 2.2 s) · 1 source file changed since previous compile · rebuilt: Game.Tests.Editor
     stale: Assets/Foo.cs modified after this compile — run verify again
+
+  An error that names something the compiler could not find, or an API that is obsolete, prints a
+  hint under it with the closest real answer from the loaded assemblies:
+    Assets/Foo.cs:12:9 CS1061 'Transform' does not contain a definition for 'positon' ...
+      hint: closest: Transform.position, Transform.localPosition, Rigidbody.position
 
 Build (long-running; the editor stays observable while it runs):
   build --profile <name> --output <path>      Start a player build job, watch progress, exit 0/1
@@ -919,8 +936,11 @@ brief enough for an agent's context:
   1. Clears the console (a Burst error stays there after its code changes;
      Burst logs a live one again on the next compile). --keep-console skips it.
   2. Refreshes assets, compiles, and waits for it to finish.
-  3. Lists this compile's errors in your code as file:line:col CODE message.
-     Errors in Library/ or PackageCache/ are listed only when nothing else is.
+  3. Lists this compile's errors in your code as file:line:col CODE message. An error that names a
+     member or type the compiler could not find, or an API that is obsolete (CS0117, CS1061, CS0246,
+     CS0234, CS0619, CS0618), prints an indented 'hint:' line under it with the closest real
+     members/types, or the replacement the obsolete notice points at. Errors in Library/ or
+     PackageCache/ are listed only when nothing else is.
   4. Asks Burst (burst_status) whether it is still compiling, what compiled, and
      what failed, waiting up to --burst-wait seconds. Burst errors print the same
      way as compile errors and fail verify. --no-burst skips the step; projects
@@ -1151,6 +1171,44 @@ Examples:
   unity-cli wait --compile --timeout 120
   unity-cli wait --json
   unity-cli editor refresh --compile && unity-cli wait --compile
+`)
+	case "api":
+		fmt.Print(`Usage: unity-cli api <Type>[.<Member>] [options]
+
+What the API actually is, read off the assemblies the editor has loaded — the same set
+the project's code compiles against. Text search over Library/PackageCache disagrees with
+what compiled (hashed folders, stubs, #if branches); reflection cannot.
+
+  api Vector3                 kind, namespace, assembly, base type, interfaces, member counts
+  api Vector3.Lerp            every overload, as C#: modifiers, generics + constraints,
+                              ref/out/in/params, return type
+  api EditorApplication       a bounded member summary (all members are counted, not listed)
+  api List.Add                the member reading: last '.' splits type from member
+
+Type queries accept the simple name, the full name, and either spelling of a generic
+(BufferLookup, BufferLookup<T>, or the reflection spelling with its arity suffix). When
+several types match, all of them are described, best match first, up to --max_types.
+
+[Obsolete] members report the message, whether it is an error, and the replacement when the
+notice names one ("Use X instead", "(UnityUpgradable) -> X").
+
+Options:
+  --assembly <a,b>   Only assemblies whose name contains one of these (comma-separated)
+  --docs             Add the XML doc <summary> for the type and each member, when a doc .xml
+                     sits next to the assembly (Unity ships one for its own modules; other
+                     assemblies usually do not, and missing docs print nothing)
+  --limit <n>        Max members listed per type (default 20)
+  --max_types <n>    Max types to describe when several match (default 5)
+  --budget <ms>      How long the assembly scan may take (default 1500)
+
+The index is built lazily and cached per domain; 'index.complete: false' means the budget ran
+out and some assemblies are not searchable yet — raise --budget or ask again.
+
+Examples:
+  unity-cli api Vector3.Lerp
+  unity-cli api EditorApplication.isCompiling
+  unity-cli api UnityEngine.Object.FindObjectOfType --docs
+  unity-cli api GetSingletonBuffer --assembly Entities
 `)
 	case "compile_status":
 		fmt.Print(`Usage: unity-cli compile_status [--scan false] [--scan_budget <ms>]

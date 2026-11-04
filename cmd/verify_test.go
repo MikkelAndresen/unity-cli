@@ -177,6 +177,57 @@ func TestVerify_CompileErrorsAreListedAndTestsSkipped(t *testing.T) {
 	}
 }
 
+// The connector answers a missing member/type or an obsolete API with the closest real answer;
+// verify prints it under the error, because reading it is cheaper than going looking for it.
+func TestVerify_HintsPrintIndentedUnderTheirError(t *testing.T) {
+	errs := []interface{}{
+		map[string]interface{}{
+			"file": "Assets/Foo.cs", "line": 12, "col": 9, "severity": "error", "code": "CS1061",
+			"message": "'Transform' does not contain a definition for 'positon'",
+			"hint":    "closest: Transform.position, Transform.localPosition",
+		},
+		map[string]interface{}{
+			"file": "Assets/Foo.cs", "line": 13, "col": 3, "severity": "error", "code": "CS0619",
+			"message": "'Object.GetInstanceID()' is obsolete: 'Use GetEntityId instead.'",
+			"hint":    "use UnityEngine.Object.GetEntityId()",
+		},
+		map[string]interface{}{
+			"file": "Assets/Foo.cs", "line": 14, "col": 20, "severity": "error", "code": "CS0103",
+			"message": "The name 'speed' does not exist in the current context",
+		},
+	}
+	f := &fakeEditor{t: t, compileErrors: true, diagnostics: map[bool][]interface{}{true: errs, false: errs}}
+	code, out := f.run()
+	if code != verifyFailed {
+		t.Fatalf("exit = %d, want 1", code)
+	}
+	want := "compile: 3 error(s)\n" +
+		"  Assets/Foo.cs:12:9 CS1061 'Transform' does not contain a definition for 'positon'\n" +
+		"    hint: closest: Transform.position, Transform.localPosition\n" +
+		"  Assets/Foo.cs:13:3 CS0619 'Object.GetInstanceID()' is obsolete: 'Use GetEntityId instead.'\n" +
+		"    hint: use UnityEngine.Object.GetEntityId()\n" +
+		"  Assets/Foo.cs:14:20 CS0103 The name 'speed' does not exist in the current context\n"
+	if out != want {
+		t.Errorf("output =\n%s\nwant\n%s", out, want)
+	}
+}
+
+func TestVerify_HintSurvivesTheJSONReport(t *testing.T) {
+	errs := []interface{}{map[string]interface{}{
+		"file": "Assets/Foo.cs", "line": 12, "col": 9, "severity": "error", "code": "CS0246",
+		"message": "The type or namespace name 'Vectr3' could not be found",
+		"hint":    "closest types: UnityEngine.Vector3 (UnityEngine.CoreModule)",
+	}}
+	f := &fakeEditor{t: t, compileErrors: true, diagnostics: map[bool][]interface{}{true: errs, false: errs}}
+	code, out := f.run("--json")
+	if code != verifyFailed {
+		t.Fatalf("exit = %d, want 1", code)
+	}
+	if !strings.Contains(out, `"hint":"closest types: UnityEngine.Vector3 (UnityEngine.CoreModule)"`) {
+		t.Errorf("json = %s, want the hint kept under the error", out)
+	}
+}
+
 func TestVerify_ErrorsOnlyInPackagesAreNotReportedAsClean(t *testing.T) {
 	pkg := []interface{}{map[string]interface{}{
 		"file": "Library/PackageCache/com.x@1/A.cs", "line": 1, "col": 2, "severity": "error", "code": "CS0246", "message": "missing type",

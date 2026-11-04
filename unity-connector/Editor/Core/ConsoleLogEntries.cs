@@ -139,6 +139,9 @@ namespace UnityCliConnector
 			public string Severity;
 			public string Code;
 			public string Message;
+			/// <summary>What the caller should write instead, for the codes where that is knowable
+			/// (see <see cref="CompileHints"/>). Null when there is nothing close to suggest.</summary>
+			public string Hint;
 		}
 	}
 }
