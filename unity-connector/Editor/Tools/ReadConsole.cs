@@ -23,6 +23,12 @@ namespace UnityCliConnector.Tools
         private const int DefaultEntryChars = 1000;
         private const int DefaultMaxBytes = 15360;
 
+        private const string DefaultTypes = "error,warning,log";
+
+        // What --type selects. Exceptions and asserts are chosen by "error"; the reply still names
+        // them in `types`, so a mixed listing can be read without re-querying.
+        private static readonly string[] SelectableTypes = { "error", "warning", "log" };
+
         private static MethodInfo _startGettingEntriesMethod, _endGettingEntriesMethod, _clearMethod, _getCountMethod, _getEntryMethod;
         private static MethodInfo _getEntryTimestampMethod;
         private static FieldInfo _modeField, _messageField, _fileField, _lineField, _globalLineIndexField;
@@ -88,7 +94,8 @@ namespace UnityCliConnector.Tools
             [ToolParameter("Comma-separated log types: error, warning, log. Default: error,warning,log")]
             public string Type { get; set; }
 
-            [ToolParameter("Most recent N entries to return (0 = no limit). Default: 50")]
+            [ToolParameter("Most recent N entries to return (0 = no limit). Default: 50",
+                Aliases = new[] { "count" })]
             public int Lines { get; set; }
 
             [ToolParameter("Stack trace mode: none (first line), user (user code frames only, engine frames collapsed), full (raw). Default: user")]
@@ -158,8 +165,21 @@ namespace UnityCliConnector.Tools
                 return new SuccessResponse("Console cleared.");
             }
 
-            var type = p.Get("type", "error,warning,log").ToLower();
+            var type = p.Get("type", DefaultTypes).ToLowerInvariant();
             var types = type.Split(',').Select(t => t.Trim()).Where(t => t.Length > 0).ToList();
+            var unknownTypes = types.Where(t => !SelectableTypes.Contains(t)).ToList();
+            if (types.Count == 0 || unknownTypes.Count > 0)
+            {
+                return new ErrorResponse(
+                    $"--type takes a comma-separated list of {string.Join(", ", SelectableTypes)}; " +
+                    $"{(unknownTypes.Count > 0 ? "unknown: " + string.Join(", ", unknownTypes) : "none given")}." +
+                    " Exceptions and asserts are selected by 'error' and reported with their own type in 'types'.",
+                    new { unknown_types = unknownTypes, known_types = SelectableTypes });
+            }
+
+            var linesFlag = p.GetInt("lines") ?? p.GetInt("count");
+            if (linesFlag < 0)
+                return new ErrorResponse($"--lines must be 0 (no limit) or positive, got {linesFlag}.");
 
             if (!StackTraceFilter.TryParseMode(p.Get("stacktrace", "user"), out var mode))
                 return new ErrorResponse("Unknown stacktrace mode. Use none, user, or full.");
@@ -174,6 +194,7 @@ namespace UnityCliConnector.Tools
             // console. Entries are formatted after the scan so byte-truncated ones are never shaped.
             var matched = new List<int>();
             var texts = new List<string>();
+            var entryTypes = new List<string>();
             bool cutByBytes = false, stoppedAtLineCap = false;
             int framesOmitted = 0, framesOverCap = 0, charsOmitted = 0, bytes = 0, scanned = 0;
 
@@ -212,6 +233,7 @@ namespace UnityCliConnector.Tools
                 {
                     _getEntryMethod.Invoke(null, new object[] { entryIndex, logEntry });
                     string message = (string)_messageField.GetValue(logEntry);
+                    var logType = GetLogTypeFromMode((int)_modeField.GetValue(logEntry));
                     var formatted = StackTraceFilter.Format(message, mode, limits.Frames, limits.EntryChars);
                     framesOmitted += formatted.FramesOmitted;
                     framesOverCap += formatted.FramesOverCap;
@@ -225,6 +247,7 @@ namespace UnityCliConnector.Tools
                     }
                     bytes += cost;
                     texts.Add(formatted.Text);
+                    entryTypes.Add(TypeName(logType));
                 }
             }
             finally
@@ -234,6 +257,7 @@ namespace UnityCliConnector.Tools
             }
 
             texts.Reverse();
+            entryTypes.Reverse();
 
             var truncatedBy = new List<string>();
             if (stoppedAtLineCap) truncatedBy.Add("lines");
@@ -259,6 +283,10 @@ namespace UnityCliConnector.Tools
             var data = new Dictionary<string, object>
             {
                 ["entries"] = texts,
+                // Index-aligned with 'entries': a mixed listing was indistinguishable, so an agent
+                // could not tell which line was the error it was looking for. Exceptions and asserts
+                // keep their own names here while '--type error' is what selects them.
+                ["types"] = entryTypes,
                 ["entries_total"] = matched.Count,
                 ["entries_total_is_lower_bound"] = stoppedAtLineCap,
                 ["entries_scanned"] = scanned,
@@ -462,6 +490,8 @@ namespace UnityCliConnector.Tools
             if ((mode & WarningMask) != 0) return LogType.Warning;
             return LogType.Log;
         }
+
+        internal static string TypeName(LogType type) => type.ToString().ToLowerInvariant();
 
         /// Reflection seam for other connector code that needs to iterate the
         /// in-memory editor console without duplicating the LogEntries binding.

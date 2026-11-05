@@ -135,7 +135,29 @@ namespace UnityCliConnector.Tests
             var data = Run("NoSuchTypeAnywhereInTheDomain");
             Assert.AreEqual(0, data["matches"].Value<int>());
             Assert.AreEqual("closest_types", data["matched_by"].Value<string>());
-            Assert.IsEmpty((JArray)data["types"]);
+            Assert.IsEmpty((JArray)data["types"], "a nonexistent type must not answer with unrelated types");
+            Assert.IsFalse(data["exact"].Value<bool>(),
+                "exact:false is what tells the CLI this lookup found nothing (and it exits non-zero)");
+        }
+
+        [Test]
+        public void UnknownMember_IsMarkedFuzzyAndNamesTheClosestOnes()
+        {
+            // `api Vector3.Lerpp` used to list Lerp/Slerp as if they were the match, with no marker.
+            var data = Run("Vector3.Lerpp", ("limit", 5));
+
+            Assert.IsFalse(data["exact"].Value<bool>());
+            StringAssert.Contains("no member named 'Lerpp'", data["note"].Value<string>());
+            StringAssert.Contains("Lerp", data["note"].Value<string>());
+            StringAssert.Contains("no member named 'Lerpp'", data["summary"].Value<string>());
+        }
+
+        [Test]
+        public void ExactLookups_SayTheyAreExact()
+        {
+            Assert.IsTrue(Run("Vector3")["exact"].Value<bool>());
+            Assert.IsTrue(Run("Vector3.Lerp")["exact"].Value<bool>());
+            Assert.IsNull(Run("Vector3.Lerp")["note"].Value<string>(), "an exact answer needs no caveat");
         }
 
         [Test]

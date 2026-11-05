@@ -1,3 +1,4 @@
+using System.Collections.Generic;
 using Newtonsoft.Json.Linq;
 using UnityEditor;
 using UnityEngine;
@@ -40,9 +41,34 @@ namespace UnityCliConnector.Tools
                 return new SuccessResponse("Reserialized entire project");
             }
 
+            // ForceReserializeAssets ignores a path that does not exist, so a typo answered exactly
+            // like a success. Name every missing path before touching any of them, so a partial run
+            // cannot make the answer ambiguous.
+            var missing = new List<string>();
+            foreach (var path in paths)
+                if (!AssetExists(path))
+                    missing.Add(path);
+            if (missing.Count > 0)
+            {
+                return new ErrorResponse(
+                    $"No asset at {(missing.Count == 1 ? "this path" : "these paths")}: {string.Join(", ", missing)}. " +
+                    "Nothing was reserialized; check the path with 'unity-cli exec' + AssetDatabase or pass a folder.",
+                    new { missing_paths = missing, paths });
+            }
+
             AssetDatabase.ForceReserializeAssets(paths);
             Debug.Log($"[UnityCliConnector] ForceReserializeAssets: {string.Join(", ", paths)}");
             return new SuccessResponse($"Reserialized {paths.Length} asset(s)", new { paths });
+        }
+
+        /// Folders count: ForceReserializeAssets walks a folder path, and the CLI passes whatever the
+        /// caller typed.
+        internal static bool AssetExists(string path)
+        {
+            if (string.IsNullOrEmpty(path)) return false;
+            var normalized = path.TrimEnd('/');
+            return AssetDatabase.IsValidFolder(normalized) ||
+                   AssetDatabase.LoadMainAssetAtPath(normalized) != null;
         }
     }
 }

@@ -125,3 +125,14 @@ Updated the `console` section of `README.md` to describe the override and the ne
   message, and the compile-gate/`burst_status` entry iterators log it as a connector warning. The
   widening failure already reported `console_window_filter.available=false`; this covers the other
   half, where the user's Log/Warning/Error toggles or search text stay changed.
+
+## Review follow-up (end-to-end run)
+
+- **A mixed listing could not be read.** `entries` was an array of bare strings, so `--type
+  error,warning,log` gave no way to tell which line was the error. The reply now carries a `types`
+  array index-aligned with `entries` (`log`/`warning`/`error`/`exception`/`assert`; exceptions and
+  asserts keep their own name while `--type error` selects them), documented in the README. An
+  unknown `--type` is refused with the values it accepts instead of answering an empty list, and
+  `--lines -1` is refused (0 still means "no limit", as documented). Covered by
+  `ReadConsoleCapsTests.EntryTypes_AreReportedPerEntryInAParallelArray`,
+  `UnknownType_IsRejectedInsteadOfReturningNothing` and `NegativeLines_IsRejected`.

@@ -82,8 +82,59 @@ namespace UnityCliConnector.Tests
             finally
             {
                 Heartbeat.TickForTests();
-                CompilationGate.ResetForTests();
+                // Restore the live clocks: leaving the gate reset is what made the heartbeat report
+                // compileFinishedAt 0 for minutes after a test run while compile_status still knew the
+                // compile. ResetForTests no longer writes the live key, but the in-memory clock is
+                // this domain's answer until something restores it.
+                CompilationGate.RestoreLiveStateForTests();
             }
+        }
+
+        [Test]
+        public void CompileFinishedAt_FallsBackToProvenanceSoTheCLINeverSeesATrackedZero()
+        {
+            // Two records carry the compile clock (the gate's console-freshness key and the provenance
+            // key). They are stamped by the same events, so one going missing must not make the
+            // heartbeat claim this connector has no clock while compile_status names a valid compile.
+            var provenanceBefore = CompileProvenance.DumpSessionForTests();
+            CompilationGate.ResetForTests();
+            try
+            {
+                // Stand in for a session whose provenance record survived while the gate's key did not.
+                CompileProvenance.ResetForTests();
+                CompileProvenance.NoteNothingToCompile(99_000);
+
+                CompilationGate.SeedCompileClockForTests(100, 0);
+                Assert.AreEqual(99_000, Heartbeat.ResolveCompileFinishedAt(),
+                    "the gate's clock was lost, so the published one comes from the provenance record");
+
+                CompilationGate.SeedCompileClockForTests(100, 4242);
+                Assert.AreEqual(99_000, Heartbeat.ResolveCompileFinishedAt(),
+                    "the later record wins: a clock never moves backwards for the CLI");
+
+                CompilationGate.SeedCompileClockForTests(100, 123_456);
+                Assert.AreEqual(123_456, Heartbeat.ResolveCompileFinishedAt(),
+                    "and it is the gate's clock when that is the later one");
+            }
+            finally
+            {
+                CompilationGate.RestoreLiveStateForTests();
+                CompileProvenance.RestoreSessionForTests(provenanceBefore);
+                CompileProvenance.ReloadFromSessionForTests();
+            }
+        }
+
+        [Test]
+        public void StateFor_ReportsPausedWhileTheGameIsPaused()
+        {
+            // `wait` documents paused as a state to wait on, so the heartbeat has to publish it: a
+            // paused game reported as "playing" reads as a run that is still going.
+            Assert.AreEqual("paused", Heartbeat.StateFor(false, false, false, playing: true, paused: true));
+            Assert.AreEqual("playing", Heartbeat.StateFor(false, false, false, playing: true, paused: false));
+            Assert.AreEqual("ready", Heartbeat.StateFor(false, false, false, playing: false, paused: false));
+            Assert.AreEqual("compiling", Heartbeat.StateFor(false, compiling: true, false, playing: false, false));
+            Assert.AreEqual("refreshing", Heartbeat.StateFor(false, false, updating: true, playing: false, false));
+            Assert.AreEqual("building", Heartbeat.StateFor(building: true, false, false, playing: false, false));
         }
 
         [Test]

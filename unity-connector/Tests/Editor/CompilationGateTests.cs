@@ -846,6 +846,55 @@ namespace UnityCliConnector.Tests
 
         static long NowMs() => DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
 
+        // ─── live-state hygiene + the skipped compile ───────────
+
+        [Test]
+        public void ResetForTests_CannotClobberTheLiveSessionRecord()
+        {
+            // The gate's console-freshness key is what the heartbeat's compile clock comes from. A test
+            // that resets the gate (and one that forgets its restore) must not be able to erase it:
+            // that is how the heartbeat lost compileFinishedAt for minutes after a test run.
+            const string liveKey = "unity-cli/console-freshness";
+            var before = UnityEditor.SessionState.GetString(liveKey, null);
+            Assert.IsNotNull(before, "the live editor always has a gate record by the time tests run");
+
+            CompilationGate.ResetForTests();
+            CompilationGate.NoteCompileStartedForTests();
+            CompilationGate.NoteCompileFinishedForTests();
+            Assert.AreEqual(before, UnityEditor.SessionState.GetString(liveKey, null),
+                "test writes go to the tests' own key");
+
+            CompilationGate.RestoreLiveStateForTests();
+            Assert.AreEqual(before, UnityEditor.SessionState.GetString(liveKey, null));
+        }
+
+        [Test]
+        public void NoteNothingToCompile_AdvancesBothClocksWithoutClaimingARebuild()
+        {
+            // refresh_unity skips a compile it can prove unneeded; the CLI only believes a compile
+            // finished when the clock moves, so the skip has to stamp it.
+            CompilationGate.SeedCompileClockForTests(1000, 2000);
+            var provenanceBefore = CompileProvenance.DumpSessionForTests();
+            try
+            {
+                var before = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+                CompilationGate.NoteNothingToCompile();
+
+                Assert.That(CompilationGate.LastCompileFinishedAt, Is.GreaterThanOrEqualTo(before));
+                Assert.AreEqual(CompilationGate.LastCompileStartedAt, CompilationGate.LastCompileFinishedAt,
+                    "a compile that rebuilt nothing took no time");
+                Assert.AreEqual(CompilationGate.LastCompileFinishedAt, CompileProvenance.LastCompileFinishedAtMs(),
+                    "compile_status and the heartbeat must name the same compile");
+                CollectionAssert.IsEmpty(CompileProvenance.SnapshotForTests().rebuilt,
+                    "nothing was rebuilt, and the record must not claim otherwise");
+            }
+            finally
+            {
+                CompileProvenance.RestoreSessionForTests(provenanceBefore);
+                CompileProvenance.ReloadFromSessionForTests();
+            }
+        }
+
         static long TimeOfDaySeconds(long epochMs)
         {
             var local = DateTimeOffset.FromUnixTimeMilliseconds(epochMs).ToLocalTime();

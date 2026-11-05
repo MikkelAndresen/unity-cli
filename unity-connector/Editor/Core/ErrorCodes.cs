@@ -31,5 +31,11 @@ namespace UnityCliConnector
 
         /// The tool produced a value that could not be serialized; the command did run.
         public const string SerializationFailed = "serialization_failed";
+
+        /// <summary>
+        /// The request named a parameter the tool's schema does not declare (a misspelled flag). The
+        /// command did not run; the response lists the parameters the tool accepts.
+        /// </summary>
+        public const string UnknownParameter = "unknown_parameter";
     }
 }

@@ -16,7 +16,8 @@ namespace UnityCliConnector.Tools
             [ToolParameter("Scan the source tree for files written after the last compile (default: true)")]
             public bool Scan { get; set; }
 
-            [ToolParameter("Milliseconds the source scan may take before it reports itself incomplete (default 200)")]
+            [ToolParameter("Milliseconds the source scan may take before it reports itself incomplete (default 200)",
+                Aliases = new[] { "scan_budget_ms" })]
             public int ScanBudget { get; set; }
         }
 

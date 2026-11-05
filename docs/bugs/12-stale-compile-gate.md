@@ -251,3 +251,24 @@ at least one assembly finished.
 - `PackageInfo.FindForAssetPath` returns null for a package path that is no longer installed; such a
   console diagnostic is treated as stale (correct for a removed package, and the pipeline cache
   remains the primary source for installed ones).
+
+## Review follow-up (end-to-end run)
+
+- **The compile clock could read 0 while `compile_status` knew the compile.** The heartbeat published
+  `CompilationGate.LastCompileFinishedAt`; `HeartbeatPayloadTests.MarkCompileRequested_…` reset the gate
+  and never restored it, and the reset erased the `unity-cli/console-freshness` SessionState key, so
+  after a 403-test run the heartbeat reported `compileFinishedAt: 0` for minutes while the separate
+  provenance record still named a valid compile. Three changes: `ResetForTests` switches the gate into
+  a test key (`unity-cli/console-freshness.tests`) so a test cannot erase or overwrite the live record
+  at all; the fixture restores the live state; and `Heartbeat.ResolveCompileFinishedAt()` falls back to
+  `CompileProvenance`'s finish clock, so the two records cannot disagree about whether this editor can
+  prove a compile happened. Covered by
+  `CompilationGateTests.ResetForTests_CannotClobberTheLiveSessionRecord`,
+  `HeartbeatPayloadTests.CompileFinishedAt_FallsBackToProvenanceSoTheCLINeverSeesATrackedZero` and the
+  fixed fixture.
+- **`CompilationGate.NoteNothingToCompile()`** publishes a compile that rebuilt nothing (see
+  `editor refresh --compile` in the README): it moves both clocks without clearing the diagnostics
+  cache or adopting a new console boundary, and records no rebuilt assemblies. `refresh_unity` skips
+  the request only when the project is provably current, which took `editor refresh --compile` on an
+  unchanged project from 20-28 s to ~2.5 s (the 20 s was a forced compile plus its ~10 s domain
+  reload, not the 20 s `compileIdleGrace`).

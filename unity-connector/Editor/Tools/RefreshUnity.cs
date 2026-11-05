@@ -58,18 +58,33 @@ namespace UnityCliConnector.Tools
             // plain request, which a caller could mistake for the clean rebuild it asked for.
             if (clean && !CleanCompileSupported())
                 return new ErrorResponse("compile:\"clean\" needs Unity 2021.1 or newer; request a normal compile instead.");
+            var skipCompile = false;
             if (string.Equals(compile, "request", StringComparison.OrdinalIgnoreCase) || clean)
             {
-                Heartbeat.MarkCompileRequested();
-                // RequestScriptCompilation is fire-and-forget here: the domain reload it triggers
-                // drops the HTTP connection, so the outcome is polled from the heartbeat instead.
-#if UNITY_2021_1_OR_NEWER
-                if (clean) CompilationPipeline.RequestScriptCompilation(RequestScriptCompilationOptions.CleanBuildCache);
-                else CompilationPipeline.RequestScriptCompilation();
-#else
-                CompilationPipeline.RequestScriptCompilation();
-#endif
+                // RequestScriptCompilation forces a full script compile even when Bee rebuilds
+                // nothing, and its domain reload costs ~10 s on a project with heavy
+                // [InitializeOnLoad] work — for a request that has nothing to compile. Every tool
+                // call is on the same main thread, so tools that need a compile (verify, editor
+                // refresh --compile) paid that per call. When the project can be proved current the
+                // clocks advance instead, which is what the CLI's wait treats as "compile finished".
+                skipCompile = !clean && NothingToCompile();
                 compileRequested = true;
+                if (skipCompile)
+                {
+                    CompilationGate.NoteNothingToCompile();
+                }
+                else
+                {
+                    Heartbeat.MarkCompileRequested();
+                    // RequestScriptCompilation is fire-and-forget here: the domain reload it triggers
+                    // drops the HTTP connection, so the outcome is polled from the heartbeat instead.
+#if UNITY_2021_1_OR_NEWER
+                    if (clean) CompilationPipeline.RequestScriptCompilation(RequestScriptCompilationOptions.CleanBuildCache);
+                    else CompilationPipeline.RequestScriptCompilation();
+#else
+                    CompilationPipeline.RequestScriptCompilation();
+#endif
+                }
             }
 
             // Before the compile this is the state the request starts from; the post-compile answer
@@ -79,6 +94,10 @@ namespace UnityCliConnector.Tools
             {
                 refresh_triggered = true,
                 compile_requested = compileRequested,
+                // True when the requested compile was provably unnecessary and was skipped; the
+                // compile clock in this reply is still the one from before, so the CLI's wait sees
+                // it advance only if nothing is out of date.
+                nothing_to_compile = skipCompile,
                 // The CLI may ask for one CleanBuildCache retry after a compile left a stale DLL.
                 clean_compile_supported = CleanCompileSupported(),
                 compile_finished_at = compileFinishedBefore,
@@ -92,6 +111,24 @@ namespace UnityCliConnector.Tools
                 stale_assembly_covered_count = stale.CoveredCount,
                 stale_assembly_covered_line = AssemblyStaleness.FormatCoveredLine(stale),
             });
+        }
+
+        /// A requested compile is only skippable when this editor can prove it would rebuild nothing:
+        /// a finished compile to compare against, no compile error waiting for the fix that this
+        /// request would have produced the diagnostics for, no pending import or compile, no source
+        /// written since that compile, and no assembly whose DLL is older than its sources. Anything
+        /// unproven — a scan that ran out of budget, a source with no content record — compiles.
+        private static bool NothingToCompile()
+        {
+            if (EditorApplication.isCompiling || EditorApplication.isUpdating) return false;
+            if (CompilationGate.HasOutstandingErrors()) return false;
+            if (CompileProvenance.LastCompileFinishedAtMs() <= 0) return false;
+
+            var sources = CompileProvenance.ScanSourceTree(CompileProvenance.DefaultScanBudgetMs);
+            if (!sources.complete || sources.stale_count > 0) return false;
+
+            var assemblies = AssemblyStaleness.ScanProject(AssemblyStaleness.DefaultBudgetMs);
+            return assemblies.Complete && assemblies.StaleCount == 0;
         }
 
         private static bool CleanCompileSupported()

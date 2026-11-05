@@ -393,3 +393,19 @@ The review of `fix/10-reload-response` raised three C# findings; the Go ones are
   nothing was applied."* and keeps the null `data.code` (no editor to wait for). Covered by
   `RequestDeadlineTests.BuildReloadError_AQueuedRequestDuringAQuitIsNotToldToWait` (fails against the
   old sentence).
+
+## Review follow-up (end-to-end run)
+
+- **`Unsolicited response received on idle HTTP channel` — reproduced, and it is not a double write.**
+  The note above called it cosmetic and Go-only. It is a connector-side defect, just not the one the
+  finding suspected: `HttpServer` writes exactly one response per request (`WriteResponse` is the only
+  writer, and the ticket CAS makes a second answer impossible), and every response carries a JSON body.
+  The stray response has `Content-Length: 0`, `Connection: close` and `Server: Mono-HTTPAPI/1.0` — a
+  shape no code path here produces. It is Mono's `HttpListener` closing the connections it still holds
+  when the listener stops for a domain reload: reproduced with a raw socket kept idle after its answer,
+  a real content-change compile+reload, and the empty 200 arriving on that idle connection.
+  `HandleRequest` now sets `response.KeepAlive = false`, so the client closes instead of pooling a
+  connection the reload can write into (a CLI invocation opens a connection per command anyway; a
+  local connect measured 0-4 ms). Covered by
+  `RequestDeadlineTests.Responses_AskTheClientNotToReuseTheConnection`; the probe that reproduced the
+  stray response now sees the connection close with zero extra bytes.

@@ -282,7 +282,7 @@ namespace UnityCliConnector
 
             s_LastState = s_ForcedState ?? GetState();
             s_LastCompileErrors = EditorUtility.scriptCompilationFailed;
-            s_LastCompileFinishedAt = CompilationGate.LastCompileFinishedAt;
+            s_LastCompileFinishedAt = ResolveCompileFinishedAt();
             WriteFile();
         }
 
@@ -353,15 +353,37 @@ namespace UnityCliConnector
             return CONNECTOR_VERSION;
         }
 
-        static string GetState()
+        /// <summary>
+        /// The compile clock the CLI reads, from whichever record still has it: both are stamped by the
+        /// same compile events, and a domain that lost the gate's copy (a session that started before
+        /// any compile, a test fixture holding the gate) must not report "no compile clock" while
+        /// compile_status names a valid compile.
+        /// </summary>
+        internal static long ResolveCompileFinishedAt()
+        {
+            // The clock only moves forward, so the later of the two records is the truthful one: either
+            // can be behind the other for a while (a compile that landed while a test held the gate went
+            // to the live key only through provenance), and publishing the older one reads as a compile
+            // the CLI has already seen.
+            var gate = CompilationGate.LastCompileFinishedAt;
+            var provenance = CompileProvenance.LastCompileFinishedAtMs();
+            return gate > provenance ? gate : provenance;
+        }
+
+        static string GetState() => StateFor(s_BuildActive, EditorApplication.isCompiling,
+            EditorApplication.isUpdating, EditorApplication.isPlaying, EditorApplication.isPaused);
+
+        /// The published state, with the editor's flags passed in so the mapping can be tested: the
+        /// heartbeat is what `status` and `wait` read, and a paused game that reported "playing" made
+        /// an agent wait on a run that was never going to advance.
+        internal static string StateFor(bool building, bool compiling, bool updating, bool playing, bool paused)
         {
             // A build blocks the main thread for minutes without touching isCompiling/isUpdating;
             // without this the heartbeat would say "ready" while nothing can be answered.
-            if (s_BuildActive) return BuildJobRecord.PhaseBuilding;
-            if (EditorApplication.isCompiling) return "compiling";
-            if (EditorApplication.isUpdating) return "refreshing";
-            if (EditorApplication.isPlaying)
-                return EditorApplication.isPaused ? "paused" : "playing";
+            if (building) return BuildJobRecord.PhaseBuilding;
+            if (compiling) return "compiling";
+            if (updating) return "refreshing";
+            if (playing) return paused ? "paused" : "playing";
             return "ready";
         }
 

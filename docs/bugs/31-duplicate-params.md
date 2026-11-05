@@ -169,3 +169,20 @@ exit=1
 - `verify` now writes a subcommand usage error to stderr instead of stdout, so `--json` output stays
   a single parseable object (`wait` does the same for its parser errors).
 - The invalid-JSON test now asserts the occurrence number (`#1`, `#2`), not just the message prefix.
+
+## Review follow-up (end-to-end run)
+
+- **A misspelled flag was silently ignored, not just a repeated `--params`.** `test --filtre X` ran
+  all 586 tests; `compile_status --sacn false` behaved as if the flag were absent. The connector's
+  router now rejects any parameter the tool's `Parameters` schema does not declare, with
+  `data.code = unknown_parameter` (`ErrorCodes.UnknownParameter`, `client.CodeUnknownParameter`) and a
+  message plus payload listing the parameters the tool takes — in both spellings it accepts (snake and
+  camel `case`) and in any legacy alias the schema declares (`scan_budget_ms`, `count`). Reserved keys
+  the CLI or connector injects are always allowed: `args`, `queue_deadline_ms`, `deadline_ms`,
+  `skip_compile_check`/`skipCompileCheck`. Tools without a `Parameters` class keep accepting anything,
+  and the check runs before the compile gate so a typo does not wait for a compile.
+  `CommandRouterTests` covers the refusal, the known-parameter list, the reserved keys, the camelCase
+  and alias spellings, the cached tool scan and the schema-less case. Live: `exec … --bogus`,
+  `api Vector3 --bogus` and `compile_status --sacn false` each answer exit 1 with
+  `known parameters: …`. The CLI's own flag parsing (which flags a Go subcommand accepts at all) is
+  the Go half and stays with `--params` handling.

@@ -147,6 +147,12 @@ and states that the command did not run. A request still queued when Unity reloa
 listener closes, instead of being dropped. See
 [Queued Commands and Server-Side Deadlines](#queued-commands-and-server-side-deadlines).
 
+A parameter the target tool does not declare is refused before the tool runs, with
+`data.code: unknown_parameter` and the parameters it does accept — so a misspelled flag fails loudly
+instead of being ignored. The keys the CLI and the connector inject themselves (`args`,
+`queue_deadline_ms`, `deadline_ms`, `skip_compile_check`) are always accepted. Tools without a declared
+parameter schema keep accepting anything.
+
 ## Built-in Commands
 
 | Command | Description |
@@ -225,7 +231,14 @@ whether it fixed the DLL; the top-level `stale_assembly_*` fields always describ
 compile left you in, not the state the request started from. `timed_out: true` means the wait gave up after 5 minutes — not that the compile
 failed. `nothing_to_compile: true` means no compilation was seen to run after the request, in which
 case `compile_succeeded` describes the editor's current compile state rather than a compile this
-command caused. The proof a compile actually ran is the connector's compile-finished clock: the
+command caused.
+
+When the project can be proved current — a finished compile to compare against, no compile errors, no
+pending import, no source written since that compile and no assembly whose DLL is older than its
+sources — the connector skips the request. `RequestScriptCompilation` forces a full script compile even
+when Bee would rebuild nothing, and its domain reload costs ~10 s on a project with heavy
+`[InitializeOnLoad]` work; on an unchanged project the same command took 20-28 s before and ~2.5 s now.
+The compile clock is stamped either way, which is what the CLI's wait treats as "compile finished". The proof a compile actually ran is the connector's compile-finished clock: the
 refresh reply reports it at request time and the heartbeat is polled until that number moves, so a
 heartbeat that was already `ready` is never mistaken for a finished compile. Exit code is 1 when the
 compile failed or timed out, and the report is printed either way. `--compile` clears the console
@@ -436,6 +449,7 @@ cut the reply says what and how much, so a caller knows how to widen the query i
   "entries": [
     "IndexOutOfRangeException : Index was out of bounds.\n... (+12 engine frames)\nFoW.FogOfWarUpdater:Update () (at Assets/FogOfWar/Runtime/Components/FogOfWarUpdater.cs:31)"
   ],
+  "types": ["exception"],
   "entries_total": 213,
   "entries_returned": 50,
   "entries_omitted": 163,
@@ -447,8 +461,12 @@ cut the reply says what and how much, so a caller knows how to widen the query i
 }
 ```
 
-`entries` is oldest-first and holds the newest entries the caps allowed; `entries_total` counts the
-entries matching `--type`, before any cap. The scan stops once `--lines` matches are found, so when
+`entries` is oldest-first and holds the newest entries the caps allowed, and `types` is index-aligned
+with it: one `log`/`warning`/`error`/`exception`/`assert` per entry, so a mixed listing can be read
+without re-querying. `--type` selects `log`/`warning`/`error` only (an exception or assert is chosen
+by `error`), and any other value is refused with the ones it accepts rather than answering nothing;
+`--lines` accepts 0 (no limit) or a positive count. `entries_total` counts the entries matching
+`--type`, before any cap. The scan stops once `--lines` matches are found, so when
 that happens `entries_total_is_lower_bound` is true and `entries_total` counts only the newest matches
 that were read (`entries_scanned` says how many console entries were examined); without an early stop
 the total is exact. The tool temporarily turns on the Console window's
@@ -468,13 +486,17 @@ Entities traces slipped through, which is what a single call costing 35 KB came 
 
 Run arbitrary C# code inside the Unity Editor at runtime. This is the most powerful command — it gives you full access to UnityEngine, UnityEditor, ECS, and every loaded assembly. No need to write a custom tool for one-off queries or mutations.
 
-Use `return` to get output. Common namespaces are included by default. Add `--usings` only for project-specific types (e.g. `Unity.Entities`). The csc compiler and dotnet runtime are auto-detected; if detection fails, specify manually with `--csc <path>` or `--dotnet <path>`.
+Common namespaces are included by default. A snippet that is a single expression (`Time.time`, `40 + 2`,
+`new Vector3(0, 1, 0)`) is compiled as `return (<expr>);`, so the value comes back without a `return`;
+a body of statements still needs one (`return 1;`). A body without a return answers `null`, so a bare
+`Debug.Log("x")` runs and reports `OK`. Add `--usings` only for project-specific types (e.g. `Unity.Entities`). The csc compiler and dotnet runtime are auto-detected; if detection fails, specify manually with `--csc <path>` or `--dotnet <path>`.
 
 `System` and `UnityEngine` both define `Object`, `Random`, and `Debug`, so those names resolve through default aliases to the Unity types instead of failing with CS0104. A `using` directive at the top of the snippet is moved above the generated method, and your own alias wins over the default one. To replace the default set completely, pass `--no_default_usings` (the default imports and aliases are dropped) and list what you want with `--usings`.
 
 **Compile gate.** Every tool runs behind a compile check, so a project that does not currently compile answers with the errors instead of running the call. The check only uses the current compile: live compiler diagnostics plus console entries from that compile, not old console lines or a failed build. When it blocks, the error names the first three diagnostics (`file:line:col CODE message`), says how old the compile is, and repeats the escape hatch. Pass `--skip_compile_check` (or `--params '{"skip_compile_check":true}'`) to run anyway — useful for diagnostics or to edit the source from `exec`.
 
 ```bash
+unity-cli exec "Time.time"                                        # a bare expression returns its value
 unity-cli exec "return Application.dataPath;"
 unity-cli exec "return EditorSceneManager.GetActiveScene().name;"
 unity-cli exec "return World.All.Count;" --usings Unity.Entities
@@ -503,6 +525,12 @@ echo 'for (int i = 0; i < 3; i++) { yield return null; yield return i; }' | unit
 ```
 
 Waits are bounded by `--await_timeout <ms>` (default 30000; `0` waits forever). If a wait outlives it, the response is an error carrying `{"timed_out": true, "status": "WaitingForActivation", "steps": N}` — the operation keeps running in the editor and its result is not observable from that response. A domain reload drops a pending result silently, so park long-lived results in a static field or `ScriptableObject` and read them back with a second `exec`.
+
+**Diagnostics.** A compile error names the snippet's own line (`L3: …`, not the generated file's
+line 21), and a runtime exception comes back as `Runtime error: <Type>: <message>` followed by a short
+user-code stack whose snippet frames read `in snippet:line N`. The snippet is compiled with a portable
+PDB so those frames carry line numbers, and Unity's engine frames are collapsed the same way
+`console --stacktrace user` collapses them.
 
 **Result shape.** A returned value is serialized from its public fields and readable public properties, so anonymous types, property-only editor API objects, lists, dictionaries, and nested objects come back as JSON objects rather than `ToString()` text. Collections cap at 100 entries and depth at 6, cycles are reported as `"<cycle: Type>"`, and a property that throws becomes `"<error: Type: message>"` without dropping its siblings. Unity objects keep their identity string (`"Main Camera (UnityEngine.Camera)"`), and Unity math structs expose their data members rather than derived values such as `Vector3.normalized`. If serialization itself fails, `data` falls back to a string and `meta` carries `serialization_error`; use `--meta` to see it.
 
@@ -550,7 +578,7 @@ unity-cli api UnityEngine.Object.FindObjectOfType --docs
 }
 ```
 
-A type query accepts the simple name, the full name, and either spelling of a generic (`BufferLookup`, `BufferLookup<T>`, `` BufferLookup`1 ``). When several types match, each one is described, best match first (up to `--max_types`, default 5). `[Obsolete]` members report the message, whether it is an error, and the replacement when the notice names one (`Use X instead`, `(UnityUpgradable) -> X`). `--docs` adds the `<summary>` from the `.xml` sitting next to the assembly — Unity ships one for its own modules, most third-party assemblies ship none, and a missing doc file prints nothing.
+A type query accepts the simple name, the full name, and either spelling of a generic (`BufferLookup`, `BufferLookup<T>`, `` BufferLookup`1 ``). An answer that is a nearest-match fallback says so: `exact: false` plus a `note` (`no member named 'Lerpp' on UnityEngine.Vector3; closest: Lerp, Slerp`) and, for a query that names nothing at all, an empty `types` list with the closest type names in `closest_types` — the CLI exits 1 on that, because the API the caller asked for does not exist. When several types match, each one is described, best match first (up to `--max_types`, default 5). `[Obsolete]` members report the message, whether it is an error, and the replacement when the notice names one (`Use X instead`, `(UnityUpgradable) -> X`). `--docs` adds the `<summary>` from the `.xml` sitting next to the assembly — Unity ships one for its own modules, most third-party assemblies ship none, and a missing doc file prints nothing.
 
 The index is built lazily and cached for the editor session. `--budget <ms>` (default 1500) bounds one call; `index.complete: false` means the budget ran out before every assembly was searchable, so raise the budget or ask again. The command stays available while the project does not compile: the loaded assemblies are the last good ones, which is exactly when the real API is wanted.
 
@@ -612,6 +640,9 @@ unity-cli reserialize Assets/Scenes/Main.unity Assets/Scenes/Lobby.unity
 # After modifying material properties
 unity-cli reserialize Assets/Materials/Character.mat
 ```
+
+Every path must exist: `ForceReserializeAssets` silently ignores one that does not, so a typo used to
+answer exactly like a success. The tool now names every missing path and reserializes nothing.
 
 This is what makes text-based asset editing safe. Without it, a single misplaced YAML field can break a prefab with no visible error until runtime. With it, **AI agents can confidently modify any Unity asset through plain text** — add components to prefabs, adjust scene hierarchies, change material properties — and know the result will load correctly.
 
@@ -804,16 +835,18 @@ Every compile result says which compile it reflects, so a clean answer is told a
 compiled 14:02:11 (3 s ago, took 2.2 s) · 1 source file changed since previous compile · rebuilt: Game, Game.Tests.Editor
 stale: Assets/Scripts/Player.cs modified after this compile — run verify again
 stale assembly: Game.Tests.dll (built 14:01:50) is older than Assets/Game/Tests.cs (14:04:02) — run unity-cli editor refresh --compile
-not stale: Game.Tests.dll (built 14:01:50) is older than Assets/Game/Tests.cs (14:04:02), but the compile that started 14:05:10 read that source and kept the DLL; a moved mtime alone does not mean the DLL is out of date
+not stale: Game.Tests.dll (built 14:01:50) is older than Assets/Game/Tests.cs (14:04:02), but its content matches what the compile recorded for it; a moved mtime alone does not mean the DLL is out of date
 ```
 
 The third line appears when an assembly's output DLL is missing or older than its newest `.cs`/`.asmdef`/`.asmref` source (project and `file:`/embedded packages only; `Packages/<name>` paths are resolved to the directory the package really lives in, which is what makes `file:` packages count). The compile may have "succeeded" while Unity's assembly cache skipped the rebuild; `verify` and `test` refuse to run tests in that state unless `--allow-stale` is passed, and `editor refresh --compile` asks once for a `CleanBuildCache` rebuild before reporting `stale_after_compile`.
 
-The fourth line is the opposite case, and it is deliberately not a refusal: Unity does not rewrite a DLL whose contents it considers current, so a source whose mtime merely moved (a `touch`, a re-checkout) stays older than its DLL forever even though a compile read it. When the last compile *started* after that source was written, the assembly is counted in `stale_assembly_covered_count` and named in `stale_assembly_covered_line` instead of being reported stale — otherwise every `verify` after a `touch` would refuse, ask for a clean rebuild, and refuse again. Measured on 6000.6.5f1: a touched file produced an 11 s compile with `rebuilt_assemblies: []` and the DLL mtime unchanged, and even `editor refresh --compile clean` (`RequestScriptCompilationOptions.CleanBuildCache`, 65 s) left those mtimes alone because Bee restores its cached node output with the timestamps it recorded. So the compile clock, not the DLL's mtime, is what decides this case; `--compile clean` is still the hammer for a cache you believe is lying.
+The fourth line is the opposite case, and it is deliberately not a refusal: Unity does not rewrite a DLL whose contents it considers current, so a source whose mtime merely moved (a `touch`, a re-checkout) stays older than its DLL forever even though a compile read it. The first scan that finds a DLL current writes a content record for its sources, so the very next `touch` is answered by comparing hashes (‘its content matches what the compile recorded for it’) instead of the noisier ‘not stale, no content record yet’ line, which is now only for an assembly whose DLL predates its sources the first time the connector sees it. When the last compile *started* after that source was written, the assembly is counted in `stale_assembly_covered_count` and named in `stale_assembly_covered_line` instead of being reported stale — otherwise every `verify` after a `touch` would refuse, ask for a clean rebuild, and refuse again. Measured on 6000.6.5f1: a touched file produced an 11 s compile with `rebuilt_assemblies: []` and the DLL mtime unchanged, and even `editor refresh --compile clean` (`RequestScriptCompilationOptions.CleanBuildCache`, 65 s) left those mtimes alone because Bee restores its cached node output with the timestamps it recorded. So the compile clock, not the DLL's mtime, is what decides this case; `--compile clean` is still the hammer for a cache you believe is lying.
 
 The first line is the connector's: when the last script compilation finished (the reload it triggered
 included), how long it took, how many source files were written since the compile before it, and
-which assemblies it rebuilt. The second line appears when a `.cs`, `.asmdef` or `.asmref` under
+which assemblies it rebuilt. The same clock is what the heartbeat publishes as `compileFinishedAt`; the
+heartbeat and `compile_status` read it from the same record, so the CLI cannot see "this connector has
+no compile clock" while a compile status names one. The second line appears when a `.cs`, `.asmdef` or `.asmref` under
 `Assets/` or under a `file:`/embedded package was written **after** that compile: the edit is in the
 project but not in the result above it, which is the doubt that otherwise makes agents poll the
 editor with `sleep 45 && unity-cli compile_errors` loops.
@@ -1154,7 +1187,9 @@ to ask. Commands that own their own reload wait (`editor play/stop`, `editor ref
 `test`, `verify`, `build`, `wait`) report it themselves.
 
 A slow but successful pickup says so in `meta`: `--meta` shows `queue_wait_ms` and `queue_depth` once
-the wait exceeded a second.
+the wait exceeded a second. `queue_wait_ms` stops when the tool handler starts, and `total_ms` covers the
+whole request, so `queue_wait_ms + compile_ms` can no longer exceed the invocation's wall time (a tool's
+own timing such as `exec`'s `compile_ms` sits inside the handler time, which sits inside `total_ms`).
 
 ## Global Options
 

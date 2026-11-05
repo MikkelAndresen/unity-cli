@@ -136,6 +136,26 @@ namespace UnityCliConnector
         /// how old the compile behind an answer is (the compile gate's error message).
         public static string DescribeLastCompile() => FormatProvenanceLine(s_Record, null, NowMs());
 
+        /// When the last script compilation finished, or 0 when none has been recorded. The
+        /// heartbeat's compile clock reads this when CompilationGate's own clock is missing, so the two
+        /// records cannot disagree about whether this editor can prove a compile happened.
+        internal static long LastCompileFinishedAtMs() => s_Record.finished_at_ms;
+
+        /// Records the compile RefreshUnity skipped because every assembly was already current: the
+        /// clocks move (the CLI waits for that), nothing was rebuilt, and every source became an input
+        /// the compile could read — which is what the caller verified before skipping.
+        internal static void NoteNothingToCompile(long nowMs)
+        {
+            s_Record.previous_finished_at_ms = s_Record.finished_at_ms;
+            s_Record.started_at_ms = nowMs;
+            s_Record.rebuilt = new List<string>();
+            s_Record.rebuilt_truncated = false;
+            s_Record.finished_at_ms = nowMs;
+            s_Record.reload_expected = false;
+            s_PendingStartedMs = 0;
+            Save();
+        }
+
         /// When the last observed script compilation started, or its finish if this domain never saw
         /// its start. Sources written before that moment were inputs that compile could read, which is
         /// what lets AssemblyStaleness tell "the edit was never compiled" from "the compile read the
@@ -261,7 +281,7 @@ namespace UnityCliConnector
         }
 
         /// Counts .cs files written since the previous compile finished, and lists sources (.cs,
-        /// .asmdef, .asmref) written after the reported compile finished. Runs on the calling thread
+        /// .asmdef, .asmref, .rsp) written after the reported compile finished. Runs on the calling thread
         /// with a wall-clock budget; the counts stay a lower bound when it runs out.
         internal static SourceScan ScanSourceTree(int budgetMs)
         {
@@ -305,7 +325,7 @@ namespace UnityCliConnector
 
                     var ext = info.Extension.ToLowerInvariant();
                     var isSource = ext == ".cs";
-                    var isAssemblyDef = ext == ".asmdef" || ext == ".asmref";
+                    var isAssemblyDef = ext == ".asmdef" || ext == ".asmref" || ext == ".rsp";
                     if (!isSource && !isAssemblyDef) continue;
 
                     scan.scanned_files++;

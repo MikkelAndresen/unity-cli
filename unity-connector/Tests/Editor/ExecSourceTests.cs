@@ -143,6 +143,57 @@ namespace UnityCliConnector.Tests
                 Build("yield return null;", null, true, ExecSource.BodyKind.Iterator));
         }
 
+        // ─── bare expressions ───────────────────────────────────
+
+        [TestCase("Time.time")]
+        [TestCase("40 + 2")]
+        [TestCase("\"text\"")]
+        [TestCase("new Vector3(0, 1, 0)")]
+        [TestCase("EditorApplication.isPlaying")]
+        [TestCase("list.Select(x => x * 2).ToList()")]
+        [TestCase("\"a;b\"")]
+        public void IsSingleExpression_AcceptsAValueWithNoStatements(string code)
+        {
+            Assert.IsTrue(ExecSource.IsSingleExpression(code), $"{code} is one expression");
+        }
+
+        [TestCase("return 1;")]
+        [TestCase("Debug.Log(\"x\");")]
+        [TestCase("var x = 1")]
+        [TestCase("if (true) { }")]
+        [TestCase("for (var i = 0; i < 2; i++) { }")]
+        [TestCase("yield return null;")]
+        [TestCase("await Task.Delay(1)")]
+        [TestCase("throw new System.Exception()")]
+        [TestCase("x = 1; y = 2;")]
+        [TestCase("")]
+        public void IsSingleExpression_RejectsStatementsAndBodies(string code)
+        {
+            Assert.IsFalse(ExecSource.IsSingleExpression(code), $"{code} is a statement body, not an expression");
+        }
+
+        [Test]
+        public void ExpressionForm_WrapsTheBodyInAReturn_AndKeepsTheLineMap()
+        {
+            var generated = ExecSource.BuildMapped("Time.time", null, true, ExecSource.BodyKind.Sync,
+                returnExpression: true);
+
+            StringAssert.Contains("return (", generated.Text);
+            StringAssert.Contains("#line 1 \"exec-snippet\"", generated.Text);
+            var lines = generated.Text.Replace("\r\n", "\n").Split('\n');
+            Assert.AreEqual("Time.time", lines[generated.BodyStartLine - 1],
+                "BodyStartLine must point at the caller's line 1, whatever wraps it");
+        }
+
+        [Test]
+        public void StatementForm_TerminatesABodyWrittenWithoutItsSemicolon()
+        {
+            // `Debug.Log("x")` is what a caller types at a prompt; it has to compile as a statement.
+            var generated = ExecSource.BuildMapped("Debug.Log(\"x\")", null, true, ExecSource.BodyKind.Sync);
+            var body = generated.Text.Substring(generated.Text.IndexOf("#line 1"));
+            StringAssert.Contains("    ;", body, "a missing final semicolon is added on its own line");
+        }
+
         // ─── real exec compile path ─────────────────────────────
 
         static async Task<object> Exec(string code, bool noDefaults = false, string usings = null)
@@ -200,6 +251,45 @@ namespace UnityCliConnector.Tests
         {
             Assert.AreEqual("System.Object",
                 DataOf(await Exec("return typeof(Object).FullName;", true, "System")));
+        }
+
+        [Test]
+        public async Task BareExpression_ReturnsItsValueWithoutAReturn()
+        {
+            // The top-level help documents `exec "Time.time"`; a bare expression never compiled
+            // before, because the statement form needs a `return` and a terminating `;`.
+            Assert.AreEqual(42, DataOf(await Exec("40 + 2")));
+        }
+
+        [Test]
+        public async Task VoidCallWithoutASemicolon_RunsAndAnswersNull()
+        {
+            var response = await Exec("Debug.Log(\"exec void call\")");
+            Assert.IsInstanceOf<SuccessResponse>(response,
+                (response as ErrorResponse)?.message ?? "a void call is a valid snippet");
+            Assert.IsNull(((SuccessResponse)response).data);
+        }
+
+        [Test]
+        public async Task CompileError_ReportsTheSnippetLine_NotTheGeneratedOne()
+        {
+            // The generated wrapper used to add ~18 lines, so a snippet error on line 3 read as L21.
+            var message = ((ErrorResponse)await Exec("var a = 1;\nvar b = 2;\nundefinedThing.Run();\nreturn a + b;"))
+                .message;
+
+            StringAssert.Contains("L3:", message);
+            StringAssert.Contains("undefinedThing", message);
+        }
+
+        [Test]
+        public async Task RuntimeError_NamesTheTypeTheMessageAndTheSnippetLine()
+        {
+            var message = ((ErrorResponse)await Exec("string s = null;\nreturn s.Length;")).message;
+
+            StringAssert.Contains("Runtime error:", message);
+            StringAssert.Contains("System.NullReferenceException", message);
+            StringAssert.Contains("Object reference not set", message);
+            StringAssert.Contains("in snippet:line 2", message);
         }
     }
 }

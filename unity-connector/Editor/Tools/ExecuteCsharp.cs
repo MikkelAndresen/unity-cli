@@ -88,9 +88,16 @@ namespace UnityCliConnector.Tools
             var cscPath = p.Get("csc");
             var dotnetPath = p.Get("dotnet");
             var awaitTimeout = p.GetInt("await_timeout") ?? p.GetInt("awaitTimeout") ?? ExecAwait.DefaultTimeoutMs;
-            return await CompileAndExecute(
-                ExecSource.Build(code, extraUsings, includeDefaults, DetectBodyKind(code)),
-                cscPath, dotnetPath, awaitTimeout);
+            var kind = DetectBodyKind(code);
+            var statementForm = ExecSource.BuildMapped(code, extraUsings, includeDefaults, kind, returnExpression: false);
+            // A snippet that is one expression and nothing else is compiled as `return (expr);`, so
+            // `exec "Time.time"` returns the value instead of failing with "; expected". The statement
+            // form is kept as the retry for the one case that is a valid statement but not a value: a
+            // void call (`Debug.Log("x")`), which only compiles — and only answers — as a statement.
+            if (!ExecSource.WrapSingleExpression(code, kind))
+                return await CompileAndExecute(statementForm, null, cscPath, dotnetPath, awaitTimeout);
+            var expressionForm = ExecSource.BuildMapped(code, extraUsings, includeDefaults, kind, returnExpression: true);
+            return await CompileAndExecute(expressionForm, statementForm, cscPath, dotnetPath, awaitTimeout);
         }
 
         /// <summary>
@@ -180,7 +187,8 @@ namespace UnityCliConnector.Tools
             };
         }
 
-        private static async Task<object> CompileAndExecute(string source, string cscOverride = null,
+        private static async Task<object> CompileAndExecute(ExecSource.Generated source,
+            ExecSource.Generated? statementFallback = null, string cscOverride = null,
             string dotnetOverride = null, int awaitTimeoutMs = ExecAwait.DefaultTimeoutMs)
         {
             // Compiler discovery and the reference set read Unity APIs and this domain's
@@ -199,11 +207,12 @@ namespace UnityCliConnector.Tools
 
             var csc = resolved.Csc;
             var dotnet = resolved.Dotnet;
-            var key = ExecCompileCache.KeyFor(source, csc, dotnet, references);
+            var key = ExecCompileCache.KeyFor(source.Text, csc, dotnet, references);
 
             string compileState;
             long compileMs = 0;
             MethodInfo method;
+            var sourceName = "";
 
             if (ExecCompileCache.TryGet(key, out var cached))
             {
@@ -214,15 +223,41 @@ namespace UnityCliConnector.Tools
             {
                 var id = ExecAssemblyPrefix + Guid.NewGuid().ToString("N").Substring(0, 12);
                 var sw = Stopwatch.StartNew();
-                var compiled = await ExecCompiler.CompileAsync(source, references, csc, dotnet, id, CompileTimeoutMs);
+                var compiled = await ExecCompiler.CompileAsync(source.Text, references, csc, dotnet, id, CompileTimeoutMs);
+                var generated = source;
+                var snippetName = id;
+                // Only a void call needs the statement fallback: `return (Debug.Log("x"));` cannot
+                // convert void to object, while as a statement it runs and the snippet answers null.
+                // Any other failure would fail in both shapes, so it is reported from the shape the
+                // caller wrote — and a broken expression pays for one compile, not two.
+                if (!compiled.Ok && !compiled.TimedOut && statementFallback is { } statement &&
+                    compiled.Diagnostics != null &&
+                    compiled.Diagnostics.IndexOf("'void'", StringComparison.OrdinalIgnoreCase) >= 0)
+                {
+                    var statementId = ExecAssemblyPrefix + Guid.NewGuid().ToString("N").Substring(0, 12);
+                    var retried = await ExecCompiler.CompileAsync(statement.Text, references, csc, dotnet, statementId,
+                        CompileTimeoutMs);
+                    if (retried.Ok)
+                    {
+                        compiled = retried;
+                        generated = statement;
+                        snippetName = statementId;
+                        key = ExecCompileCache.KeyFor(statement.Text, csc, dotnet, references);
+                    }
+                    else if (retried.TimedOut)
+                    {
+                        compiled = retried;
+                    }
+                }
                 compileMs = sw.ElapsedMilliseconds;
+                sourceName = snippetName;
 
                 if (compiled.TimedOut)
                     return new ErrorResponse($"Compile timed out after {compileMs}ms.")
                         { meta = CompileMeta("timeout", compileMs, references.Count) };
 
                 if (!compiled.Ok)
-                    return new ErrorResponse($"Compile error:\n{FormatErrors(compiled.Diagnostics)}")
+                    return new ErrorResponse($"Compile error:\n{FormatErrors(compiled.Diagnostics, generated.BodyStartLine)}")
                         { meta = CompileMeta("failed", compileMs, references.Count) };
 
                 // See ReloadedMessage: the compile finished, but not on the thread that may
@@ -231,7 +266,7 @@ namespace UnityCliConnector.Tools
                     return new ErrorResponse(ReloadedMessage)
                         { meta = CompileMeta("interrupted", compileMs, references.Count) };
 
-                var assembly = Assembly.Load(compiled.Bytes);
+                var assembly = Load(compiled);
                 method = assembly.GetType(ExecSource.TypeName)?.GetMethod("Execute");
                 if (method == null)
                     return new ErrorResponse("Internal error: compiled type or method not found.")
@@ -252,7 +287,7 @@ namespace UnityCliConnector.Tools
             catch (TargetInvocationException tie)
             {
                 var inner = tie.InnerException ?? tie;
-                return new ErrorResponse($"Runtime error: {inner.GetType().Name}: {inner.Message}")
+                return new ErrorResponse(FormatRuntimeError(inner, sourceName, source.BodyStartLine))
                     { meta = CompileMeta(compileState, compileMs, references.Count) };
             }
 
@@ -261,7 +296,7 @@ namespace UnityCliConnector.Tools
             var outcome = await ExecAwait.ResolveAsync(result, awaitTimeoutMs);
 
             if (outcome.Error != null)
-                return new ErrorResponse($"Runtime error: {outcome.Error.GetType().Name}: {outcome.Error.Message}")
+                return new ErrorResponse(FormatRuntimeError(outcome.Error, sourceName, source.BodyStartLine))
                     { meta = CompileMeta(compileState, compileMs, references.Count) };
 
             if (outcome.TimedOut)
@@ -414,7 +449,7 @@ namespace UnityCliConnector.Tools
             return null;
         }
 
-        private static string FormatErrors(string raw)
+        private static string FormatErrors(string raw, int bodyStartLine = 0)
         {
             var lines = raw.Split('\n');
             var errors = new List<string>();
@@ -422,13 +457,93 @@ namespace UnityCliConnector.Tools
             {
                 var trimmed = line.Trim();
                 if (string.IsNullOrEmpty(trimmed)) continue;
-                var m = Regex.Match(trimmed, @"\((\d+),\d+\):\s*error\s+\w+:\s*(.+)");
+                var m = Regex.Match(trimmed, @"^(.+?)\((\d+),\d+\):\s*error\s+\w+:\s*(.+)");
                 if (m.Success)
-                    errors.Add($"L{m.Groups[1].Value}: {m.Groups[2].Value}");
+                {
+                    var lineNumber = int.Parse(m.Groups[2].Value);
+                    var snippetLine = SnippetLine(m.Groups[1].Value, lineNumber, bodyStartLine);
+                    errors.Add($"L{snippetLine}: {m.Groups[3].Value}");
+                }
                 else if (trimmed.Contains("error"))
                     errors.Add(trimmed);
             }
             return errors.Count > 0 ? string.Join("\n", errors) : raw;
+        }
+
+        /// <summary>
+        /// Maps a compiler line to the line the caller wrote. The generated body carries a
+        /// `#line 1 "exec-snippet"` directive, so a diagnostic in it already says the snippet's line;
+        /// only a diagnostic in the generated prologue (a bad --usings directive, a malformed wrapper)
+        /// still names the temporary file, and it is clamped to the first snippet line.
+        /// </summary>
+        internal static int SnippetLine(string file, int lineNumber, int bodyStartLine)
+        {
+            if (file.IndexOf(ExecSource.Generated.SnippetFileName, StringComparison.Ordinal) >= 0)
+                return lineNumber;
+            if (bodyStartLine <= 0) return lineNumber;
+            return Math.Max(1, lineNumber - bodyStartLine + 1);
+        }
+
+        // A runtime stack is a diagnostic, not a payload: a handful of user frames is enough to see
+        // which snippet line threw, and the entry cap keeps a deep graph from flooding the answer.
+        private const int RuntimeStackFrames = 5;
+        private const int RuntimeStackChars = 1200;
+
+        /// <summary>
+        /// The exception type, message and a short stack, with generated-file frames rewritten to the
+        /// snippet line they came from. Frames inside Unity's engine are collapsed by the same filter
+        /// read_console uses, so what is left is where the caller's code actually threw.
+        /// </summary>
+        internal static string FormatRuntimeError(Exception exception, string snippetName, int bodyStartLine)
+        {
+            var formatted = StackTraceFilter.Format(exception.ToString(), StackTraceFilter.StacktraceMode.User,
+                RuntimeStackFrames, RuntimeStackChars);
+            return "Runtime error: " + RewriteSnippetFrames(formatted.Text, snippetName, bodyStartLine);
+        }
+
+        /// <summary>
+        /// Rewrites `in <temp file>.cs:line N` to `in snippet:line N` using the same mapping as the
+        /// compiler diagnostics. A stack without symbols (no portable PDB) has no line numbers and is
+        /// left as the runtime printed it.
+        /// </summary>
+        internal static string RewriteSnippetFrames(string stack, string snippetName, int bodyStartLine)
+        {
+            if (string.IsNullOrEmpty(stack)) return stack;
+            // The portable PDB attributes frames to the #line document, so a frame reads
+            // `in <temp dir>/exec-snippet:3` and its number is already the snippet's.
+            stack = Regex.Replace(stack,
+                @"in\s+[^\r\n]*?" + Regex.Escape(ExecSource.Generated.SnippetFileName) + @":(?<line>\d+)",
+                match => $"in snippet:line {match.Groups["line"].Value}");
+            return Regex.Replace(stack,
+                @"in\s+(?<file>[^\r\n]*?)\.cs:line (?<line>\d+)",
+                match =>
+                {
+                    var file = match.Groups["file"].Value;
+                    var line = int.Parse(match.Groups["line"].Value);
+                    var mapped = file.IndexOf(ExecSource.Generated.SnippetFileName, StringComparison.Ordinal) >= 0
+                        ? line
+                        : SnippetLine(file + ".cs", line, bodyStartLine);
+                    return $"in snippet:line {mapped}";
+                });
+        }
+
+        /// <summary>
+        /// Loads the compiled snippet. The portable PDB travels with it so a stack trace can name the
+        /// snippet line; runtimes that refuse the symbol store still run the snippet, just without
+        /// line numbers in its frames.
+        /// </summary>
+        private static Assembly Load(ExecCompiler.Result compiled)
+        {
+            if (compiled.Pdb is { Length: > 0 })
+            {
+                try { return Assembly.Load(compiled.Bytes, compiled.Pdb); }
+                catch (Exception e) when (e is ArgumentException || e is BadImageFormatException ||
+                                          e is NotSupportedException || e is IOException)
+                {
+                    // Fall through to a symbol-less load.
+                }
+            }
+            return Assembly.Load(compiled.Bytes);
         }
 
         private const int MaxDepth = 6;

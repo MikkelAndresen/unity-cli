@@ -262,6 +262,57 @@ namespace UnityCliConnector.Tests
         }
 
         [Test]
+        public void EntryTypes_AreReportedPerEntryInAParallelArray()
+        {
+            // The entries used to be bare strings, so a `--type error,warning,log` listing gave no way
+            // to tell which line was the error an agent was looking for.
+            IgnoreFailingLogs();
+            const string marker = Marker + "_typed";
+            Debug.Log(marker + "_log");
+            Debug.LogWarning(marker + "_warn");
+            Debug.LogError(marker + "_err");
+
+            var data = Run(new JObject { ["type"] = "error,warning,log", ["lines"] = 200, ["stacktrace"] = "none" });
+            var entries = data["entries"].Values<string>().ToList();
+            var types = data["types"].Values<string>().ToList();
+
+            Assert.AreEqual(entries.Count, types.Count, "the types array is index-aligned with entries");
+            var index = entries.FindIndex(e => e == marker + "_warn");
+            Assert.GreaterOrEqual(index, 0);
+            Assert.AreEqual("warning", types[index]);
+            index = entries.FindIndex(e => e == marker + "_err");
+            Assert.GreaterOrEqual(index, 0);
+            Assert.AreEqual("error", types[index]);
+            index = entries.FindIndex(e => e == marker + "_log");
+            Assert.GreaterOrEqual(index, 0);
+            Assert.AreEqual("log", types[index]);
+        }
+
+        [Test]
+        public void UnknownType_IsRejectedInsteadOfReturningNothing()
+        {
+            var response = ReadConsole.HandleCommand(new JObject { ["type"] = "bogus" }) as ErrorResponse;
+
+            Assert.IsNotNull(response, "a bad --type must not answer an empty list as if it were valid");
+            StringAssert.Contains("bogus", response.message);
+            var data = JObject.FromObject(response.data);
+            CollectionAssert.Contains(data["unknown_types"].ToObject<string[]>(), "bogus");
+            var known = data["known_types"].ToObject<string[]>();
+            CollectionAssert.Contains(known, "error");
+            CollectionAssert.Contains(known, "warning");
+            CollectionAssert.Contains(known, "log");
+        }
+
+        [Test]
+        public void NegativeLines_IsRejected()
+        {
+            var response = ReadConsole.HandleCommand(new JObject { ["lines"] = -1 }) as ErrorResponse;
+
+            Assert.IsNotNull(response);
+            StringAssert.Contains("--lines", response.message);
+        }
+
+        [Test]
         public void UnknownStacktraceMode_IsRejected()
         {
             var response = ReadConsole.HandleCommand(new JObject { ["stacktrace"] = "short" }) as ErrorResponse;

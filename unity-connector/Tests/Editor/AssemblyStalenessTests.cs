@@ -139,8 +139,8 @@ namespace UnityCliConnector.Tests
             Assert.AreEqual(1, result.CoveredCount);
             Assert.IsTrue(result.CoveredSample.Unverified, "without a content record the compile clock is all there is");
             Assert.IsNull(AssemblyStaleness.FormatLine(result), "a covered assembly must not read as a refusal");
-            StringAssert.Contains("not stale (unverified, no content record): Game.dll (built ", AssemblyStaleness.FormatCoveredLine(result));
-            StringAssert.Contains("read that source and kept the DLL", AssemblyStaleness.FormatCoveredLine(result));
+            StringAssert.Contains("not stale, no content record yet: Game.dll (built ", AssemblyStaleness.FormatCoveredLine(result));
+            StringAssert.Contains("read it, so a moved mtime alone is not an edit", AssemblyStaleness.FormatCoveredLine(result));
         }
 
         [Test]
@@ -206,8 +206,8 @@ namespace UnityCliConnector.Tests
                 coveredSinceMs: BaseMs + 2_000, coveredClockIsFinish: true);
 
             var line = AssemblyStaleness.FormatCoveredLine(result);
-            StringAssert.Contains("compile that finished", line);
-            StringAssert.DoesNotContain("compile that started", line);
+            StringAssert.Contains("compile finished", line);
+            StringAssert.DoesNotContain("compile starting", line);
         }
 
         [Test]
@@ -325,6 +325,53 @@ namespace UnityCliConnector.Tests
 
             Assert.AreEqual(0, result.ScannedAssemblies,
                 "a built-in package's DLL is not the caller's to rebuild");
+        }
+
+        [Test]
+        public void Evaluate_CleanScan_RecordsContentsSoALaterTouchIsVerified()
+        {
+            // A project whose DLL was already current when the connector first saw it never got a
+            // content record, so every later `touch` printed "no content record" forever.
+            var source = Write("Game/Player.cs", BaseMs);
+            var dll = Write("Library/ScriptAssemblies/Game.dll", BaseMs + 1_000);
+            var records = new Dictionary<string, AssemblyStaleness.AssemblyContentRecord>();
+            var saves = 0;
+
+            var clean = AssemblyStaleness.Evaluate(new[] { Input("Game", dll, source) }, _tmp, 5_000,
+                0, records, null, false, () => saves++);
+
+            Assert.AreEqual(0, clean.StaleCount);
+            Assert.AreEqual(1, saves, "the first clean scan writes the record");
+            var key = AssemblyStaleness.ContentRecordKey("Game", dll);
+            Assert.IsTrue(records.ContainsKey(key));
+            Assert.AreEqual(AssemblyStaleness.ComputeFileHash(source), records[key].Sources[source]);
+
+            // The touch: same contents, newer mtime, DLL left alone by Unity's cache.
+            File.SetLastWriteTimeUtc(source, DateTimeOffset.FromUnixTimeMilliseconds(BaseMs + 2_000).UtcDateTime);
+            var afterTouch = AssemblyStaleness.Evaluate(new[] { Input("Game", dll, source) }, _tmp, 5_000,
+                0, records, null, false, () => saves++);
+
+            Assert.AreEqual(0, afterTouch.StaleCount);
+            Assert.AreEqual(1, afterTouch.CoveredCount);
+            Assert.IsFalse(afterTouch.CoveredSample.Unverified,
+                "the record now proves the DLL holds this content, so the line must not say unverified");
+            StringAssert.Contains("content matches", AssemblyStaleness.FormatCoveredLine(afterTouch));
+        }
+
+        [Test]
+        public void Evaluate_DoesNotRecordWhenTheScanIsOutOfBudget()
+        {
+            // Recording is an optimisation for the next scan; it must not make the current answer slower.
+            var source = Write("Game/Player.cs", BaseMs);
+            var dll = Write("Library/ScriptAssemblies/Game.dll", BaseMs + 1_000);
+            var records = new Dictionary<string, AssemblyStaleness.AssemblyContentRecord>();
+            var saves = 0;
+
+            AssemblyStaleness.Evaluate(new[] { Input("Game", dll, source) }, _tmp, 0, 0, records,
+                null, false, () => saves++);
+
+            Assert.AreEqual(0, saves);
+            Assert.IsEmpty(records);
         }
 
         AssemblyStaleness.AssemblyInput Input(string name, string dll, params string[] sources) =>

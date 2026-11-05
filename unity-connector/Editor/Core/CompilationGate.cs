@@ -95,7 +95,7 @@ namespace UnityCliConnector
 			return false;
 		}
 
-		private static void NoteCompileStarted()
+		private static void NoteCompileStarted(bool live = true)
 		{
 			s_State.started_at_ms = NowMs();
 			s_State.finished_via_reload = false;
@@ -104,10 +104,10 @@ namespace UnityCliConnector
 			s_State.boundary_first = s_State.snapshot_first;
 			s_State.boundary_max = s_State.snapshot_max;
 			ByAssembly.Clear();
-			Save();
+			Save(live);
 		}
 
-		private static void NoteCompileFinished(bool afterReload)
+		private static void NoteCompileFinished(bool afterReload, bool live = true)
 		{
 			s_State.finished_at_ms = NowMs();
 			s_State.finished_via_reload = afterReload;
@@ -117,7 +117,7 @@ namespace UnityCliConnector
 				s_State.snapshot_first = first;
 				s_State.snapshot_max = last;
 			}
-			Save();
+			Save(live);
 			// Only a successful compile reloads the domain. A failed one ends here and never
 			// reaches afterAssemblyReload, so it must not leave a reload pending for the next one.
 			CompileProvenance.NoteCompileFinished(afterReload,
@@ -156,9 +156,33 @@ namespace UnityCliConnector
 			}
 		}
 
-		private static void Save()
+		/// <param name="live">true for a real compile event: it goes to the live key even while a test
+		/// holds the gate, because a compile that lands mid-test is what the editor really did and the
+		/// restore afterwards must not roll the clock back over it. Test-driven mutations pass false.</param>
+		private static void Save(bool live = true)
 		{
-			SessionState.SetString(SessionKey, Newtonsoft.Json.JsonConvert.SerializeObject(s_State));
+			var key = s_TestMode && !live ? TestSessionKey : SessionKey;
+			SessionState.SetString(key, Newtonsoft.Json.JsonConvert.SerializeObject(s_State));
+		}
+
+		/// True when the editor holds compile diagnostics the gate would block on. refresh_unity uses it
+		/// to refuse to skip a compile it cannot prove unneeded.
+		public static bool HasOutstandingErrors() => CollectErrors().Count > 0;
+
+		/// Publishes a compile that rebuilt nothing because every assembly was already current (see
+		/// RefreshUnity). The clocks have to move: the CLI waits for the compile clock to advance as its
+		/// proof that a requested compile finished, and "nothing was out of date" is that proof.
+		/// CompilationGate deliberately does not take the compile-start path here — that would clear the
+		/// diagnostics cache and adopt a new console boundary for a compile that never read the console.
+		public static void NoteNothingToCompile()
+		{
+			var now = NowMs();
+			s_State.started_at_ms = now;
+			s_State.finished_at_ms = now;
+			s_State.finished_via_reload = false;
+			s_State.rebuilt = false;
+			Save();
+			CompileProvenance.NoteNothingToCompile(now);
 		}
 
 		/// Returns an ErrorResponse with compile diagnostics if the editor is mid-compile or has
@@ -576,7 +600,7 @@ namespace UnityCliConnector
 			s_State.snapshot_first = firstIndex;
 		}
 
-		internal static void NoteCompileStartedForTests() => NoteCompileStarted();
+		internal static void NoteCompileStartedForTests() => NoteCompileStarted(live: false);
 
 		internal static void NoteAssemblyCompiledForTests() => s_State.rebuilt = true;
 
@@ -592,35 +616,35 @@ namespace UnityCliConnector
 			s_State.finished_via_reload = finishedViaReload;
 		}
 
-		// Tests run in the live editor, so they must not leave the gate without the boundary and
-		// compile clocks the editor already had: the first reset keeps what is persisted and
-		// RestoreLiveStateForTests puts it back.
-		static string s_PersistedBeforeTests;
-		static bool s_PersistedCaptured;
+		// Tests run in the live editor, so they must not be able to clobber the record the CLI reads:
+		// while a test holds the gate, Save/Load go to a separate SessionState key, and a test that
+		// forgets its restore can only lose its own state. The heartbeat file is still written from
+		// the in-memory state, which is why Heartbeat falls back to CompileProvenance for the clock.
+		static bool s_TestMode;
+		static readonly string TestSessionKey = SessionKey + ".tests";
 
 		internal static void ResetForTests()
 		{
-			if (!s_PersistedCaptured)
-			{
-				s_PersistedBeforeTests = SessionState.GetString(SessionKey, null);
-				s_PersistedCaptured = true;
-			}
+			s_TestMode = true;
 			ByAssembly.Clear();
 			s_State = new Freshness();
 			ConsoleRangeForTests = null;
 			FileExistsForTests = null;
-			SessionState.EraseString(SessionKey);
+			SessionState.EraseString(TestSessionKey);
 		}
 
+		/// Reloads whatever the live record holds now, rather than a snapshot taken when the test started:
+		/// a compile that finished while the test held the gate wrote the live key (Save(live: true)), and
+		/// restoring an older snapshot over it is exactly how the heartbeat lost the compile clock.
 		internal static void RestoreLiveStateForTests()
 		{
-			if (!s_PersistedCaptured) return;
-			if (s_PersistedBeforeTests == null) SessionState.EraseString(SessionKey);
-			else SessionState.SetString(SessionKey, s_PersistedBeforeTests);
-			s_PersistedCaptured = false;
+			if (!s_TestMode) return;
+			s_TestMode = false;
+			SessionState.EraseString(TestSessionKey);
 			Load();
 		}
 
-		internal static void NoteCompileFinishedForTests(bool afterReload = false) => NoteCompileFinished(afterReload);
+		internal static void NoteCompileFinishedForTests(bool afterReload = false)
+			=> NoteCompileFinished(afterReload, live: false);
 	}
 }

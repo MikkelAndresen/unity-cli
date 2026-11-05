@@ -130,7 +130,7 @@ namespace UnityCliConnector
             var remaining = Math.Max(0, budgetMs - collectionMs);
             var result = Evaluate(inputs, projectRoot, remaining,
                 CompileProvenance.LastCompileStartedAtMs(), LoadContentRecords(), null,
-                CompileProvenance.LastCompileClockFromFinish());
+                CompileProvenance.LastCompileClockFromFinish(), SaveContentRecords);
             if (truncated)
                 result.Complete = false;
             result.ScanMs += collectionMs;
@@ -153,9 +153,13 @@ namespace UnityCliConnector
         /// did not rewrite the DLL. Null means "no record", which falls back to the compile clock.</param>
         /// <param name="hashFile">Test seam; production hashes the file on disk.</param>
         /// <param name="coveredClockIsFinish">True when coveredSinceMs fell back to a compile finish.</param>
+        /// <param name="saveRecords">Persists <paramref name="contentRecords"/> after this scan filled
+        /// in a missing one. Without that, a project whose DLL was already current when the connector
+        /// first saw it never gets a record, and every later touch is reported as unverified.</param>
         public static ScanResult Evaluate(IReadOnlyList<AssemblyInput> assemblies, string projectRoot, int budgetMs,
             long coveredSinceMs = 0, IReadOnlyDictionary<string, AssemblyContentRecord> contentRecords = null,
-            Func<string, string> hashFile = null, bool coveredClockIsFinish = false)
+            Func<string, string> hashFile = null, bool coveredClockIsFinish = false,
+            Action saveRecords = null)
         {
             var result = new ScanResult
             {
@@ -210,7 +214,10 @@ namespace UnityCliConnector
                 if (newestSource == null)
                     continue;
                 if (dllMs.HasValue && dllMs.Value >= newestMs)
+                {
+                    RecordContentsWhenMissing(assembly, contentRecords, hashFile, watch, budgetMs, saveRecords);
                     continue;
+                }
 
                 var sample = new StaleAssembly
                 {
@@ -258,6 +265,37 @@ namespace UnityCliConnector
 
             result.ScanMs = (int)watch.ElapsedMilliseconds;
             return result;
+        }
+
+        /// Fills in the content record for an assembly the DLL already covers. This is the one moment
+        /// the record is provably right: the DLL is newer than every source, so its contents are what
+        /// the successful compile read. Recording it here is what lets a later `touch` be answered with
+        /// "content matches" instead of "unverified, no content record".
+        static void RecordContentsWhenMissing(AssemblyInput assembly,
+            IReadOnlyDictionary<string, AssemblyContentRecord> contentRecords, Func<string, string> hashFile,
+            Stopwatch watch, int budgetMs, Action saveRecords)
+        {
+            if (contentRecords == null || saveRecords == null || assembly.Sources == null) return;
+            var key = ContentRecordKey(assembly.Name, assembly.OutputPath);
+            if (contentRecords.ContainsKey(key)) return;
+
+            var hashes = new Dictionary<string, string>(StringComparer.Ordinal);
+            foreach (var source in assembly.Sources)
+            {
+                if (string.IsNullOrEmpty(source) || !File.Exists(source)) continue;
+                // Past the budget the scan stops recording rather than answering slower; the cost of
+                // a missing record is the noisy unverified line, not a wrong verdict.
+                if (watch.ElapsedMilliseconds >= budgetMs) return;
+                var hash = hashFile != null ? hashFile(source) : ComputeFileHash(source);
+                if (hash == null) return;
+                hashes[source] = hash;
+            }
+            if (hashes.Count == 0) return;
+
+            if (contentRecords is IDictionary<string, AssemblyContentRecord> writable)
+                writable[key] = new AssemblyContentRecord { Dll = assembly.OutputPath, Sources = hashes };
+            else return;
+            saveRecords();
         }
 
         /// True/False when the record proves the candidate contents do or do not match; null when no
@@ -332,11 +370,10 @@ namespace UnityCliConnector
                        "recorded for it; a moved mtime alone does not mean the DLL is out of date";
             }
 
-            var compile = result.CoveredClockIsFinish ? "finished" : "started";
-            return $"not stale (unverified, no content record): {dll} (built {Clock(first.DllMtimeMs ?? 0)}) " +
-                   $"is older than {first.NewestSource} ({Clock(first.NewestSourceMtimeMs)}){more}, but the " +
-                   $"compile that {compile} {Clock(result.CoveredSinceMs)} read that source and kept the DLL; " +
-                   "a moved mtime alone does not mean the DLL is out of date";
+            var compile = result.CoveredClockIsFinish ? "finished" : "starting";
+            return $"not stale, no content record yet: {dll} (built {Clock(first.DllMtimeMs ?? 0)}) " +
+                   $"is older than {first.NewestSource} ({Clock(first.NewestSourceMtimeMs)}){more}, but the compile " +
+                   $"{compile} {Clock(result.CoveredSinceMs)} read it, so a moved mtime alone is not an edit";
         }
 
         /// The runner's refusal: a stale DLL runs old code, and an incomplete scan cannot prove the
@@ -349,7 +386,7 @@ namespace UnityCliConnector
             if (scan.StaleCount > 0)
             {
                 var line = FormatLine(scan);
-                var staleMessage = line + " Tests were not run; pass --allow-stale to run them anyway.";
+                var staleMessage = line + ". Tests were not run; pass --allow-stale to run them anyway.";
                 return new ErrorResponse(staleMessage, new
                 {
                     blocked = "stale-assembly",

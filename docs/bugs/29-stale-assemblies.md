@@ -262,3 +262,22 @@ restored byte-for-byte.
 - An explicit `editor refresh --compile clean` is refused when the connector's reply does not
   advertise `clean_compile_supported`; an older connector would ignore the mode and answer a plain
   refresh, so the CLI no longer reports "nothing to compile" (exit 0) for a rebuild that never ran.
+
+## Review follow-up (end-to-end run)
+
+- **The content record was never created for a project the connector first saw already built.** A
+  record was only written on `assemblyCompilationFinished`, so an assembly whose DLL Unity had left
+  alone got no record and every later `touch` printed the noisiest line —
+  `not stale (unverified, no content record): Main.dll …` — on every `verify`/`wait`, forever.
+  `Evaluate` now writes the record during the first scan that finds the DLL current (the one state in
+  which the DLL's contents provably are what the compile read), bounded by the same scan budget, with
+  `saveRecords` as the persistence seam. The unverified line is shortened to
+  `not stale, no content record yet: … read it, so a moved mtime alone is not an edit`.
+  `AssemblyStalenessTests.Evaluate_CleanScan_RecordsContentsSoALaterTouchIsVerified` covers it.
+- **Live:** after a clean `verify`, a byte-identical restore of an edited test file reports
+  `not stale: UnityCliConnector.Tests.Editor.dll (built 19:07:36) is older than … but its content
+  matches what the compile recorded for it` — the covered line, not the unverified one.
+- **A stale-assembly refusal glued two sentences together:** `… run unity-cli editor refresh
+  --compile Tests were not run; pass --allow-stale …`. A period now separates them; the refusal was
+  reproduced live by appending a line to a test file and calling `test --assembly …` before Unity
+  compiled (exit 1, one stale assembly, `--allow-stale` runs).

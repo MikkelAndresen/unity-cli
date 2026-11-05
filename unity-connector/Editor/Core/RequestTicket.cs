@@ -59,12 +59,33 @@ namespace UnityCliConnector
         /// Wall-clock ms since the request was accepted. Safe from any thread.
         public int WaitedMs => (int)((Stopwatch.GetTimestamp() - EnqueuedTicks) * 1000 / Stopwatch.Frequency);
 
+        long m_StartedTicks;
+
+        /// <summary>
+        /// How long the request waited before a tool handler started, or -1 while it has not. Frozen
+        /// when the handler begins, so a caller that reports the pick-up wait is not also counting the
+        /// handler's own run time — `exec --meta` used to show a queue wait that contained its
+        /// compile, and the two numbers then added up to more than the invocation's wall time.
+        /// </summary>
+        public int StartedAfterMs
+        {
+            get
+            {
+                var ticks = Volatile.Read(ref m_StartedTicks);
+                return ticks == 0 ? -1 : (int)((ticks - EnqueuedTicks) * 1000 / Stopwatch.Frequency);
+            }
+        }
+
         /// Claims the request for execution. False once it has been answered, which is how a request
         /// that was already answered (deadline or reload) is skipped instead of running late.
         public bool TryBegin()
         {
-            return Interlocked.CompareExchange(ref m_Stage, (int)RequestStage.Running, (int)RequestStage.Queued)
+            var began = Interlocked.CompareExchange(ref m_Stage, (int)RequestStage.Running, (int)RequestStage.Queued)
                 == (int)RequestStage.Queued;
+            // Interlocked.Exchange rather than a plain store: the request thread may read this while it
+            // assembles the answer's meta.
+            if (began) Interlocked.Exchange(ref m_StartedTicks, Stopwatch.GetTimestamp());
+            return began;
         }
 
         /// Answers a request that has not started yet. False if a tool handler is already running it
