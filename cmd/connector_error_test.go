@@ -120,3 +120,16 @@ func TestPrintResponseTo_OrdinaryErrorKeepsItsShape(t *testing.T) {
 		t.Errorf("stderr = %q", out)
 	}
 }
+
+func TestConnectorErrorHint_UnknownCommand(t *testing.T) {
+	burst := connectorErrorHint(&client.CommandResponse{Message: "Unknown command: burst_status"})
+	if !strings.Contains(burst, "com.unity.burst") {
+		t.Errorf("burst hint = %q, want it to name the missing package", burst)
+	}
+	if other := connectorErrorHint(&client.CommandResponse{Message: "Unknown command: scene_lst"}); other != "" {
+		t.Errorf("hint = %q, want none for a command that is not a Burst tool", other)
+	}
+	if got := connectorErrorHint(&client.CommandResponse{Message: "something else"}); got != "" {
+		t.Errorf("hint = %q, want none for an unrecognised failure", got)
+	}
+}

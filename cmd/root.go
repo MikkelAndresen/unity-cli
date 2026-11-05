@@ -138,15 +138,9 @@ func Execute() error {
 	// before the one invocation deadline is set, and stdin is where it can come from.
 	var execParams map[string]interface{}
 	if category == "exec" {
-		var fromStdin bool
-		subArgs, fromStdin, err = readStdinIfPiped(subArgs, effectiveTimeout)
+		subArgs, err = execSnippetArgs(subArgs, effectiveTimeout)
 		if err != nil {
 			return err
-		}
-		// Both would be code, and silently preferring one of them is how the wrong snippet runs.
-		// subArgs[1:] is the caller's own argument list, now behind the piped snippet.
-		if _, positional := scanArgs(subArgs[1:]); fromStdin && len(positional) > 0 {
-			return fmt.Errorf("pass the code either as an argument or on stdin, not both")
 		}
 		execParams, err = buildParams(subArgs, nil)
 		if err != nil {
@@ -772,6 +766,17 @@ func buildParams(args []string, base map[string]interface{}) (map[string]interfa
 	}
 
 	return params, nil
+}
+
+// execSnippetArgs takes exec's code from stdin only when no code argument was given. Agent shells
+// often hand the CLI a stdin pipe that never closes, so reading it next to an argument stalled every
+// `exec "<code>"` for the whole --timeout.
+func execSnippetArgs(args []string, timeoutMs int) ([]string, error) {
+	if _, positional := scanArgs(args); len(positional) > 0 {
+		return args, nil
+	}
+	args, _, err := readStdinIfPiped(args, timeoutMs)
+	return args, err
 }
 
 // readStdinIfPiped reads stdin when piped and prepends it as the first positional arg. The read is

@@ -1,6 +1,8 @@
 package cmd
 
 import (
+	"strings"
+
 	"github.com/youngwoocho02/unity-cli/internal/client"
 )
 
@@ -37,6 +39,24 @@ func connectorErrorHint(resp *client.CommandResponse) string {
 		// unchanged would only earn the same refusal.
 		return "the request was refused before the tool ran; none of its parameters were applied, so check the parameter name ('unity-cli list' prints each tool's schema) and repeat it"
 	default:
+		return unknownCommandHint(resp)
+	}
+}
+
+// burstTools live in unity-connector/Editor/Burst, an assembly whose asmdef only compiles when the
+// project has com.unity.burst, so "Unknown command" for them means a missing package, not a typo.
+var burstTools = map[string]bool{"burst_status": true, "clear_burst_cache": true}
+
+func unknownCommandHint(resp *client.CommandResponse) string {
+	if resp == nil {
 		return ""
 	}
+	name, ok := strings.CutPrefix(resp.Message, "Unknown command: ")
+	if !ok {
+		return ""
+	}
+	if !burstTools[strings.TrimSpace(name)] {
+		return ""
+	}
+	return "this tool is only compiled when the project has the com.unity.burst package; without Burst there is nothing for it to report"
 }

@@ -37,6 +37,34 @@ func TestReadStdinIfPiped_BoundsANeverClosingProducer(t *testing.T) {
 	}
 }
 
+// TestExecSnippetArgs_IgnoresAnOpenStdinWhenCodeIsAnArgument: an agent shell's stdin is often a pipe
+// nobody writes to or closes; with the code passed as an argument, exec must not wait on it.
+func TestExecSnippetArgs_IgnoresAnOpenStdinWhenCodeIsAnArgument(t *testing.T) {
+	readEnd, writeEnd, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = writeEnd.Close()
+		_ = readEnd.Close()
+	})
+	orig := os.Stdin
+	os.Stdin = readEnd
+	t.Cleanup(func() { os.Stdin = orig })
+
+	start := time.Now()
+	args, err := execSnippetArgs([]string{"--usings", "X", "return 1;"}, 5000)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
+		t.Errorf("exec waited %v on stdin despite a code argument", elapsed)
+	}
+	if len(args) != 3 || args[2] != "return 1;" {
+		t.Errorf("args = %v, want them unchanged", args)
+	}
+}
+
 func TestReadStdinIfPiped_PrependsPipedCode(t *testing.T) {
 	readEnd, writeEnd, err := os.Pipe()
 	if err != nil {
