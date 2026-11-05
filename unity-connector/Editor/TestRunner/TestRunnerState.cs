@@ -87,11 +87,13 @@ namespace UnityCliConnector.TestRunner
             var skipped = new List<string>();
             var logged  = new List<RunTests.LoggedException>();
 
+            var wake = EditorWake.Hold();
             var api = ScriptableObject.CreateInstance<TestRunnerApi>();
             var callbacks = new RunTests.TestCallbacks(
                 onResult: r => RunTests.CollectResult(r, passed, failed, skipped, logged),
                 onFinished: _ =>
                 {
+                    wake.Dispose();
                     Object.DestroyImmediate(api);
                     ClearPending(port);
                     RunTests.WriteResultsFile(port, passed, failed, skipped, logged);

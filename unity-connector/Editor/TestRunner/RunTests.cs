@@ -134,12 +134,16 @@ namespace UnityCliConnector.TestRunner
             var skipped = new List<string>();
             var logged  = new List<RunTests.LoggedException>();
 
+            // The request returns before the run does, and the CLI then polls the results file
+            // without asking the editor anything, so nothing else keeps the editor updating.
+            var wake = EditorWake.Hold();
             var api = ScriptableObject.CreateInstance<TestRunnerApi>();
             TestCallbacks callbacks = null;
             callbacks = new TestCallbacks(
                 onResult: r => CollectResult(r, passed, failed, skipped, logged),
                 onFinished: _ =>
                 {
+                    wake.Dispose();
                     api.UnregisterCallbacks(callbacks);
                     Object.DestroyImmediate(api);
                     TestRunnerState.ClearPending(port);

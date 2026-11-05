@@ -15,8 +15,9 @@ namespace UnityCliConnector
     /// <summary>
     /// Lightweight HTTP server on localhost. Receives CLI commands as POST /command,
     /// dispatches via CommandRouter, returns JSON responses.
-    /// Uses ConcurrentQueue + EditorApplication.update for main-thread marshaling.
-    /// Background editor throttling can still delay command execution.
+    /// Uses ConcurrentQueue + EditorApplication.update for main-thread marshaling. A queued request
+    /// wakes the editor and keeps it updating until answered (EditorWake), so an unfocused editor's
+    /// background update rate does not delay it.
     /// Survives domain reloads via InitializeOnLoad.
     /// Every accepted request gets exactly one answer: the request thread answers it when the main
     /// thread does not pick it up within its queue deadline, and the reload/quit path answers
@@ -235,11 +236,6 @@ namespace UnityCliConnector
             Debug.Log($"[UnityCliConnector] HTTP server stopped (was port {port})");
         }
 
-        static void ForceEditorUpdate()
-        {
-            s_MainContext?.Post(_ => RequestEditorUpdate(), null);
-        }
-
         internal static void RequestEditorUpdate()
         {
             try { EditorApplication.QueuePlayerLoopUpdate(); }
@@ -427,8 +423,12 @@ namespace UnityCliConnector
                                 Parameters = parameters,
                                 Ticket = ticket,
                             });
-                            ForceEditorUpdate();
-                            result = await AwaitAnswer(ticket);
+                            // After the enqueue: a wake that ran before it could find the queue empty.
+                            using (EditorWake.Hold())
+                            {
+                                EditorWake.Now();
+                                result = await AwaitAnswer(ticket);
+                            }
                             ReportSlowQueue(ticket, ref result);
                         }
                     }

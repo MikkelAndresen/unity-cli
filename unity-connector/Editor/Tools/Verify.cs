@@ -157,8 +157,13 @@ namespace UnityCliConnector.Tools
             var state = Pending();
             if (state == null) return Error("", "verify: no job is pending", 2);
             JObject result;
-            try { result = await Steps(state); }
-            catch (Exception e) { result = Error(state.job, "verify failed: " + e.Message, 2); }
+            // A job resumed after a domain reload runs before the CLI's request for it arrives, so
+            // no request is holding the editor awake for it.
+            using (EditorWake.Hold())
+            {
+                try { result = await Steps(state); }
+                catch (Exception e) { result = Error(state.job, "verify failed: " + e.Message, 2); }
+            }
             return Finish(result);
         }
 
