@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
 	"os"
 	"strings"
 	"time"
@@ -40,6 +39,9 @@ func editorCmd(ctx context.Context, args []string, send sendFn, resolve instance
 		return send("manage_editor", map[string]interface{}{"action": "pause"})
 
 	case "refresh":
+		if err := rejectIncompleteFlags("editor refresh", flags); err != nil {
+			return nil, err
+		}
 		_, force := flags["force"]
 		_, keepConsole := flags["keep-console"]
 		params := map[string]interface{}{}
@@ -54,9 +56,6 @@ func editorCmd(ctx context.Context, args []string, send sendFn, resolve instance
 			}
 			params["compile"] = mode
 			return editorRefreshCompile(ctx, send, resolve, params, keepConsole, os.Stderr)
-		}
-		if keepConsole {
-			return nil, fmt.Errorf("editor refresh --keep-console only applies with --compile (it keeps the console uncleared before the compile, so the compile report may include older errors)")
 		}
 		return send("refresh_unity", params)
 
@@ -84,12 +83,6 @@ func refreshCompileMode(raw string) (string, error) {
 // finish, and answers with one report that says what the compile did. It returns the report even
 // when the compile failed or timed out, so the JSON is printed before the non-zero exit.
 func editorRefreshCompile(ctx context.Context, send sendFn, resolve instanceResolver, params map[string]interface{}, keepConsole bool, logw io.Writer) (*client.CommandResponse, error) {
-	// The connector closes its connection across the domain reload the compile triggers, which Go's
-	// HTTP client logs as an "Unsolicited response" line — noise next to the report. Same as verify.
-	original := log.Writer()
-	log.SetOutput(&suppressWriter{w: original, suppress: "Unsolicited response received on idle HTTP channel"})
-	defer log.SetOutput(original)
-
 	// A Burst error stays in the console after its code changes, so a stale one would be reported
 	// as this compile's failure; clear it first and let the compile log a live one. Same as verify,
 	// including the --keep-console opt-out.
@@ -232,6 +225,10 @@ type playModeReport struct {
 // the heartbeat is read back instead, and reaching the wanted state is what decides the exit code.
 func editorPlayModeCmd(ctx context.Context, action string, flags map[string]string, send sendFn,
 	resolve instanceResolver) (*client.CommandResponse, error) {
+
+	if err := rejectContradictoryFlags("editor "+action, flags); err != nil {
+		return nil, err
+	}
 
 	params := map[string]interface{}{"action": action}
 	if _, wait := flags["wait"]; wait {

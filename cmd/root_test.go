@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log"
+	"os"
 	"reflect"
 	"strings"
 	"testing"
@@ -433,5 +435,20 @@ func TestPrintResponseTo_MetaGoesToTheErrorWriter(t *testing.T) {
 	}
 	if errOut.String() != "meta: {\"compile\":\"cached\"}\n" {
 		t.Errorf("stderr = %q, want only the meta line", errOut.String())
+	}
+}
+
+// TestSilenceStdlibLogger: net/http's "Unsolicited response received on idle HTTP channel" note is a
+// bare log.Printf, which no client or transport option can turn off — only the standard logger's
+// destination can. This CLI logs nothing else through it.
+func TestSilenceStdlibLogger(t *testing.T) {
+	original := log.Writer()
+	t.Cleanup(func() { log.SetOutput(original) })
+	log.SetOutput(os.Stderr)
+
+	silenceStdlibLogger()
+
+	if log.Writer() != io.Discard {
+		t.Errorf("log.Writer() = %v, want io.Discard", log.Writer())
 	}
 }

@@ -180,7 +180,7 @@ unity-cli editor play --wait
 # 플레이 모드 종료
 unity-cli editor stop
 
-# 결과 상태를 읽지 않고 변경만 요청
+# 결과 상태를 읽지 않고 변경만 요청 (--wait와 --no-wait는 함께 쓸 수 없음)
 unity-cli editor stop --no-wait
 
 # 일시정지 토글 (플레이 모드에서만 동작)
@@ -242,6 +242,8 @@ unity-cli editor quit
 unity-cli editor quit --save
 
 # 저장하지 않은 씬 변경을 버린다고 명시
+# (--save와 --discard는 서로 모순이라 CLI가 아무것도 멈추기 전에 거부합니다:
+#  unity-cli editor quit --save --discard  -> exit 1, 종료 없음)
 unity-cli editor quit --discard
 
 # 종료를 무시하거나 모달 다이얼로그가 막고 있으면 Unity를 강제 종료
@@ -408,7 +410,7 @@ Unity 버전이 창 필터를 노출하지 않으면 `"available":false`와 안�
 
 가장 강력한 명령어입니다. Unity Editor 런타임에서 임의의 C# 코드를 실행합니다. UnityEngine, UnityEditor, ECS 및 로드된 모든 어셈블리에 접근 가능합니다. 일회성 조회나 수정을 위해 커스텀 도구를 만들 필요가 없습니다.
 
-`return`으로 결과를 받습니다. 주요 namespace는 기본 포함. 프로젝트 전용 타입(예: `Unity.Entities`)만 `--usings`로 추가합니다. csc 컴파일러와 dotnet 런타임은 자동 탐지되고, 탐지에 실패하면 `--csc <path>` 또는 `--dotnet <path>`로 직접 지정합니다.
+한 표현식만 있는 스니펫은 그 값이 그대로 반환되므로 `exec "Time.time"`은 숫자를 답합니다. 표현식을 넘어서는 본문은 statement body이므로 결과를 받으려면 `return`을 써야 합니다. 주요 namespace는 기본 포함. 프로젝트 전용 타입(예: `Unity.Entities`)만 `--usings`로 추가합니다. csc 컴파일러와 dotnet 런타임은 자동 탐지되고, 탐지에 실패하면 `--csc <path>` 또는 `--dotnet <path>`로 직접 지정합니다.
 
 `System`과 `UnityEngine`은 모두 `Object`, `Random`, `Debug`를 정의하므로, 이 이름들은 기본 alias로 Unity 타입에 연결되어 CS0104가 나지 않습니다. 스니펫 맨 위의 `using` 지시문은 생성된 메서드 위로 옮겨지고, 직접 선언한 alias가 기본 alias보다 우선합니다. 기본 집합을 완전히 바꾸려면 `--no_default_usings`로 기본 import와 alias를 끄고 `--usings`로 필요한 것을 나열합니다.
 
@@ -446,7 +448,7 @@ echo 'for (int i = 0; i < 3; i++) { yield return null; yield return i; }' | unit
 
 **결과 형태.** 반환값은 public field와 읽을 수 있는 public property에서 직렬화되므로, anonymous type, property만 가진 에디터 API 객체, list, dictionary, 중첩 객체가 `ToString()` 문자열이 아니라 JSON 객체로 돌아옵니다. 컬렉션은 100개, 깊이는 6에서 잘리고, cycle은 `"<cycle: Type>"`, 예외를 던지는 property는 형제를 잃지 않은 채 `"<error: Type: message>"`가 됩니다. Unity 객체는 식별 문자열(`"Main Camera (UnityEngine.Camera)"`)을 유지하고, Unity math struct는 `Vector3.normalized` 같은 파생값 대신 데이터 멤버를 노출합니다. 직렬화나 `ToString()` fallback이 일어나면 `data`는 문자열이 되고 `meta`에 `serialization_error`가 담깁니다 — `--meta`로 확인합니다.
 
-**컴파일 캐시.** `exec`는 스니펫을 `csc` subprocess로 컴파일하고, 에디터 메인 스레드를 막지 않고 기다린 뒤 로드/실행합니다. 같은 호출(같은 본문, 같은 `--usings`, 같은 reference 집합)은 이미 로드된 어셈블리를 재사용하므로 반복 probe가 프레임 하나로 끝납니다. 응답은 `meta: {"compile":"compiled|cached","compile_ms":N,"reference_assemblies":N}`로 이를 알리며 `data`와 분리되어 있어 결과 파싱은 그대로입니다. `--meta`를 주면 stderr로 출력됩니다:
+**컴파일 캐시.** `exec`는 스니펫을 `csc` subprocess로 컴파일하고, 에디터 메인 스레드를 막지 않고 기다린 뒤 로드/실행합니다. 같은 호출(같은 본문, 같은 `--usings`, 같은 reference 집합)은 이미 로드된 어셈블리를 재사용하므로 반복 probe가 프레임 하나로 끝납니다. 응답은 `meta: {"compile":"compiled|cached","compile_ms":N,"reference_assemblies":N}`로 이를 알리며 `data`와 분리되어 있어 결과 파싱은 그대로입니다. `--meta`를 주면 stderr로 출력됩니다. `compile_ms`는 csc subprocess만의 시간이라 캐시 hit이면 `0`이고, 스니펫 자체의 실행 시간(`await` 포함)은 여기에 들어가지 않습니다:
 
 ```bash
 unity-cli exec --meta "return Application.dataPath;"   # meta: {"compile":"compiled","compile_ms":403,…}
@@ -491,6 +493,15 @@ unity-cli api UnityEngine.Object.FindObjectOfType --docs
 ```
 
 타입 질의는 간단한 이름, 전체 이름, 그리고 제네릭의 두 표기(`BufferLookup`, `BufferLookup<T>`, `` BufferLookup`1 ``)를 받습니다. 여러 타입이 일치하면 가장 잘 맞는 것부터 각각(최대 `--max_types`, 기본 5) 설명합니다. `[Obsolete]` 멤버는 메시지, 에러 여부, 그리고 안내가 대체 멤버를 지목하면 그 대체(`Use X instead`, `(UnityUpgradable) -> X`)를 보고합니다. `--docs`는 어셈블리 옆에 있는 `.xml`의 `<summary>`를 더합니다 — Unity는 자체 모듈에 문서를 제공하고, 대부분의 서드파티 어셈블리는 제공하지 않으며, 문서 파일이 없으면 아무것도 출력하지 않습니다.
+
+실체가 없는 질의는 성공한 조회가 아닙니다. 커넥터는 오타에 가장 가까운 실제 이름과 무엇이 없었는지 말하는 문장을 답하고, CLI는 그 문장을 먼저 출력한 뒤 답을 그대로 보여 주고 exit 0으로 끝냅니다:
+
+```
+no member named 'Lerpp' on UnityEngine.Vector3, System.Numerics.Vector3; closest: Lerp, Slerp
+{ "exact": false, "matched_by": "type.member", ... }
+```
+
+가까운 것조차 없는 질의(`api NoSuchTypeXyz`)는 커넥터의 `no type or member named …` 메시지와 함께 exit 1입니다. 응답에는 `exact`, `note`, `matched_by`(`type`, `type.member`, `member`, `closest_types`)가 실리므로 스크립트가 문장을 파싱하지 않고도 판단할 수 있습니다. 응답이 `note` 없이 inexact만 알리면 CLI가 직접 `no exact match; closest: …` 줄을 만듭니다.
 
 인덱스는 lazy하게 만들어져 에디터 세션 동안 캐시됩니다. `--budget <ms>`(기본 1500)가 한 호출의 시간을 제한하고, `index.complete: false`는 모든 어셈블리가 검색 가능해지기 전에 예산이 끝났다는 뜻이므로 예산을 올리거나 다시 물어보세요. 이 명령은 프로젝트가 컴파일되지 않는 동안에도 쓸 수 있습니다: 로드된 어셈블리는 마지막으로 정상이던 것들이고, 바로 그때가 실제 API가 필요한 순간입니다.
 
@@ -627,8 +638,9 @@ unity-cli test --mode PlayMode
 # 열린 dirty 씬 저장 후 테스트 실행
 unity-cli test --auto-save-scenes
 
-# 테스트 이름으로 필터링 (부분 문자열 매치)
-unity-cli test --filter MyTestClass
+# 테스트 하나(전체 이름) 또는 클래스 하나(namespace를 포함한 클래스 이름)만
+unity-cli test --filter MyNamespace.MyTests
+unity-cli test --filter MyNamespace.MyTests.SpecificTest
 
 # 지정한 어셈블리의 테스트만 실행 (쉼표로 구분)
 unity-cli test --assembly MyGame.Tests.Editor
@@ -636,6 +648,8 @@ unity-cli test --assembly MyGame.Tests.Editor
 # 어셈블리가 소스보다 오래됐어도 실행
 unity-cli test --allow-stale
 ```
+
+`--filter`는 테스트의 전체 이름과 정확히 일치하는지로 판단합니다: `MyNamespace.MyTests`는 그 클래스의 테스트를, `MyNamespace.MyTests.SpecificTest`는 테스트 하나를 실행하며, 일부 이름이나 namespace만으로는 아무것도 선택되지 않습니다. 아무 테스트도 선택되지 않은 실행은 통과가 아니라 실패입니다: `test`는 `no tests matched (filter …, assembly …)`와 함께 exit 1로 끝나며, 이는 테스트가 하나도 실행되지 않았을 때 `verify`가 내리는 판정과 같습니다. `--assembly`를 주면 그 선택 범위 *밖*의 stale 어셈블리도 함께 보고합니다(`N stale assembly(ies) are outside --assembly; the tests will not load them`) — 그 실행은 해당 어셈블리를 로드하지 않기 때문입니다.
 
 Unity Test Framework 패키지가 필요합니다. 열린 씬에 저장되지 않은 변경이 있으면 기본적으로 테스트를 막습니다. `--auto-save-scenes`로 먼저 저장하거나, `--allow-dirty-scenes`로 그대로 실행할 수 있습니다. 테스트 대상 프로젝트 어셈블리가 소스보다 오래된 경우에도 막습니다 — stale DLL은 예전 코드를 실행하고, 그 결과는 진짜 결과와 똑같이 보입니다. `unity-cli editor refresh --compile`로 다시 빌드하거나, 의도한 것이라면 `--allow-stale`을 주세요. PlayMode 테스트는 도메인 리로드를 트리거하며, CLI가 자동으로 결과를 폴링합니다.
 
@@ -734,7 +748,7 @@ unity-cli compile_status --scan false        # timestamp만, 파일시스템 순
 unity-cli compile_status --scan_budget 1000  # 스캔에 최대 1초 허용
 ```
 
-`wait`는 에디터가 idle이면(heartbeat가 `ready`, `playing`, `paused` — `starting`, `compiling`, `refreshing`, `reloading`, `building`이 아니고 열린 다이얼로그가 없음) 0으로, 포기하면 1로, 에디터가 응답하지 못하면 2로 종료하며 이때 모달 다이얼로그와 그것을 응답하는 명령을 지목합니다. `--timeout`은 초 단위이고 명령 이름 뒤에 와야 합니다. 그 앞의 전역 `--timeout`은 밀리초 단위 요청 timeout으로 남습니다.
+`wait`는 에디터가 idle이면(heartbeat가 `ready`, `playing`, `paused` — `starting`, `compiling`, `refreshing`, `reloading`, `building`이 아니고 열린 다이얼로그가 없음) 0으로, 포기하면 1로, 에디터가 응답하지 못하면 2로 종료하며 이때 모달 다이얼로그와 그것을 응답하는 명령을 지목합니다. `--compile`은 "idle"을 "idle이고 증명된 컴파일"로 바꿉니다: 커넥터가 그것을 증명할 수 없으면(heartbeat에 compile clock이 없거나 `compile_status`가 답하지 않음) `wait --compile`은 이유와 함께, 그리고 실제로 증명하는 명령과 함께 exit 1로 끝납니다. 따라서 `wait --compile && test`가 이 wait가 빌드됐다고 본 적 없는 코드로 테스트를 돌리는 일은 없습니다. `--timeout`은 초 단위이고 명령 이름 뒤에 와야 합니다. 그 앞의 전역 `--timeout`은 밀리초 단위 요청 timeout으로 남습니다.
 
 `--compile`을 주면 0으로 종료하기 위해 둘 중 하나가 참이어야 합니다: `wait`가 시작된 뒤 커넥터의 compile-finished clock이 움직였거나(비교의 양쪽이 모두 커넥터 stamp이므로, 에디터와 시계가 다른 에이전트 샌드박스에서도 동작합니다), 소스 스캔이 마지막 컴파일보다 새로운 것을 찾지 못한 경우(수정이 이미 들어 있다는 뜻)입니다. `wait`가 시작되기 *전에* 끝난 컴파일과 stale 소스는 증거가 되지 못하므로 `wait`는 계속 기다리고, 10초 뒤 그 사실을 알려 줍니다 — Unity는 포커스가 있을 때만 자동 리프레시하기 때문입니다. 터미널에서 구동되는 에디터는 결코 포커스를 갖지 않으므로, 그때 정직한 답은 note에 `run unity-cli verify`를 담은 exit 1입니다:
 
@@ -866,7 +880,7 @@ unity-cli exec --params '{"code":"return 42;"}' --params '{"await_timeout":1000}
 # code와 await_timeout을 함께 보냄
 ```
 
-`--params`는 유일하게 반복할 수 있는 subcommand 플래그입니다. 다른 subcommand 플래그는 한 번만 줄 수 있고, 두 번째(`--filter a --filter b` 같은)는 첫 값을 조용히 덮어쓰는 대신 에러입니다. 어느 `--params` 객체든 잘못된 JSON도 에러입니다. 같은 키가 일반 플래그와 `--params` 양쪽에서 오면 `--params` 값이 이깁니다.
+`--params`는 유일하게 반복할 수 있는 subcommand 플래그입니다. 다른 subcommand 플래그는 한 번만 줄 수 있고, 두 번째(`--filter a --filter b` 같은)는 첫 값을 조용히 덮어쓰는 대신 에러입니다. 명령이 받지 않는 플래그도 에러입니다 — `test --filtre x`는 전체 스위트를 실행하는 대신 `unknown flag --filtre for test; see unity-cli test --help`와 함께 exit 1입니다. 커스텀 도구의 파라미터는 커넥터가 판단하며, 모르는 파라미터는 `data.code: "unknown_parameter"`로 거부합니다(아무것도 실행되지 않았으므로 `unity-cli list`로 스키마를 확인하세요). 어느 `--params` 객체든 잘못된 JSON도 에러입니다. 같은 키가 일반 플래그와 `--params` 양쪽에서 오면 `--params` 값이 이깁니다.
 
 ### 커스텀 도구
 
@@ -954,7 +968,7 @@ unity-cli exec --params '{"code":"AssetDatabase.Refresh(); return 1;","queue_dea
 
 `reload_during_command`이면 CLI가 heartbeat를 다시 읽어 에디터가 어디에 도착했는지 출력하므로, 호출자는 물어볼 필요 없이 `state: Unity is back: Edit mode (heartbeat "ready", port 8090)`를 봅니다. 자체 리로드 대기를 가진 명령(`editor play/stop`, `editor refresh --compile`, `test`, `verify`, `build`, `wait`)은 스스로 보고합니다.
 
-느리지만 성공한 pickup은 `meta`로 말합니다: 대기가 1초를 넘기면 `--meta`가 `queue_wait_ms`와 `queue_depth`를 보여 줍니다.
+느린 응답은 `meta`로 드러나지만, 필드 이름은 실제 범위보다 좁습니다. `compile_ms`는 `csc` subprocess만의 시간이고(캐시 hit이면 0), `queue_wait_ms`는 커넥터가 요청을 받아들인 순간부터 완성된 결과를 갖게 된 순간까지의 에디터 측 구간입니다 — 메인 스레드가 집어 가기 전의 대기만이 아니므로 `compile_ms`와 스니펫 실행 시간을 이미 포함하며, 서로 더하는 값이 아닙니다. `queue_depth`는 그 시점의 대기 요청 수입니다. 큐에 들어간 명령이면 이 구간이 1초를 넘을 때 실립니다(메인 스레드 밖에서 처리되는 `build_status`나 `modal` 도구는 큐를 거치지 않으므로 `queue_wait_ms`가 없습니다). 둘 다 wall-clock 총합이 아닙니다: HTTP 왕복과 CLI가 그 주변에서 하는 일(인스턴스 탐색, heartbeat 대기)은 어느 쪽에도 들어가지 않습니다.
 
 ## 글로벌 옵션
 
@@ -964,7 +978,7 @@ unity-cli exec --params '{"code":"AssetDatabase.Refresh(); return 1;","queue_dea
 | `--project <path>` | 프로젝트 경로로 Unity 인스턴스 선택 | latest |
 | `--timeout <ms>` | 호출당 하나의 예산으로, 인스턴스 탐색, 새 heartbeat 대기, 요청이 함께 씁니다. 남은 예산은 `deadline_ms`로 커넥터에 전달되므로, 커넥터가 이 deadline보다 먼저 큐에 걸린 명령에 답합니다 — [큐에 걸린 명령과 서버 측 deadline](#큐에-걸린-명령과-서버-측-deadline) 참고. 클라이언트 deadline은 연결 실패가 아니라 `timed out ... (the editor may still be running it)`으로 보고됩니다. `test`, `verify`, `editor refresh --compile`은 1800000(30분)이 기본이고, 명시적 `0`은 deadline 없음을 뜻합니다(그래도 커넥터는 큐에 걸린 명령에 60초 기본값 뒤 답합니다). 이는 이전 릴리스와의 호환성 변경입니다: 예전에는 `--timeout 0`이면 heartbeat 대기가 즉시 실패했으므로, 그 의미에 의존하던 스크립트는 작은 양수를 넘겨야 합니다. `wait --timeout`과 build 폴링은 각자의 예산을 유지합니다. `editor quit`/`restart`에서는 종료 대기와 시작 예산이기도 합니다. | 120000 |
 | `--ignore-version-mismatch` | 버전 불일치 경고(및 0.7.0보다 오래된 커넥터에 대한 거부)를 숨김 | false |
-| `--meta` | 응답의 `meta`(호출이 어떻게 처리됐는지, 예: `exec`의 컴파일 캐시 상태)를 stderr로 출력 | false |
+| `--meta` | 응답의 `meta`(호출이 어떻게 처리됐는지, 예: `exec`의 컴파일 캐시 상태)를 stderr로 출력. `compile_ms`는 csc subprocess만의 시간이고, `queue_wait_ms`는 커넥터가 요청을 받아들인 순간부터 결과가 완성된 순간까지의 에디터 측 구간이라 `compile_ms`를 포함합니다(더하는 값이 아님). 둘 다 wall-clock 총합이 아닙니다 | false |
 
 ```bash
 # 특정 Unity 인스턴스에 연결

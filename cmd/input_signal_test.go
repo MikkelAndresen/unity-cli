@@ -25,7 +25,7 @@ func TestReadStdinIfPiped_BoundsANeverClosingProducer(t *testing.T) {
 	t.Cleanup(func() { os.Stdin = orig })
 
 	start := time.Now()
-	_, err = readStdinIfPiped(nil, 50)
+	_, _, err = readStdinIfPiped(nil, 50)
 	if err == nil {
 		t.Fatal("expected the read to be bounded by the invocation budget")
 	}
@@ -54,9 +54,12 @@ func TestReadStdinIfPiped_PrependsPipedCode(t *testing.T) {
 	}
 	_ = writeEnd.Close()
 
-	args, err := readStdinIfPiped([]string{"--usings", "X"}, 5000)
+	args, read, err := readStdinIfPiped([]string{"--usings", "X"}, 5000)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
+	}
+	if !read {
+		t.Error("read = false, want the piped snippet to be reported as read")
 	}
 	if len(args) != 3 || args[0] != "return 1;" || args[1] != "--usings" {
 		t.Errorf("args = %v, want the piped code first", args)

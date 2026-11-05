@@ -41,6 +41,11 @@ func quitCmd(args []string, deps restartDeps) (*client.CommandResponse, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Checked here too, not only in root.go's flag validation: this runs before discovery, so a
+	// refused quit never prints "Stopping Unity" for an editor it then leaves running.
+	if err := rejectContradictoryFlags("editor quit", flags); err != nil {
+		return nil, err
+	}
 
 	inst, err := deps.discover(deps.project, deps.port)
 	if err != nil {

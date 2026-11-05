@@ -248,25 +248,56 @@ func TestWait_CompileGivesUpWhenAStaleEditorNeverCompiles(t *testing.T) {
 	}
 }
 
-func TestWait_CompileOnAConnectorWithoutACompileClockSaysItCannotProveIt(t *testing.T) {
+// TestWait_CompileWithoutACompileClockIsNotSuccess: --compile promises the edit is in a compile, so a
+// connector that cannot prove it must exit 1 instead of letting `wait --compile && test` run tests
+// against code this wait never saw built (F1).
+func TestWait_CompileWithoutACompileClockIsNotSuccess(t *testing.T) {
 	f := &fakeWait{t: t, states: []client.Instance{{State: "ready"}}, prov: prov(provLine, 0)}
 	code, out := f.run("--compile")
-	if code != waitIdle {
-		t.Fatalf("exit = %d, want 0; output:\n%s", code, out)
+	if code != waitTimedOut {
+		t.Fatalf("exit = %d, want 1; output:\n%s", code, out)
 	}
-	if !strings.Contains(out, "reports no compile clock") {
-		t.Errorf("output = %q, want the unproven warning", out)
+	for _, want := range []string{
+		"reports no compile clock",
+		"cannot prove your edit was compiled",
+		"run unity-cli verify",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("output = %q, want it to contain %q", out, want)
+		}
 	}
 }
 
-func TestWait_CompileOnAConnectorWithoutCompileStatusSaysSo(t *testing.T) {
+func TestWait_CompileWithoutCompileStatusIsNotSuccess(t *testing.T) {
 	f := &fakeWait{t: t, states: []client.Instance{{State: "ready", CompileFinishedAt: 1000}}}
 	code, out := f.run("--compile")
-	if code != waitIdle {
-		t.Fatalf("exit = %d, want 0; output:\n%s", code, out)
+	if code != waitTimedOut {
+		t.Fatalf("exit = %d, want 1; output:\n%s", code, out)
 	}
-	if !strings.Contains(out, "compile_status did not answer") {
-		t.Errorf("output = %q, want the no-provenance note", out)
+	for _, want := range []string{"compile_status did not answer", "run unity-cli verify"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("output = %q, want it to contain %q", out, want)
+		}
+	}
+}
+
+// TestWait_UnprovableCompileSaysSoInJSON: the same verdict under --json, where an agent reads the
+// exit code and the reason field instead of the text.
+func TestWait_UnprovableCompileSaysSoInJSON(t *testing.T) {
+	f := &fakeWait{t: t, states: []client.Instance{{State: "ready"}}}
+	code, out := f.run("--compile", "--json")
+	if code != waitTimedOut {
+		t.Fatalf("exit = %d, want 1; output:\n%s", code, out)
+	}
+	var r waitResult
+	if err := json.Unmarshal([]byte(out), &r); err != nil {
+		t.Fatalf("output is not the JSON object: %v (%s)", err, out)
+	}
+	if r.Exit != waitTimedOut || r.Reason == "" || !strings.Contains(r.Reason, "no compile clock") {
+		t.Errorf("result = %+v, want exit 1 and a reason naming the missing compile clock", r)
+	}
+	if !strings.HasPrefix(strings.Join(r.Notes, " "), "run unity-cli verify") {
+		t.Errorf("notes = %v, want the next step first", r.Notes)
 	}
 }
 

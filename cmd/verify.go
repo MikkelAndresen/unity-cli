@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
 	"os"
 	"strconv"
 	"strings"
@@ -112,12 +111,6 @@ func verifyCmd(ctx context.Context, args []string, send, testSend sendFn, resolv
 			max = n
 		}
 	}
-
-	// The connector closes its connection across a domain reload; Go's HTTP client logs that as an
-	// "Unsolicited response" line, which is noise in the brief output.
-	original := log.Writer()
-	log.SetOutput(&suppressWriter{w: original, suppress: "Unsolicited response received on idle HTTP channel"})
-	defer log.SetOutput(original)
 
 	var r verifyResult
 	finish := func(code int) int {

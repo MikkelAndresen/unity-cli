@@ -99,6 +99,11 @@ func restartCmd(args []string, deps restartDeps) (*client.CommandResponse, error
 	if err != nil {
 		return nil, err
 	}
+	// Before the executable lookup and the quit it precedes: contradictory flags must not get as far
+	// as stopping an editor.
+	if err := rejectContradictoryFlags("editor restart", flags); err != nil {
+		return nil, err
+	}
 	clean := subFlagEnabled(flags, "clean")
 	save := subFlagEnabled(flags, "save")
 	discard := subFlagEnabled(flags, "discard")

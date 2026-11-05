@@ -7,6 +7,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"strconv"
 	"strings"
@@ -26,6 +27,8 @@ var (
 )
 
 func Execute() error {
+	silenceStdlibLogger()
+
 	flag.IntVar(&flagPort, "port", 0, "Select Unity instance by active heartbeat port")
 	flag.StringVar(&flagProject, "project", "", "Select Unity instance by project path")
 	flag.IntVar(&flagTimeout, "timeout", defaultRequestTimeoutMs, "Request timeout in milliseconds")
@@ -55,6 +58,12 @@ func Execute() error {
 			printTopicHelp(category)
 			return nil
 		}
+	}
+
+	// Before any discovery, any "Stopping Unity" line or any request: a flag this command does not
+	// take is a typo, and ignoring it silently changes what the command does.
+	if err := validateCommandFlags(category, subArgs); err != nil {
+		return err
 	}
 
 	signalCtx, stopSignals := installSignalCancellation()
@@ -129,9 +138,15 @@ func Execute() error {
 	// before the one invocation deadline is set, and stdin is where it can come from.
 	var execParams map[string]interface{}
 	if category == "exec" {
-		subArgs, err = readStdinIfPiped(subArgs, effectiveTimeout)
+		var fromStdin bool
+		subArgs, fromStdin, err = readStdinIfPiped(subArgs, effectiveTimeout)
 		if err != nil {
 			return err
+		}
+		// Both would be code, and silently preferring one of them is how the wrong snippet runs.
+		// subArgs[1:] is the caller's own argument list, now behind the piped snippet.
+		if _, positional := scanArgs(subArgs[1:]); fromStdin && len(positional) > 0 {
+			return fmt.Errorf("pass the code either as an argument or on stdin, not both")
 		}
 		execParams, err = buildParams(subArgs, nil)
 		if err != nil {
@@ -205,6 +220,15 @@ func Execute() error {
 			return sendAfterReload(ctx, resolve, gate, command, params, 0)
 		}, resolve)
 		resp, err = testCmd(ctx, subArgs, testSend, currentInst.Port)
+		if err == nil && resp != nil {
+			flags, _ := parseSubFlags(subArgs)
+			applyTestVerdict(resp, flags)
+			if resp.Success {
+				if note := staleOutsideSelectionNote(testSend, flags["assembly"]); note != "" {
+					fmt.Fprintf(os.Stderr, "  (%s)\n", note)
+				}
+			}
+		}
 	case "build":
 		// Polling a build must survive the build itself: the main thread is inside BuildPlayer for
 		// the whole run, so the wait runs on build_status (served off the main thread) with its own
@@ -232,6 +256,8 @@ func Execute() error {
 		// --await_timeout already widened the one invocation budget above, so the client never
 		// gives up before the connector's own timed_out marker.
 		resp, err = send("exec", execParams)
+	case "api":
+		resp, err = apiCmd(subArgs, send, os.Stdout)
 	default:
 		var params map[string]interface{}
 		params, err = buildParams(subArgs, nil)
@@ -276,6 +302,14 @@ func Execute() error {
 	}
 
 	return nil
+}
+
+// silenceStdlibLogger sends the standard logger's output nowhere. net/http reports a leftover
+// response on an idle connection with a bare log.Printf (see client.connectorHTTP, which stops the
+// connections being reused), and that line lands in the middle of a caller's `2>&1 | jq`. Nothing in
+// this CLI logs through the standard logger, so there is no output here worth keeping.
+func silenceStdlibLogger() {
+	log.SetOutput(io.Discard)
 }
 
 // printFailureReport prints a report a command built before failing (editor refresh --compile
@@ -543,28 +577,17 @@ func parseSubFlags(args []string) (map[string]string, error) {
 // Only --params may repeat (its objects are merged by buildParams); every other flag names one
 // value, so a second occurrence is an error rather than a silent overwrite.
 func parseFlagArgs(args []string) (flags map[string]string, paramsJSON, positional []string, err error) {
+	tokens, positional := scanArgs(args)
 	flags = map[string]string{}
-	for i := 0; i < len(args); i++ {
-		a := args[i]
-		if !strings.HasPrefix(a, "--") {
-			positional = append(positional, a)
+	for _, token := range tokens {
+		if token.name == "params" {
+			paramsJSON = append(paramsJSON, token.value)
 			continue
 		}
-
-		key := a[2:]
-		value := "true"
-		if i+1 < len(args) && !strings.HasPrefix(args[i+1], "--") {
-			value = args[i+1]
-			i++
+		if previous, exists := flags[token.name]; exists {
+			return nil, nil, nil, fmt.Errorf("duplicate flag --%s (first %q, then %q); only --params may be repeated", token.name, previous, token.value)
 		}
-		if key == "params" {
-			paramsJSON = append(paramsJSON, value)
-			continue
-		}
-		if previous, exists := flags[key]; exists {
-			return nil, nil, nil, fmt.Errorf("duplicate flag --%s (first %q, then %q); only --params may be repeated", key, previous, value)
-		}
-		flags[key] = value
+		flags[token.name] = token.value
 	}
 	return flags, paramsJSON, positional, nil
 }
@@ -753,13 +776,15 @@ func buildParams(args []string, base map[string]interface{}) (map[string]interfa
 
 // readStdinIfPiped reads stdin when piped and prepends it as the first positional arg. The read is
 // bounded by timeoutMs (0 = no bound): a producer that never closes must not outlast --timeout.
-func readStdinIfPiped(args []string, timeoutMs int) ([]string, error) {
+// read reports whether a snippet actually came in, which is what tells a piped call from a terminal
+// one when the caller also passed a code argument.
+func readStdinIfPiped(args []string, timeoutMs int) ([]string, bool, error) {
 	info, err := os.Stdin.Stat()
 	if err != nil {
-		return args, nil
+		return args, false, nil
 	}
 	if info.Mode()&os.ModeCharDevice != 0 {
-		return args, nil // interactive terminal, not piped
+		return args, false, nil // interactive terminal, not piped
 	}
 
 	type readResult struct {
@@ -778,17 +803,17 @@ func readStdinIfPiped(args []string, timeoutMs int) ([]string, error) {
 		select {
 		case res = <-done:
 		case <-time.After(budget):
-			return args, fmt.Errorf("timed out after %s reading piped stdin (--timeout); close the producer or pass the snippet as an argument",
+			return args, false, fmt.Errorf("timed out after %s reading piped stdin (--timeout); close the producer or pass the snippet as an argument",
 				client.FormatBudget(budget))
 		}
 	} else {
 		res = <-done
 	}
 	if res.err != nil || len(res.data) == 0 {
-		return args, nil
+		return args, false, nil
 	}
 	code := strings.TrimRight(string(res.data), "\n\r")
-	return append([]string{code}, args...), nil
+	return append([]string{code}, args...), true, nil
 }
 
 // splitArgs separates global flags from subcommand args.
@@ -835,7 +860,11 @@ func splitArgs(args []string) (flags, commands []string) {
 }
 
 func printHelp() {
-	fmt.Print(`unity-cli ` + Version + ` — Control Unity Editor from the command line
+	printHelpTo(os.Stdout)
+}
+
+func printHelpTo(w io.Writer) {
+	fmt.Fprint(w, `unity-cli `+Version+` — Control Unity Editor from the command line
 
 Usage: unity-cli <command> [subcommand] [options]
 
@@ -862,7 +891,8 @@ Console:
   console --clear               Clear console
 
 Execute C#:
-  exec "<code>"                 Run C# code in Unity (return required for output)
+  exec "<code>"                 Run C# code in Unity (a single expression is returned as-is;
+                                statements need 'return' to produce output)
   echo '<code>' | exec          Pipe code via stdin (avoids shell escaping)
   exec "<code>" --usings x,y    Add extra using directives
   exec "<code>" --no_default_usings     Drop the default usings and aliases
@@ -914,7 +944,7 @@ Burst:
 Tests:
   test                            Run EditMode tests (default)
   test --mode PlayMode            Run PlayMode tests
-  test --filter <name>            Filter by namespace, class, or full test name
+  test --filter <name>            One test's full name (Namespace.Class.Test), or a class's
   test --allow-dirty-scenes       Run even when open scenes have unsaved changes
   test --auto-save-scenes         Save dirty open scenes before running tests
   test --assembly <a,b>           Only tests in these assemblies
@@ -1040,7 +1070,15 @@ Global Options:
                       Per call, --params '{"queue_deadline_ms":300000}' overrides that wait.
   --ignore-version-mismatch
                       Run even when CLI and connector versions differ
-  --meta              Print the response's meta (how the call was served) to stderr
+  --meta              Print the response's meta (how the call was served) to stderr. exec reports
+                      compile (compiled|cached), compile_ms (the csc subprocess only) and
+                      reference_assemblies. A queued command whose ask took the connector >= 1 s,
+                      from accepting the request to having the result, also carries queue_wait_ms —
+                      that span, not just the wait before the main thread picked it up — and
+                      queue_depth. It is the
+                      editor-side handling time, so it overlaps compile_ms and the snippet's own run
+                      time instead of adding to them; the HTTP round trip and the CLI's discovery are
+                      outside it. No field is a wall-clock total.
 
 Use "unity-cli <command> --help" for more information about a command.
 
@@ -1049,7 +1087,11 @@ Notes:
   - Multiple Unity instances: use --port or --project to select
   - Custom tools: any [UnityCliTool] class is auto-discovered
   - A subcommand flag other than --params may be given once; repeating it is an error, not a silent overwrite
+  - A subcommand flag must be one the command takes; an unknown flag is an error (exit 1) instead of
+    being ignored, so a typo cannot quietly change what runs
   - Only exec, build and custom tools read --params; test, verify, editor and wait take their own flags
+  - Custom tools are the exception: their parameters belong to the connector, which refuses one it
+    does not know with data.code "unknown_parameter"
   - Run 'list' to see all available tools
   - Every accepted command gets one answer: a queued command that the main thread never starts is
     answered as main_thread_busy, one still queued when Unity reloads as domain_reload (retry it),
@@ -1059,9 +1101,13 @@ Notes:
 }
 
 func printTopicHelp(topic string) {
+	printTopicHelpTo(os.Stdout, topic)
+}
+
+func printTopicHelpTo(w io.Writer, topic string) {
 	switch topic {
 	case "input":
-		fmt.Print(`Usage: unity-cli input <key|mouse|gamepad|axis|touch|state|reset> [options]
+		fmt.Fprint(w, `Usage: unity-cli input <key|mouse|gamepad|axis|touch|state|reset> [options]
 
 Injects device state into the new Input System (com.unity.inputsystem) and pumps the player loop
 so the player update consumes the events inside the same call — game Update() sees fresh press/release
@@ -1126,7 +1172,7 @@ Examples:
   unity-cli editor stop
 `)
 	case "editor":
-		fmt.Print(`Usage: unity-cli editor <play|stop|pause|refresh|quit|restart> [options]
+		fmt.Fprint(w, `Usage: unity-cli editor <play|stop|pause|refresh|quit|restart> [options]
 
 Subcommands:
   play [--wait|--no-wait]  Enter play mode.
@@ -1138,7 +1184,7 @@ Subcommands:
   stop [--no-wait]    Exit play mode. No effect if not playing.
                       Confirmed from the heartbeat like play.
     --no-wait         Return as soon as the change is requested, without reading the
-                      resulting state back.
+                      resulting state back. --wait and --no-wait are mutually exclusive.
   pause               Toggle pause. Only works during play mode.
   refresh             Refresh AssetDatabase (reimport changed assets).
                       Blocked in play mode unless --force is set.
@@ -1164,6 +1210,8 @@ Subcommands:
                       stops advancing. Unsaved scene changes are discarded unless --save.
     --save            Save open scenes and assets before quitting.
     --discard         Discard unsaved scene changes explicitly (the default).
+                      --save and --discard are mutually exclusive, and the CLI refuses the pair
+                      before it announces or asks for anything.
     --force           If Unity ignores the quit or a modal dialog blocks it,
                       terminate the process (SIGTERM on unix).
   restart             Quit Unity, relaunch the same project, and wait until ready.
@@ -1190,7 +1238,7 @@ Examples:
   unity-cli editor restart --clean
 `)
 	case "console":
-		fmt.Print(`Usage: unity-cli console [options]
+		fmt.Fprint(w, `Usage: unity-cli console [options]
 
 Read Unity console log entries.
 
@@ -1219,12 +1267,14 @@ Examples:
   unity-cli console --clear
 `)
 	case "exec":
-		fmt.Print(`Usage: unity-cli exec "<code>" [options]
+		fmt.Fprint(w, `Usage: unity-cli exec "<code>" [options]
 
 Execute C# code inside Unity Editor. Full access to UnityEngine,
 UnityEditor, and all loaded assemblies.
 
-Use 'return' to get output. Add --usings for types outside default namespaces.
+A snippet that is a single expression returns that expression's value, so exec "Time.time" answers
+with a number. Anything past one expression is a statement body: use 'return' to get output.
+Add --usings for types outside default namespaces.
 Using directives at the top of the snippet are moved above the generated method,
 and an alias there overrides the matching default alias.
 
@@ -1287,10 +1337,11 @@ Stdin:
   echo '<code>' | unity-cli exec [--usings ns1,ns2]
 
 Notes:
-  - Use 'return' for output, 'return null;' for void operations
+  - One bare expression is returned for you; a body of statements needs 'return' for output
+    ('return null;' for a void operation)
 `)
 	case "menu":
-		fmt.Print(`Usage: unity-cli menu "<path>"
+		fmt.Fprint(w, `Usage: unity-cli menu "<path>"
 
 Execute a Unity menu item by its path.
 
@@ -1302,7 +1353,7 @@ Examples:
 Note: File/Quit is blocked for safety.
 `)
 	case "screenshot":
-		fmt.Print(`Usage: unity-cli screenshot [options]
+		fmt.Fprint(w, `Usage: unity-cli screenshot [options]
 
 Capture a PNG of what Unity is rendering. No mode reads screen pixels of an
 editor window, so a window moved off every display cannot break a capture.
@@ -1337,7 +1388,7 @@ Note: --view is the older spelling of --mode: --view scene is --mode scene, but
 --view game is --mode camera (the offscreen render), not the Game view.
 `)
 	case "reserialize":
-		fmt.Print(`Usage: unity-cli reserialize [path...]
+		fmt.Fprint(w, `Usage: unity-cli reserialize [path...]
 
 Force Unity to reserialize assets through its own YAML serializer.
 Run after editing .prefab, .unity, .asset, or .mat files as text.
@@ -1349,7 +1400,7 @@ Examples:
   unity-cli reserialize Assets/Scenes/Main.unity Assets/Scenes/Lobby.unity
 `)
 	case "clear_burst_cache":
-		fmt.Print(`Usage: unity-cli clear_burst_cache [options]
+		fmt.Fprint(w, `Usage: unity-cli clear_burst_cache [options]
 
 Delete the project's Burst compilation cache (<project>/Library/BurstCache) and
 report how many files and bytes were removed.
@@ -1372,7 +1423,7 @@ Examples:
   unity-cli clear_burst_cache --scope jit
 `)
 	case "burst_status":
-		fmt.Print(`Usage: unity-cli burst_status [options]
+		fmt.Fprint(w, `Usage: unity-cli burst_status [options]
 
 Ask Burst what it has compiled. Burst compiles outside Unity's script compilation,
 so a clean C# compile and a quiet console do not prove a [BurstCompile] job was
@@ -1413,7 +1464,7 @@ Examples:
   unity-cli burst_status --compile --wait 120 --timeout 130000
 `)
 	case "profiler":
-		fmt.Print(`Usage: unity-cli profiler <subcommand> [options]
+		fmt.Fprint(w, `Usage: unity-cli profiler <subcommand> [options]
 
 Subcommands:
   hierarchy             Top-level profiler samples (last frame)
@@ -1440,14 +1491,16 @@ Examples:
   unity-cli profiler enable
 `)
 	case "test":
-		fmt.Print(`Usage: unity-cli test [options]
+		fmt.Fprint(w, `Usage: unity-cli test [options]
 
 Run Unity tests via the Test Runner API.
 
 Options:
   --mode <EditMode|PlayMode>    Test mode (default: EditMode)
-  --filter <name>               Filter by namespace, class, or full test name
-                                Must be the full path (e.g. MyNamespace.MyClass)
+  --filter <name>               Only the tests whose full name matches exactly: one test
+                                (Namespace.Class.TestName) or one class (Namespace.Class). A partial
+                                name or a bare namespace matches nothing — a filter that selects no
+                                test is reported as such, not as a passing run
   --assembly <a,b>              Only tests in these assemblies (comma-separated)
   --allow-dirty-scenes          Run even when open scenes have unsaved changes
   --auto-save-scenes            Save dirty open scenes before running tests
@@ -1462,6 +1515,11 @@ By default, tests are blocked when any open scene has unsaved changes, and when 
 test is older than its sources (a stale DLL runs old code). Fix that with
 'unity-cli editor refresh --compile', or pass --allow-stale deliberately.
 
+Exit codes:
+  0  at least one test ran and none failed
+  1  a test failed, the run was refused (dirty scenes, stale assemblies, compile gate), or no test
+     matched: "no tests matched (filter …, assembly …)"
+
 Requires the Unity Test Framework package (com.unity.test-framework).
 
 Examples:
@@ -1473,7 +1531,7 @@ Examples:
   unity-cli test --mode EditMode --filter MyNamespace.MyTests.SpecificTest
 `)
 	case "verify":
-		fmt.Print(`Usage: unity-cli verify [options]
+		fmt.Fprint(w, `Usage: unity-cli verify [options]
 
 Check that the project compiles and its tests pass, in one call, with output
 brief enough for an agent's context:
@@ -1518,7 +1576,8 @@ Options:
   --burst-wait <seconds>        How long to wait for Burst to go idle (default 60)
   --assembly <a,b>              Only tests in these assemblies (comma-separated). A stale
                                 assembly outside this list is reported but does not refuse.
-  --filter <name>               Filter by namespace, class, or full test name
+  --filter <name>               Only tests whose full name matches exactly (one test, Namespace.
+                                Class.TestName, or one class, Namespace.Class)
   --mode <EditMode|PlayMode>    Test mode (default: EditMode)
   --max <n>                     List at most n errors and n failures (default 20); the error
                                 count is still the true total
@@ -1551,7 +1610,7 @@ Examples:
   unity-cli verify --json
 `)
 	case "modal":
-		fmt.Print(`Usage: unity-cli modal [list|answer] [options]
+		fmt.Fprint(w, `Usage: unity-cli modal [list|answer] [options]
 
 Inspect or answer a modal dialog that blocks the Unity Editor (macOS only).
 
@@ -1577,7 +1636,7 @@ Examples:
   unity-cli modal answer --index 0 --id 27186
 `)
 	case "dialogs":
-		fmt.Print(`Usage: unity-cli dialogs [--click "<button title>"] [--window "<window title>"]
+		fmt.Fprint(w, `Usage: unity-cli dialogs [--click "<button title>"] [--window "<window title>"]
 
 List — and optionally answer — the windows of the Unity processes on this machine,
 read from OUTSIDE the editor with AppleScript + System Events (Accessibility).
@@ -1625,7 +1684,7 @@ Examples:
 See also: 'unity-cli modal' — the in-editor equivalent, available once the connector loads.
 `)
 	case "build":
-		fmt.Print(`Usage: unity-cli build [--profile <name> | --target <BuildTarget>] --output <path> [options]
+		fmt.Fprint(w, `Usage: unity-cli build [--profile <name> | --target <BuildTarget>] --output <path> [options]
        unity-cli build status [id]
 
 Starts a player build as a job. The connector validates the parameters, records the job, and returns
@@ -1689,7 +1748,7 @@ Examples:
   unity-cli status                 # shows: Unity (port 8090): building
 `)
 	case "wait":
-		fmt.Print(`Usage: unity-cli wait [--compile] [--timeout <seconds>] [--json]
+		fmt.Fprint(w, `Usage: unity-cli wait [--compile] [--timeout <seconds>] [--json]
 
 Blocks until the editor stops reporting work in progress, then prints its state and the compile
 provenance line. It replaces the 'sleep 45 && unity-cli compile_errors' loop: the answer says both
@@ -1704,6 +1763,8 @@ Options:
                      finished after wait started (connector compile clock, compared to the value at
                      wait start — no local clock involved), OR the source scan finds nothing newer
                      than that compile. Without it, wait only reports the state.
+                     A connector that cannot prove it answers exit 1: no compile clock on the
+                     heartbeat, or compile_status not answering, is "could not prove", never "in".
   --timeout <second> Give up after this many seconds (default 120) and exit 1. For wait this flag is
                      seconds and must come after the command name; the global --timeout (before it)
                      stays an HTTP request timeout in milliseconds.
@@ -1726,7 +1787,10 @@ the editor's main thread, saying so instead of stalling the editor.
 
 Exit codes:
   0  the editor is idle (and with --compile, the edit is provably in)
-  1  the editor was still working when --timeout ran out
+  1  the editor was still working when --timeout ran out, or --compile could not be proven: the
+     connector reports no compile clock, compile_status did not answer, or uncompiled sources
+     stayed uncompiled. The reason is printed, with the command that does prove it
+     (unity-cli verify, or unity-cli editor refresh --compile)
   2  the editor could not answer: not running, heartbeat silent, or blocked by a modal dialog
      (named, with the command that answers it)
 
@@ -1737,7 +1801,7 @@ Examples:
   unity-cli editor refresh --compile && unity-cli wait --compile
 `)
 	case "api":
-		fmt.Print(`Usage: unity-cli api <Type>[.<Member>] [options]
+		fmt.Fprint(w, `Usage: unity-cli api <Type>[.<Member>] [options]
 
 What the API actually is, read off the assemblies the editor has loaded — the same set
 the project's code compiles against. Text search over Library/PackageCache disagrees with
@@ -1752,6 +1816,10 @@ what compiled (hashed folders, stubs, #if branches); reflection cannot.
 Type queries accept the simple name, the full name, and either spelling of a generic
 (BufferLookup, BufferLookup<T>, or the reflection spelling with its arity suffix). When
 several types match, all of them are described, best match first, up to --max_types.
+
+A query that names nothing real is not a successful lookup: when no type or member matches
+exactly, a query the connector can only approximate prints "no exact match; closest: …" first
+and still answers (exit 0), and a query with nothing close exits 1.
 
 [Obsolete] members report the message, whether it is an error, and the replacement when the
 notice names one ("Use X instead", "(UnityUpgradable) -> X").
@@ -1775,7 +1843,7 @@ Examples:
   unity-cli api GetSingletonBuffer --assembly Entities
 `)
 	case "compile_status":
-		fmt.Print(`Usage: unity-cli compile_status [--scan false] [--scan_budget <ms>]
+		fmt.Fprint(w, `Usage: unity-cli compile_status [--scan false] [--scan_budget <ms>]
 
 What the last script compilation covers, without waiting or compiling:
 when it finished (unix ms, ISO and a printed line), how long it took, which assemblies it rebuilt,
@@ -1805,7 +1873,7 @@ Examples:
   unity-cli compile_status --scan_budget 1000
 `)
 	case "list":
-		fmt.Print(`Usage: unity-cli list
+		fmt.Fprint(w, `Usage: unity-cli list
 
 List all registered tools (built-in + custom) with parameter schemas.
 
@@ -1813,7 +1881,7 @@ Example:
   unity-cli list
 `)
 	case "status":
-		fmt.Print(`Usage: unity-cli status
+		fmt.Fprint(w, `Usage: unity-cli status
 
 Show the current Unity Editor state: port, project path, version, PID.
 Reports "not responding" if heartbeat is older than 3 seconds.
@@ -1853,7 +1921,7 @@ Example:
   unity-cli status
 `)
 	case "update":
-		fmt.Print(`Usage: unity-cli update [options]
+		fmt.Fprint(w, `Usage: unity-cli update [options]
 
 Update the CLI binary to the latest release from GitHub.
 
@@ -1865,7 +1933,7 @@ Examples:
   unity-cli update --check
 `)
 	case "custom-tools", "custom", "tools":
-		fmt.Print(`How to write custom tools for unity-cli
+		fmt.Fprint(w, `How to write custom tools for unity-cli
 
 Custom tools are C# classes that run inside Unity Editor. The CLI
 discovers them automatically via reflection.
@@ -1904,7 +1972,7 @@ Rules:
   - Duplicate tool names are detected and logged as errors (first wins)
 `)
 	case "setup", "install":
-		fmt.Print(`Installation and Unity setup
+		fmt.Fprint(w, `Installation and Unity setup
 
 CLI Installation:
   # Linux / macOS
@@ -1925,7 +1993,7 @@ Verify:
   unity-cli list
 `)
 	default:
-		fmt.Printf("Unknown help topic: %s\n\nUse \"unity-cli --help\" for available commands.\n", topic)
+		fmt.Fprintf(w, "Unknown help topic: %s\n\nUse \"unity-cli --help\" for available commands.\n", topic)
 	}
 }
 
