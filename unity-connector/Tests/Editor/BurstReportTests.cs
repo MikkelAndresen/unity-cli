@@ -1,3 +1,4 @@
+using System;
 using System.Collections.Generic;
 using NUnit.Framework;
 using UnityCliConnector.Tools;
@@ -139,12 +140,18 @@ namespace UnityCliConnector.Tests
         }
 
         [Test]
-        public void IsPackageSourcePath_RecognisesRegistryEmbeddedAndFilePackages()
+        public void FixedPackageSource_IsRegistryGitAndBuiltIn_NotEmbeddedOrFilePackages()
         {
-            Assert.IsTrue(BurstTargets.IsPackageSourcePath("Packages/com.unity.entities/Job.cs", null));
-            Assert.IsTrue(BurstTargets.IsPackageSourcePath("/p/Library/PackageCache/com.unity.entities@1/Job.cs", null));
-            Assert.IsTrue(BurstTargets.IsPackageSourcePath("/p/LocalPackages/unity-cli/Job.cs", new[] { "/p/LocalPackages/unity-cli" }));
-            Assert.IsFalse(BurstTargets.IsPackageSourcePath("/p/Assets/Job.cs", new[] { "/p/LocalPackages/unity-cli" }));
+            var fixedNames = new HashSet<string> { "com.unity.entities" };
+            var fixedRoots = new[] { "/p/Library/PackageCache/com.unity.entities@1" };
+
+            Assert.IsTrue(BurstTargets.IsFixedPackageSource("Packages/com.unity.entities/Job.cs", fixedNames, fixedRoots));
+            Assert.IsTrue(BurstTargets.IsFixedPackageSource("/p/Library/PackageCache/com.unity.entities@1/Job.cs", fixedNames, fixedRoots));
+            // A file: package the project develops reports its sources under Packages/<name> too.
+            Assert.IsFalse(BurstTargets.IsFixedPackageSource("Packages/com.fae.gameplay/Runtime/BowSystem.cs", fixedNames, fixedRoots));
+            Assert.IsFalse(BurstTargets.IsFixedPackageSource("/p/Custom-Packages/gameplay/Runtime/BowSystem.cs", fixedNames, fixedRoots));
+            Assert.IsFalse(BurstTargets.IsFixedPackageSource("/p/Packages/com.my.embedded/Job.cs", fixedNames, fixedRoots));
+            Assert.IsFalse(BurstTargets.IsFixedPackageSource("/p/Assets/Job.cs", fixedNames, fixedRoots));
         }
 
         [Test]
@@ -340,18 +347,16 @@ namespace UnityCliConnector.Tests
         }
 
         [Test]
-        public void IsPackageSourcePath_CoversPackagesCachesAndLocalPackages()
+        public void FixedPackageSource_HandlesSeparatorsUnknownSourcesAndCase()
         {
-            var roots = new List<string> { "/Users/me/proj/LocalPackages/unity-cli/unity-connector" };
+            var fixedNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "com.x" };
 
-            Assert.IsFalse(BurstTargets.IsPackageSourcePath("Assets/Scripts/Job.cs", roots));
-            Assert.IsFalse(BurstTargets.IsPackageSourcePath("/Users/me/proj/Assets/Job.cs", roots));
-            Assert.IsTrue(BurstTargets.IsPackageSourcePath("Packages/com.x/Runtime/A.cs", roots));
-            Assert.IsTrue(BurstTargets.IsPackageSourcePath("/Users/me/proj/Library/PackageCache/com.x@1/A.cs", roots));
-            Assert.IsTrue(BurstTargets.IsPackageSourcePath("/Users/me/proj/LocalPackages/unity-cli/unity-connector/Editor/A.cs", roots));
-            Assert.IsTrue(BurstTargets.IsPackageSourcePath("\\Users\\me\\proj\\Packages\\com.x\\A.cs", roots));
+            Assert.IsFalse(BurstTargets.IsFixedPackageSource("Assets/Scripts/Job.cs", fixedNames, null));
+            Assert.IsTrue(BurstTargets.IsFixedPackageSource("Packages/COM.X/Runtime/A.cs", fixedNames, null));
+            Assert.IsTrue(BurstTargets.IsFixedPackageSource("\\Users\\me\\proj\\Packages\\com.x\\A.cs", fixedNames, null));
+            Assert.IsTrue(BurstTargets.IsFixedPackageSource("/Users/me/proj/Library/PackageCache/com.y@1/A.cs", fixedNames, null));
             // Unknown source: not counted as the project's own code.
-            Assert.IsTrue(BurstTargets.IsPackageSourcePath("", roots));
+            Assert.IsTrue(BurstTargets.IsFixedPackageSource("", fixedNames, null));
         }
 
         static BurstErrorEntry Error(string message)

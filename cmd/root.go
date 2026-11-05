@@ -1435,7 +1435,8 @@ so a clean C# compile and a quiet console do not prove a [BurstCompile] job was
 compiled — and a Burst (BCxxxx) error can appear after the compile finished.
 
 Reports whether Burst's own queue is idle, and the [BurstCompile] targets in the
-project's own assemblies (package assemblies are left out unless --include_packages)
+project's own assemblies: Assets/ plus embedded and file: packages (registry, git and built-in
+package assemblies are left out unless --include_packages)
 with status compiled / failed / not-compiled-yet / unknown. Default output is short:
 counts plus the Burst errors, each as file:line:col CODE message.
 

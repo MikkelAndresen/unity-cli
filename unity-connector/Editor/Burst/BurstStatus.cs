@@ -85,9 +85,7 @@ namespace UnityCliConnector.Tools
 
             var projectAssemblies = ProjectAssemblies();
             var projectAssemblyNames = new HashSet<string>(projectAssemblies.Keys, StringComparer.OrdinalIgnoreCase);
-            var resolutionOrder = ResolutionOrder(projectAssemblies);
-            foreach (var target in targets)
-                ResolveAssembly(target, resolutionOrder);
+            BurstTargetResolver.Resolve(targets, projectAssemblies, p.GetBool("include_packages"));
 
             // A target belongs to the project by its resolved assembly name, not by having one:
             // Burst 1.8 sets Assembly from the job's own type, package targets included.
@@ -235,16 +233,19 @@ namespace UnityCliConnector.Tools
             return raw.Split(new[] { ',', ' ' }, StringSplitOptions.RemoveEmptyEntries);
         }
 
-        /// Assembly name -> project (non-package) assembly, from the compile pipeline's own list so
-        /// the set matches what the editor just compiled. A package assembly is one whose sources
-        /// live under a registered package (Packages/, Library/PackageCache/, or a file: package
-        /// outside both) — the pipeline list has no package flag to read.
+        /// Assembly name -> project assembly, from the compile pipeline's own list so the set matches
+        /// what the editor just compiled. The project is Assets/ plus the packages it develops
+        /// (embedded and file:); the pipeline list has no package flag, so the sources say which.
         private static Dictionary<string, System.Reflection.Assembly> ProjectAssemblies()
         {
-            var packageRoots = UnityEditor.PackageManager.PackageInfo.GetAllRegisteredPackages()
-                .Select(info => info.resolvedPath)
-                .Where(path => !string.IsNullOrEmpty(path))
+            // Embedded and file: packages are code the project develops, so their targets count as
+            // the project's own; registry, git, built-in and tarball packages are fixed.
+            var fixedPackages = UnityEditor.PackageManager.PackageInfo.GetAllRegisteredPackages()
+                .Where(info => info.source != UnityEditor.PackageManager.PackageSource.Embedded &&
+                               info.source != UnityEditor.PackageManager.PackageSource.Local)
                 .ToList();
+            var fixedNames = new HashSet<string>(fixedPackages.Select(info => info.name), StringComparer.OrdinalIgnoreCase);
+            var fixedRoots = fixedPackages.Select(info => info.resolvedPath).Where(path => !string.IsNullOrEmpty(path)).ToList();
 
             var loaded = new Dictionary<string, System.Reflection.Assembly>(StringComparer.OrdinalIgnoreCase);
             foreach (var assembly in AppDomain.CurrentDomain.GetAssemblies())
@@ -260,76 +261,10 @@ namespace UnityCliConnector.Tools
                 if (string.IsNullOrEmpty(assembly.name)) continue;
                 if (!loaded.TryGetValue(assembly.name, out var runtime)) continue;
                 var source = assembly.sourceFiles != null && assembly.sourceFiles.Length > 0 ? assembly.sourceFiles[0] : null;
-                if (BurstTargets.IsPackageSourcePath(source, packageRoots)) continue;
+                if (BurstTargets.IsFixedPackageSource(source, fixedNames, fixedRoots)) continue;
                 project[assembly.name] = runtime;
             }
             return project;
-        }
-
-        /// Project assemblies first, then every other loaded assembly. Resolution order decides which
-        /// assembly a type that exists in both is attributed to, and AppDomain order must not.
-        private static List<System.Reflection.Assembly> ResolutionOrder(Dictionary<string, System.Reflection.Assembly> projectAssemblies)
-        {
-            var ordered = new List<System.Reflection.Assembly>(projectAssemblies.Values);
-            var seen = new HashSet<string>(projectAssemblies.Keys, StringComparer.OrdinalIgnoreCase);
-            foreach (var assembly in AppDomain.CurrentDomain.GetAssemblies())
-            {
-                var name = assembly.GetName().Name;
-                if (string.IsNullOrEmpty(name) || !seen.Add(name)) continue;
-                ordered.Add(assembly);
-            }
-            return ordered;
-        }
-
-        /// Fills target.Assembly (and normalizes DeclaringType) by finding the owning type among the
-        /// loaded assemblies. Burst 2.x describes targets as strings only, so this is the only way
-        /// to resolve an assembly there. Package targets are resolved too, so --include_packages can
-        /// list them; an unresolved target keeps whatever Burst itself reported (usually nothing).
-        private static void ResolveAssembly(BurstTargetInfo target, IReadOnlyList<System.Reflection.Assembly> assemblies)
-        {
-            if (assemblies.Count == 0) return;
-
-            foreach (var candidate in Candidates(target))
-            {
-                foreach (var assembly in assemblies)
-                {
-                    var found = FindType(assembly, candidate);
-                    if (found == null) continue;
-                    target.Assembly = assembly.GetName().Name;
-                    target.DeclaringType = found.FullName;
-                    return;
-                }
-            }
-        }
-
-        /// Burst writes nested types with '+' in Scope and with '.' in FullName; a loaded type name
-        /// needs the '+' form. Try both spellings of each name Burst gave us.
-        private static IEnumerable<string> Candidates(BurstTargetInfo target)
-        {
-            var seen = new HashSet<string>();
-            foreach (var raw in new[] { target.DeclaringType, target.Scope })
-            {
-                if (string.IsNullOrEmpty(raw)) continue;
-                foreach (var variant in NestVariants(raw))
-                    if (seen.Add(variant))
-                        yield return variant;
-            }
-        }
-
-        static IEnumerable<string> NestVariants(string name)
-        {
-            yield return name;
-            var lastDot = name.LastIndexOf('.');
-            if (lastDot > 0)
-                yield return name.Substring(0, lastDot) + "+" + name.Substring(lastDot + 1);
-            if (name.Contains("."))
-                yield return name.Replace('.', '+');
-        }
-
-        static Type FindType(System.Reflection.Assembly assembly, string name)
-        {
-            try { return assembly.GetType(name, false); }
-            catch (Exception) { return null; }
         }
     }
 }

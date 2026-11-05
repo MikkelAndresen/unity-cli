@@ -581,7 +581,7 @@ Burst idle: 3/4 targets compiled, 1 Burst error(s).
   Assets/Jobs/HeavyJob.cs:39 BC1006 The `catch` construction is not supported
 ```
 
-대상은 Burst가 직접 나열하는 `[BurstCompile]` job과 static method이고, 목록에는 프로젝트 자체 어셈블리의 대상만 올린다(패키지와 엔진 대상은 따로 세며, 목록에 넣으려면 `--include_packages`가 필요하다). 상태는 `compiled`, `failed`, `not-compiled-yet`, `unknown` 네 가지다. Burst는 어셈블리 컴파일이 끝날 때 아는 대상 전부를 eager 컴파일하므로, “Burst의 큐가 idle” + “이 대상을 지칭하는 에러가 없음”이 `compiled`의 뜻이고, 에러가 대상을 지칭하지 못하면 추측 대신 `notes`에 그 수를 적는다. `method` 필드는 답이 eager 큐에서 나왔는지 이번 호출이 강제한 재컴파일(`forced_recompile`)에서 나왔는지 알려 준다.
+대상은 Burst가 직접 나열하는 `[BurstCompile]` job과 static method이고, 목록에는 프로젝트 자체 어셈블리의 대상만 올린다 — `Assets/`와 프로젝트가 개발하는 패키지, 즉 embedded(`Packages/<name>`)나 `file:` 패키지다 (registry, git, 내장, tarball 패키지와 엔진 대상은 따로 세며, 목록에 넣으려면 `--include_packages`가 필요하다). 상태는 `compiled`, `failed`, `not-compiled-yet`, `unknown` 네 가지다. Burst는 어셈블리 컴파일이 끝날 때 아는 대상 전부를 eager 컴파일하므로, “Burst의 큐가 idle” + “이 대상을 지칭하는 에러가 없음”이 `compiled`의 뜻이고, 에러가 대상을 지칭하지 못하면 추측 대신 `notes`에 그 수를 적는다. `method` 필드는 답이 eager 큐에서 나왔는지 이번 호출이 강제한 재컴파일(`forced_recompile`)에서 나왔는지 알려 준다.
 
 job producer 에러가 가리키는 위치는 엔진이 생성한 job struct이므로, 도구는 엔진 밖의 첫 stack frame — 사용자의 파일과 라인 — 을 우선해 `file:line:col BCxxxx message` 형태로 출력한다. `verify`가 컴파일 뒤에 이 단계를 실행하므로 별도로 물어 볼 필요가 없고, `--no-burst`로 건너뛸 수 있다.
 

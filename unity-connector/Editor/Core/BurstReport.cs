@@ -398,20 +398,24 @@ namespace UnityCliConnector.Tools
                 }
         }
 
-        /// Whether a source file belongs to a package rather than to the project's own code.
-        /// packageRoots are the absolute resolved paths of registered packages, which is the only
-        /// way to catch file: packages that live outside Packages/ (e.g. LocalPackages/...).
-        public static bool IsPackageSourcePath(string sourceFile, IReadOnlyCollection<string> packageRoots)
+        /// Whether a source file belongs to a package the project does not develop: a registry, git,
+        /// built-in or tarball package. Assets/, embedded packages (Packages/<name>) and file:
+        /// packages are the project's own code. The compile pipeline reports package sources as
+        /// virtual "Packages/<name>/..." paths, so the package is told by name; fixedRoots catch
+        /// absolute paths. An unknown source counts as fixed: it is not shown as the project's code.
+        public static bool IsFixedPackageSource(string sourceFile, IReadOnlyCollection<string> fixedNames,
+            IReadOnlyCollection<string> fixedRoots)
         {
             if (string.IsNullOrEmpty(sourceFile)) return true;
             var path = sourceFile.Replace('\\', '/');
-            if (path.StartsWith("Packages/", StringComparison.OrdinalIgnoreCase)) return true;
-            // Embedded packages live in <project>/Packages/<name>, and resolved registry packages under
-            // Library/PackageCache; both show up as absolute paths here.
-            if (path.Contains("/Packages/", StringComparison.OrdinalIgnoreCase)) return true;
             if (path.Contains("PackageCache/", StringComparison.OrdinalIgnoreCase)) return true;
-            if (packageRoots == null) return false;
-            foreach (var root in packageRoots)
+
+            var name = PackageNameOf(path);
+            if (name != null)
+                return fixedNames != null && fixedNames.Contains(name);
+
+            if (fixedRoots == null) return false;
+            foreach (var root in fixedRoots)
             {
                 if (string.IsNullOrEmpty(root)) continue;
                 var normalized = root.Replace('\\', '/');
@@ -419,6 +423,21 @@ namespace UnityCliConnector.Tools
                 if (path.StartsWith(normalized, StringComparison.OrdinalIgnoreCase)) return true;
             }
             return false;
+        }
+
+        /// "com.x" from "Packages/com.x/A.cs" or "/proj/Packages/com.x/A.cs"; null otherwise.
+        static string PackageNameOf(string path)
+        {
+            int start;
+            if (path.StartsWith("Packages/", StringComparison.OrdinalIgnoreCase)) start = "Packages/".Length;
+            else
+            {
+                var at = path.IndexOf("/Packages/", StringComparison.OrdinalIgnoreCase);
+                if (at < 0) return null;
+                start = at + "/Packages/".Length;
+            }
+            var end = path.IndexOf('/', start);
+            return end > start ? path.Substring(start, end - start) : null;
         }
     }
 }
