@@ -83,6 +83,12 @@ namespace UnityCliConnector.Tools
                 .Where(d => d != null)
                 .ToList();
 
+            // A short type name often matches several types (UnityEngine.Vector3, System.Numerics.Vector3,
+            // an Odin shim). The member query is answered by the ones that declare it; the rest would
+            // otherwise turn an exact answer into "no member named".
+            if (!string.IsNullOrEmpty(resolution.member) && described.Any(d => d.memberExact))
+                described = described.Where(d => d.memberExact).ToList();
+
             var memberExact = resolution.exact && described.All(d => d.memberExact);
             var exact = resolution.exact && memberExact;
             var note = exact ? null : MemberNote(query, resolution, described);

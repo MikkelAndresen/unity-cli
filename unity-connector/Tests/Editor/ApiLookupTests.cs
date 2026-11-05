@@ -161,11 +161,49 @@ namespace UnityCliConnector.Tests
         }
 
         [Test]
+        public void MemberQuery_OnAnAmbiguousTypeName_AnswersFromTheTypesThatHaveIt()
+        {
+            // With Odin installed, `api Vector3.Lerp` matched three Vector3s; the shim without Lerp
+            // turned the whole answer into "no member named 'Lerp'".
+            var data = Run("ApiAmbiguityProbe.OnlyOnA", ("limit", 5));
+
+            Assert.IsTrue(data["exact"].Value<bool>(), data["summary"].Value<string>());
+            var types = ((JArray)data["types"]).Select((JToken t) => t["type"].Value<string>()).ToList();
+            CollectionAssert.AreEqual(new[] { "UnityCliConnector.Tests.ProbeA.ApiAmbiguityProbe" }, types);
+        }
+
+        [Test]
+        public void MemberQuery_OnAnAmbiguousTypeName_StaysFuzzyWhenNoTypeHasIt()
+        {
+            var data = Run("ApiAmbiguityProbe.OnNeither", ("limit", 5));
+
+            Assert.IsFalse(data["exact"].Value<bool>());
+            StringAssert.Contains("no member named 'OnNeither'", data["note"].Value<string>());
+        }
+
+        [Test]
         public void MissingQuery_IsAnError()
         {
             var response = (ErrorResponse)ApiLookup.HandleCommand(new JObject());
             Assert.IsFalse(response.success);
             StringAssert.Contains("needs a type", response.message);
         }
+    }
+}
+
+namespace UnityCliConnector.Tests.ProbeA
+{
+    // Looked up by name in ApiLookupTests: two types sharing a short name, one declaring the member.
+    public class ApiAmbiguityProbe
+    {
+        public static int OnlyOnA() => 1;
+    }
+}
+
+namespace UnityCliConnector.Tests.ProbeB
+{
+    public class ApiAmbiguityProbe
+    {
+        public static int Other() => 2;
     }
 }
