@@ -79,7 +79,7 @@ var commandFlags = map[string]flagSpec{
 	"screenshot": {allowed: []string{
 		"mode", "view", "width", "height", "output_path",
 	}},
-	"api":          {allowed: []string{"assembly", "docs", "limit", "max_types", "budget"}, aliases: []string{"query", "type"}},
+	"api":          {allowed: []string{"assembly", "docs", "limit", "max_types", "budget", "json"}, aliases: []string{"query", "type"}},
 	"build":        {allowed: []string{"profile", "target", "output", "scenes", "development", "no-wait"}, aliases: []string{"output_path", "no_wait", "nowait"}},
 	"build status": {},
 	"input": {allowed: []string{

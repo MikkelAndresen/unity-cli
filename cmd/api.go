@@ -39,31 +39,175 @@ const apiClosestMax = 5
 // successful lookup: `api NoSuchTypeXyz` is reported as a failure, and `api Vector3.Lerpp` (a member
 // that does not exist) is answered with the closest members plus a line saying there was no exact
 // match.
+//
+// The answer prints as text: one header per type and one C# signature per member. --json prints the
+// connector's reply instead.
 func apiCmd(args []string, send sendFn, out io.Writer) (*client.CommandResponse, error) {
 	params, err := buildParams(args, nil)
 	if err != nil {
 		return nil, err
 	}
+	_, asJSON := params["json"]
+	delete(params, "json")
 	resp, err := send("api", params)
 	if err != nil || resp == nil || !resp.Success {
 		return resp, err
 	}
 
 	reply, exact, ok := apiExactness(resp.Data)
-	if !ok || exact {
-		return resp, nil
+	if ok && !exact {
+		// Nothing to describe: the query named nothing that exists, so the nearest-match suggestion is
+		// the connector's message and the command fails rather than passing a list of lookalikes off as
+		// the answer.
+		if len(reply.Types) == 0 {
+			resp.Success = false
+			if !asJSON {
+				resp.Data = nil
+			}
+			return resp, nil
+		}
+		if line := apiNoExactMatchLine(reply); line != "" {
+			fmt.Fprintln(out, line)
+		}
 	}
-	// Nothing to describe: the query named nothing that exists, so the nearest-match suggestion is
-	// the connector's message and the command fails rather than passing a list of lookalikes off as
-	// the answer.
-	if len(reply.Types) == 0 {
-		resp.Success = false
-		return resp, nil
-	}
-	if line := apiNoExactMatchLine(reply); line != "" {
-		fmt.Fprintln(out, line)
+	if !asJSON {
+		if text, rendered := renderAPIText(resp.Data); rendered {
+			resp.Data, _ = json.Marshal(text)
+		}
 	}
 	return resp, nil
+}
+
+type apiTypeText struct {
+	Type          string          `json:"type"`
+	Kind          string          `json:"kind"`
+	Assembly      string          `json:"assembly"`
+	BaseType      string          `json:"base_type"`
+	Interfaces    []string        `json:"interfaces"`
+	Obsolete      *apiObsolete    `json:"obsolete"`
+	Docs          string          `json:"docs"`
+	MemberFilter  string          `json:"member_filter"`
+	MemberTotal   int             `json:"member_total"`
+	MembersListed int             `json:"members_listed"`
+	Counts        map[string]int  `json:"counts"`
+	Members       []apiMemberText `json:"members"`
+}
+
+type apiMemberText struct {
+	Signature string       `json:"signature"`
+	Obsolete  *apiObsolete `json:"obsolete"`
+	Docs      string       `json:"docs"`
+}
+
+type apiObsolete struct {
+	Message     string `json:"message"`
+	IsError     bool   `json:"is_error"`
+	Replacement string `json:"replacement"`
+}
+
+// apiInterfacesShown caps the interface list in a type header: generic collections implement a
+// dozen, and the member signatures are what the caller came for.
+const apiInterfacesShown = 6
+
+// apiCountOrder is the order member counts print in, with their singular names.
+var apiCountOrder = []struct{ key, one string }{
+	{"constructors", "constructor"}, {"methods", "method"}, {"properties", "property"},
+	{"fields", "field"}, {"events", "event"}, {"nested_types", "nested type"},
+}
+
+// renderAPIText turns the connector's reply into text. rendered is false for a reply without a
+// types list (an older or unexpected shape), which then prints as JSON.
+func renderAPIText(data json.RawMessage) (string, bool) {
+	var reply struct {
+		Types *[]apiTypeText `json:"types"`
+	}
+	if len(data) == 0 || json.Unmarshal(data, &reply) != nil || reply.Types == nil {
+		return "", false
+	}
+	var b strings.Builder
+	for i, t := range *reply.Types {
+		if i > 0 {
+			b.WriteString("\n")
+		}
+		fmt.Fprintf(&b, "%s (%s, %s)", t.Type, t.Kind, t.Assembly)
+		if t.MemberFilter == "" {
+			if parents := apiParents(t); parents != "" {
+				b.WriteString(" : " + parents)
+			}
+		}
+		b.WriteString("\n")
+		if t.Obsolete != nil {
+			b.WriteString("  " + apiObsoleteText(t.Obsolete) + "\n")
+		}
+		if t.Docs != "" {
+			b.WriteString("  // " + apiOneLine(t.Docs) + "\n")
+		}
+		if t.MemberFilter == "" {
+			if counts := apiCountsText(t.Counts); counts != "" {
+				b.WriteString("  " + counts + "\n")
+			}
+		}
+		for _, m := range t.Members {
+			b.WriteString("  " + m.Signature)
+			if m.Obsolete != nil {
+				b.WriteString("  [" + apiObsoleteText(m.Obsolete) + "]")
+			}
+			b.WriteString("\n")
+			if m.Docs != "" {
+				b.WriteString("      // " + apiOneLine(m.Docs) + "\n")
+			}
+		}
+		if more := t.MemberTotal - len(t.Members); more > 0 {
+			fmt.Fprintf(&b, "  (+%d more; --limit %d lists them)\n", more, t.MemberTotal)
+		}
+	}
+	return b.String(), true
+}
+
+func apiParents(t apiTypeText) string {
+	var parents []string
+	if t.BaseType != "" && t.BaseType != "object" && t.BaseType != "ValueType" && t.BaseType != "Enum" {
+		parents = append(parents, t.BaseType)
+	}
+	ifaces := t.Interfaces
+	if len(ifaces) > apiInterfacesShown {
+		ifaces = append(append([]string{}, ifaces[:apiInterfacesShown]...), fmt.Sprintf("(+%d more)", len(t.Interfaces)-apiInterfacesShown))
+	}
+	return strings.Join(append(parents, ifaces...), ", ")
+}
+
+func apiCountsText(counts map[string]int) string {
+	var parts []string
+	for _, c := range apiCountOrder {
+		n := counts[c.key]
+		switch {
+		case n == 1:
+			parts = append(parts, "1 "+c.one)
+		case n > 1 && c.one == "property":
+			parts = append(parts, fmt.Sprintf("%d properties", n))
+		case n > 1:
+			parts = append(parts, fmt.Sprintf("%d %ss", n, c.one))
+		}
+	}
+	return strings.Join(parts, ", ")
+}
+
+func apiObsoleteText(o *apiObsolete) string {
+	text := "obsolete"
+	if o.IsError {
+		text += " (error)"
+	}
+	if msg := apiOneLine(o.Message); msg != "" {
+		text += ": " + msg
+	}
+	if o.Replacement != "" && !strings.Contains(text, o.Replacement) {
+		text += "; use " + o.Replacement
+	}
+	return text
+}
+
+func apiOneLine(s string) string {
+	return strings.Join(strings.Fields(s), " ")
 }
 
 // apiExactness reads the connector's "exact" flag. ok is false when the reply carries no such key:

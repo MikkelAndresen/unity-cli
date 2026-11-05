@@ -206,3 +206,109 @@ func TestAPISendsTheQueryAsAPositionalArgument(t *testing.T) {
 		t.Errorf("limit = %v, want the numeric flag value", sent["limit"])
 	}
 }
+
+func apiSend(reply *client.CommandResponse) sendFn {
+	return func(string, interface{}) (*client.CommandResponse, error) { return reply, nil }
+}
+
+// apiPrinted is what printResponse shows for a reply whose data is a JSON string.
+func apiPrinted(t *testing.T, resp *client.CommandResponse) string {
+	t.Helper()
+	var text string
+	if err := json.Unmarshal(resp.Data, &text); err != nil {
+		t.Fatalf("data = %s, want the rendered text as a JSON string: %v", resp.Data, err)
+	}
+	return text
+}
+
+const apiMemberReply = `{
+	"query": "SystemAPI.TryGetSingletonBuffer", "member": "TryGetSingletonBuffer", "matched_by": "type.member",
+	"matches": 1, "index": {"assemblies_indexed": 423, "complete": true, "types_indexed": 67020},
+	"types": [{
+		"type": "Unity.Entities.SystemAPI", "kind": "static class", "assembly": "Unity.Entities",
+		"base_type": "object", "interfaces": [], "member_filter": "TryGetSingletonBuffer",
+		"member_total": 1, "members_listed": 1,
+		"counts": {"methods": 44, "constructors": 0, "properties": 1, "fields": 0, "events": 0, "nested_types": 1},
+		"members": [{"kind": "method", "name": "TryGetSingletonBuffer", "docs": null, "obsolete": null,
+			"signature": "public static bool TryGetSingletonBuffer<T>(out DynamicBuffer<T> value, bool isReadOnly = false) where T : unmanaged, IBufferElementData"}]
+	}]
+}`
+
+// The signature is what a member query is for, so it is the second line, not 35 lines into JSON.
+func TestAPIMemberAnswerIsHeaderThenSignatures(t *testing.T) {
+	got, err := apiCmd([]string{"SystemAPI.TryGetSingletonBuffer"}, apiSend(&client.CommandResponse{
+		Success: true, Data: apiReplyJSON(t, true, true, apiMemberReply),
+	}), &bytes.Buffer{})
+	if err != nil {
+		t.Fatalf("apiCmd: %v", err)
+	}
+	want := "Unity.Entities.SystemAPI (static class, Unity.Entities)\n" +
+		"  public static bool TryGetSingletonBuffer<T>(out DynamicBuffer<T> value, bool isReadOnly = false) where T : unmanaged, IBufferElementData\n"
+	if text := apiPrinted(t, got); text != want {
+		t.Errorf("text =\n%s\nwant\n%s", text, want)
+	}
+}
+
+func TestAPIJSONFlagKeepsTheConnectorReply(t *testing.T) {
+	var sent map[string]interface{}
+	data := apiReplyJSON(t, true, true, apiMemberReply)
+	got, err := apiCmd([]string{"SystemAPI.TryGetSingletonBuffer", "--json"}, func(_ string, params interface{}) (*client.CommandResponse, error) {
+		sent = params.(map[string]interface{})
+		return &client.CommandResponse{Success: true, Data: data}, nil
+	}, &bytes.Buffer{})
+	if err != nil {
+		t.Fatalf("apiCmd: %v", err)
+	}
+	if _, forwarded := sent["json"]; forwarded {
+		t.Error("--json was sent to the connector; it is a CLI output switch")
+	}
+	if string(got.Data) != string(data) {
+		t.Errorf("data = %s, want the connector reply unchanged", got.Data)
+	}
+}
+
+func TestAPITypeAnswerHasParentsCountsAndTheCutOff(t *testing.T) {
+	got, err := apiCmd([]string{"Vector3"}, apiSend(&client.CommandResponse{
+		Success: true,
+		Data: apiReplyJSON(t, true, true, `{
+			"query": "Vector3", "member": null, "matched_by": "type", "matches": 1,
+			"types": [{
+				"type": "UnityEngine.Vector3", "kind": "struct", "assembly": "UnityEngine.CoreModule",
+				"base_type": "ValueType", "interfaces": ["IEquatable<Vector3>", "IFormattable"],
+				"member_filter": null, "member_total": 3, "members_listed": 1,
+				"counts": {"methods": 2, "constructors": 0, "properties": 1, "fields": 0, "events": 0, "nested_types": 0},
+				"members": [{"signature": "public static Vector3 Lerp(Vector3 a, Vector3 b, float t)",
+					"obsolete": {"message": "Will be removed", "is_error": false, "replacement": "LerpUnclamped"}}]
+			}]
+		}`),
+	}), &bytes.Buffer{})
+	if err != nil {
+		t.Fatalf("apiCmd: %v", err)
+	}
+	want := "UnityEngine.Vector3 (struct, UnityEngine.CoreModule) : IEquatable<Vector3>, IFormattable\n" +
+		"  2 methods, 1 property\n" +
+		"  public static Vector3 Lerp(Vector3 a, Vector3 b, float t)  [obsolete: Will be removed; use LerpUnclamped]\n" +
+		"  (+2 more; --limit 3 lists them)\n"
+	if text := apiPrinted(t, got); text != want {
+		t.Errorf("text =\n%s\nwant\n%s", text, want)
+	}
+}
+
+// With nothing to describe the error message is the answer; the JSON details would only repeat it.
+func TestAPINothingFoundPrintsNoDetails(t *testing.T) {
+	got, _ := apiCmd([]string{"NoSuchTypeXyz"}, apiSend(&client.CommandResponse{
+		Success: true,
+		Message: "no type or member named 'NoSuchTypeXyz' in the loaded assemblies",
+		Data:    apiReplyJSON(t, true, false, `{"query": "NoSuchTypeXyz", "matches": 0, "types": []}`),
+	}), &bytes.Buffer{})
+	if got.Success || len(got.Data) != 0 {
+		t.Errorf("got success=%v data=%s, want a failure carrying only the message", got.Success, got.Data)
+	}
+}
+
+func TestAPIObsoleteReplacementIsNotRepeated(t *testing.T) {
+	got := apiObsoleteText(&apiObsolete{Message: "Use IsBufferEnabled (UnityUpgradable) -> IsBufferEnabled(*)", Replacement: "IsBufferEnabled(*)"})
+	if want := "obsolete: Use IsBufferEnabled (UnityUpgradable) -> IsBufferEnabled(*)"; got != want {
+		t.Errorf("got %q, want %q", got, want)
+	}
+}

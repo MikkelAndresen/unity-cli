@@ -1822,6 +1822,14 @@ what compiled (hashed folders, stubs, #if branches); reflection cannot.
   api EditorApplication       a bounded member summary (all members are counted, not listed)
   api List.Add                the member reading: last '.' splits type from member
 
+The answer is text: a header per type (full name, kind, assembly; for a type query also its
+base type, interfaces and member counts), then one C# signature per member:
+
+  Unity.Entities.SystemAPI (static class, Unity.Entities)
+    public static bool TryGetSingletonBuffer<T>(out DynamicBuffer<T> value, bool isReadOnly = false) where T : unmanaged, IBufferElementData
+
+--json prints the connector's full reply instead.
+
 Type queries accept the simple name, the full name, and either spelling of a generic
 (BufferLookup, BufferLookup<T>, or the reflection spelling with its arity suffix). When
 several types match, all of them are described, best match first, up to --max_types.
@@ -1841,8 +1849,9 @@ Options:
   --limit <n>        Max members listed per type (default 20)
   --max_types <n>    Max types to describe when several match (default 5)
   --budget <ms>      How long the assembly scan may take (default 1500)
+  --json             Print the connector's JSON reply instead of text
 
-The index is built lazily and cached per domain; 'index.complete: false' means the budget ran
+The index is built lazily and cached per domain; 'index.complete: false' (--json) means the budget ran
 out and some assemblies are not searchable yet — raise --budget or ask again.
 
 Examples:

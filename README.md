@@ -568,6 +568,14 @@ unity-cli api List.Add --assembly mscorlib --limit 5
 unity-cli api UnityEngine.Object.FindObjectOfType --docs
 ```
 
+```
+UnityEngine.Vector3 (struct, UnityEngine.CoreModule)
+  public static Vector3 Lerp(in Vector3 a, in Vector3 b, float t)
+  public static Vector3 Lerp(Vector3 a, Vector3 b, float t)
+```
+
+The answer is text: a header per type (for a type query also its base type, interfaces and member counts) and one C# signature per member, with `(+N more; --limit N lists them)` when the list was cut. `--json` prints the Connector's full reply instead:
+
 ```json
 {
   "summary": "UnityEngine.Vector3 (struct, UnityEngine.CoreModule): 2 'Lerp' matches",
@@ -587,12 +595,14 @@ A query that names nothing real is not a successful lookup. The Connector answer
 
 ```
 no member named 'Lerpp' on UnityEngine.Vector3, System.Numerics.Vector3; closest: Lerp, Slerp
-{ "exact": false, "matched_by": "type.member", ... }
+UnityEngine.Vector3 (struct, UnityEngine.CoreModule)
+  public static Vector3 Lerp(in Vector3 a, in Vector3 b, float t)
+  ...
 ```
 
-A query with nothing close at all (`api NoSuchTypeXyz`) exits 1 with the Connector's `no type or member named …` message. The reply carries `exact`, `note` and `matched_by` (`type`, `type.member`, `member`, `closest_types`), so a script can decide without parsing the sentence; when a reply marks itself inexact without a `note`, the CLI builds the line itself (`no exact match; closest: …`).
+A query with nothing close at all (`api NoSuchTypeXyz`) exits 1 with the Connector's `no type or member named …` message. The reply carries `exact`, `note` and `matched_by` (`type`, `type.member`, `member`, `closest_types`), so a script (`--json`) can decide without parsing the sentence; when a reply marks itself inexact without a `note`, the CLI builds the line itself (`no exact match; closest: …`).
 
-The index is built lazily and cached for the editor session. `--budget <ms>` (default 1500) bounds one call; `index.complete: false` means the budget ran out before every assembly was searchable, so raise the budget or ask again. The command stays available while the project does not compile: the loaded assemblies are the last good ones, which is exactly when the real API is wanted.
+The index is built lazily and cached for the editor session. `--budget <ms>` (default 1500) bounds one call; `index.complete: false` (`--json`) means the budget ran out before every assembly was searchable, so raise the budget or ask again. The command stays available while the project does not compile: the loaded assemblies are the last good ones, which is exactly when the real API is wanted.
 
 ### Menu Items
 

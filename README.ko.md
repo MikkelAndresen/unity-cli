@@ -479,6 +479,14 @@ unity-cli api List.Add --assembly mscorlib --limit 5
 unity-cli api UnityEngine.Object.FindObjectOfType --docs
 ```
 
+```
+UnityEngine.Vector3 (struct, UnityEngine.CoreModule)
+  public static Vector3 Lerp(in Vector3 a, in Vector3 b, float t)
+  public static Vector3 Lerp(Vector3 a, Vector3 b, float t)
+```
+
+답은 텍스트입니다: 타입마다 헤더 한 줄(타입 질의라면 기반 타입, 인터페이스, 멤버 수 포함)과 멤버마다 C# 시그니처 한 줄이며, 목록이 잘리면 `(+N more; --limit N lists them)`이 붙습니다. `--json`은 대신 커넥터의 전체 응답을 출력합니다:
+
 ```json
 {
   "summary": "UnityEngine.Vector3 (struct, UnityEngine.CoreModule): 2 'Lerp' matches",
@@ -498,12 +506,14 @@ unity-cli api UnityEngine.Object.FindObjectOfType --docs
 
 ```
 no member named 'Lerpp' on UnityEngine.Vector3, System.Numerics.Vector3; closest: Lerp, Slerp
-{ "exact": false, "matched_by": "type.member", ... }
+UnityEngine.Vector3 (struct, UnityEngine.CoreModule)
+  public static Vector3 Lerp(in Vector3 a, in Vector3 b, float t)
+  ...
 ```
 
-가까운 것조차 없는 질의(`api NoSuchTypeXyz`)는 커넥터의 `no type or member named …` 메시지와 함께 exit 1입니다. 응답에는 `exact`, `note`, `matched_by`(`type`, `type.member`, `member`, `closest_types`)가 실리므로 스크립트가 문장을 파싱하지 않고도 판단할 수 있습니다. 응답이 `note` 없이 inexact만 알리면 CLI가 직접 `no exact match; closest: …` 줄을 만듭니다.
+가까운 것조차 없는 질의(`api NoSuchTypeXyz`)는 커넥터의 `no type or member named …` 메시지와 함께 exit 1입니다. 응답에는 `exact`, `note`, `matched_by`(`type`, `type.member`, `member`, `closest_types`)가 실리므로 스크립트(`--json`)가 문장을 파싱하지 않고도 판단할 수 있습니다. 응답이 `note` 없이 inexact만 알리면 CLI가 직접 `no exact match; closest: …` 줄을 만듭니다.
 
-인덱스는 lazy하게 만들어져 에디터 세션 동안 캐시됩니다. `--budget <ms>`(기본 1500)가 한 호출의 시간을 제한하고, `index.complete: false`는 모든 어셈블리가 검색 가능해지기 전에 예산이 끝났다는 뜻이므로 예산을 올리거나 다시 물어보세요. 이 명령은 프로젝트가 컴파일되지 않는 동안에도 쓸 수 있습니다: 로드된 어셈블리는 마지막으로 정상이던 것들이고, 바로 그때가 실제 API가 필요한 순간입니다.
+인덱스는 lazy하게 만들어져 에디터 세션 동안 캐시됩니다. `--budget <ms>`(기본 1500)가 한 호출의 시간을 제한하고, `index.complete: false`(`--json`)는 모든 어셈블리가 검색 가능해지기 전에 예산이 끝났다는 뜻이므로 예산을 올리거나 다시 물어보세요. 이 명령은 프로젝트가 컴파일되지 않는 동안에도 쓸 수 있습니다: 로드된 어셈블리는 마지막으로 정상이던 것들이고, 바로 그때가 실제 API가 필요한 순간입니다.
 
 ### 메뉴 아이템
 
