@@ -13,6 +13,7 @@ const (
 	codeDomainReload        = "domain_reload"
 	codeReloadDuringCommand = "reload_during_command"
 	codeSerializationFail   = "serialization_failed"
+	codeUnknownParameter    = "unknown_parameter"
 )
 
 // connectorErrorHint turns the connector's reason for answering without a result into the next step.
@@ -30,6 +31,11 @@ func connectorErrorHint(resp *client.CommandResponse) string {
 		return "the command had already started when Unity reloaded, so its effects may be applied and only its return value was lost; check 'unity-cli status' before repeating it"
 	case codeSerializationFail:
 		return "the command ran and its effects stand; only the returned value was lost, so return something smaller (a string, or an object of scalars)"
+	case codeUnknownParameter:
+		// A passthrough tool's parameters are the connector's to judge (the CLI has no per-tool flag
+		// list), so this is the answer a typo on a custom tool gets. Nothing ran, and repeating it
+		// unchanged would only earn the same refusal.
+		return "the request was refused before the tool ran; none of its parameters were applied, so check the parameter name ('unity-cli list' prints each tool's schema) and repeat it"
 	default:
 		return ""
 	}

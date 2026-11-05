@@ -323,3 +323,27 @@ func TestQuitCmd_DiscardIsSentAndEditorReportIsKept(t *testing.T) {
 		t.Fatalf("editor report was dropped: %s", result.Editor)
 	}
 }
+
+// TestQuitCmd_ContradictoryFlagsFailBeforeAnythingHappens: `editor quit --save --discard` used to
+// print "Stopping Unity (pid ...)" and only then have the connector refuse (F9). The flags must be
+// judged before discovery, before the announcement, and before any request.
+func TestQuitCmd_ContradictoryFlagsFailBeforeAnythingHappens(t *testing.T) {
+	var stderr bytes.Buffer
+	deps := restartTestDeps(t, &stderr)
+	deps.discover = func(string, int) (*client.Instance, error) {
+		t.Fatal("discover must not run for a refused flag combination")
+		return nil, nil
+	}
+	deps.send = func(*client.Instance, string, interface{}, int) (*client.CommandResponse, error) {
+		t.Fatal("no request may be sent for a refused flag combination")
+		return nil, nil
+	}
+
+	_, err := quitCmd([]string{"--save", "--discard"}, deps)
+	if err == nil || !strings.Contains(err.Error(), "--save and --discard are mutually exclusive") {
+		t.Fatalf("error = %v, want the local contradiction check", err)
+	}
+	if stderr.Len() != 0 {
+		t.Errorf("stderr = %q, want nothing printed before the refusal", stderr.String())
+	}
+}

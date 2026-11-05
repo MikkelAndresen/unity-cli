@@ -324,13 +324,14 @@ func (e *RequestTimeoutError) Error() string {
 }
 
 // FormatBudget keeps a context deadline's nanosecond remainder out of the message: callers passed
-// a whole number of milliseconds, and "1.947998375s" reads like a bug rather than a budget.
+// a whole number of milliseconds, and "1.947998375s" reads like a bug rather than a budget. Below a
+// second the granularity stays at one millisecond, so `--timeout 1` is reported as the 1 ms it was.
 func FormatBudget(d time.Duration) string {
 	if d <= 0 {
 		return "0s"
 	}
 	if d < time.Second {
-		return ceilDuration(d, 10*time.Millisecond).String()
+		return ceilDuration(d, time.Millisecond).String()
 	}
 	return strconv.FormatFloat(ceilDuration(d, 100*time.Millisecond).Seconds(), 'f', -1, 64) + "s"
 }
@@ -338,6 +339,15 @@ func FormatBudget(d time.Duration) string {
 // ceilDuration keeps a rounding-down remainder from making a 2000 ms budget read as 1.9s.
 func ceilDuration(d, step time.Duration) time.Duration {
 	return ((d + step - 1) / step) * step
+}
+
+// connectorHTTP is the client every connector request goes through. Its transport keeps no
+// connection alive: the editor tears its listener down across a domain reload, and a connection that
+// was pooled before the reload reads the old listener's leftover bytes as an unsolicited response.
+// Requests here are few and long-lived, so pooling buys nothing; one connection per request is what
+// makes a reload a plain new connection instead of a confused one.
+var connectorHTTP = &http.Client{
+	Transport: &http.Transport{DisableKeepAlives: true},
 }
 
 // Send is SendContext without a caller context, for callers that manage their own HTTP timeout
@@ -387,8 +397,7 @@ func SendContext(ctx context.Context, inst *Instance, command string, params int
 	if err != nil {
 		return nil, err
 	}
-	httpClient := &http.Client{}
-	resp, err := httpClient.Do(req)
+	resp, err := connectorHTTP.Do(req)
 	if err != nil {
 		if ctx.Err() == context.Canceled {
 			return nil, fmt.Errorf("request for %s cancelled: %w", command, ctx.Err())

@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
 	"os"
 	"strconv"
 	"strings"
@@ -113,12 +112,6 @@ func verifyCmd(ctx context.Context, args []string, send, testSend sendFn, resolv
 		}
 	}
 
-	// The connector closes its connection across a domain reload; Go's HTTP client logs that as an
-	// "Unsolicited response" line, which is noise in the brief output.
-	original := log.Writer()
-	log.SetOutput(&suppressWriter{w: original, suppress: "Unsolicited response received on idle HTTP channel"})
-	defer log.SetOutput(original)
-
 	var r verifyResult
 	finish := func(code int) int {
 		r.Exit = code
@@ -175,6 +168,7 @@ func verifyCmd(ctx context.Context, args []string, send, testSend sendFn, resolv
 	if outcome.TimedOut {
 		return noReply("compile: still compiling after %s", compileWaitTimeout)
 	}
+	noteSkippedCompile(&outcome, resp.Data)
 	hasErrors := outcome.HasErrors
 
 	findings, err := verifyDiagnostics(send, max, hasErrors, verifyDiagnosticsWait)
@@ -190,6 +184,9 @@ func verifyCmd(ctx context.Context, args []string, send, testSend sendFn, resolv
 	}
 	if outcome.NothingToCompile {
 		note := "no script compilation was observed after the refresh; the compile verdict is the editor's current state"
+		if outcome.SkipProven {
+			note = "nothing changed since the last compile, so it was not repeated; the verdict is that compile's"
+		}
 		r.Notes = append(r.Notes, note)
 		if !asJSON {
 			_, _ = fmt.Fprintf(out, "  (%s)\n", note)

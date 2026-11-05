@@ -589,3 +589,35 @@ func TestSendAfterReload_RetryFailureKeepsTheOriginalDiagnosis(t *testing.T) {
 		t.Errorf("new-port server got %d hits, want 1", got)
 	}
 }
+
+// TestSendAfterReload_UnknownParameterIsNotRetried: the connector refuses a parameter it does not know
+// before any handler runs (data.code = unknown_parameter), which is a typo the caller has to fix —
+// resending it unchanged would only earn the same refusal (F3).
+func TestSendAfterReload_UnknownParameterIsNotRetried(t *testing.T) {
+	project := t.TempDir()
+	refusing, hits := domainReloadServer(t, `{"code":"unknown_parameter","command":"spawn_enemy","parameter":"colour","started":false}`)
+	port := serverPort(t, refusing)
+	writeHeartbeatSet(t, map[string]client.Instance{
+		"only.json": heartbeat(project, port, 0, "ready", time.Now()),
+	})
+	inst := &client.Instance{State: "ready", ProjectPath: project, Port: port, Timestamp: time.Now().UnixMilli()}
+	resolve := func() (*client.Instance, error) { return inst, nil }
+
+	resp, err := sendAfterReload(context.Background(), resolve, newVersionGate("spawn_enemy"), "spawn_enemy",
+		map[string]interface{}{"colour": "red"}, 2000)
+	if err != nil {
+		t.Fatalf("sendAfterReload: %v", err)
+	}
+	if resp == nil || resp.Success {
+		t.Fatalf("response = %+v, want the connector's refusal", resp)
+	}
+	if code := client.ConnectorErrorCode(resp); code != codeUnknownParameter {
+		t.Errorf("code = %q, want %q", code, codeUnknownParameter)
+	}
+	if got := atomic.LoadInt32(hits); got != 1 {
+		t.Errorf("server got %d hits, want exactly one request", got)
+	}
+	if hint := connectorErrorHint(resp); !strings.Contains(hint, "check the parameter name") {
+		t.Errorf("hint = %q, want the parameter-name next step", hint)
+	}
+}

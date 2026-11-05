@@ -2,12 +2,6 @@ package client
 
 import "encoding/json"
 
-// CodeUnknownParameter is the connector's `data.code` for a request that named a parameter the
-// tool's schema does not declare (a misspelled flag). The connector refused it before running, so
-// nothing changed and the response lists the parameters the tool accepts. Declared in
-// unity-connector/Editor/Core/ErrorCodes.cs; cmd/connector_error.go maps the codes to next steps.
-const CodeUnknownParameter = "unknown_parameter"
-
 // ConnectorErrorCode returns the machine-readable code the connector attached to a failed response
 // (`data.code`), or "" when the response carries no JSON object or no known field. The codes are
 // declared in unity-connector/Editor/Core/ErrorCodes.cs; cmd/connector_error.go maps them to the

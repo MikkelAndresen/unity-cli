@@ -189,6 +189,20 @@ func TestVerify_CleanCompileAndPassingTests(t *testing.T) {
 	}
 }
 
+func TestVerify_SkippedCompileIsReportedAsNotRepeated(t *testing.T) {
+	base := int64(1_000)
+	f := &fakeEditor{t: t, diagnostics: clean(), tests: passing(1), testsSuccess: true,
+		echoFinished: &base, finishedAt: base + 5,
+		refreshReplies: []map[string]interface{}{{"nothing_to_compile": true}}}
+	code, out := f.run()
+	if code != verifyOK {
+		t.Fatalf("exit = %d, want 0; output:\n%s", code, out)
+	}
+	if !strings.Contains(out, "compile: ok\n  (nothing changed since the last compile, so it was not repeated") {
+		t.Errorf("output = %q, want the not-repeated note under the compile line", out)
+	}
+}
+
 func TestVerify_CompileErrorsAreListedAndTestsSkipped(t *testing.T) {
 	errs := []interface{}{map[string]interface{}{
 		"file": "Assets/Foo.cs", "line": 10, "col": 5, "severity": "error", "code": "CS0103", "message": "The name 'x' does not exist",

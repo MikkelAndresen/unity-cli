@@ -355,6 +355,27 @@ func TestEditorCmd_RefreshCompileNothingToCompile(t *testing.T) {
 	}
 }
 
+func TestEditorCmd_RefreshCompileSkippedByConnector(t *testing.T) {
+	compileTestBudgets(t)
+	// The connector skips a provably unneeded compile and stamps its clock, so the wait sees the
+	// clock advance; the report must still say nothing was compiled.
+	base := int64(1_000)
+	f := &fakeEditor{t: t, diagnostics: clean(), echoFinished: &base, finishedAt: base + 5,
+		refreshReplies: []map[string]interface{}{{"nothing_to_compile": true}}}
+
+	resp, err := editorCmd(context.Background(), []string{"refresh", "--compile"}, f.send, f.resolve)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	report := parseCompileReport(t, resp)
+	if !report.NothingToCompile || !report.CompileSucceeded {
+		t.Errorf("report = %+v, want nothing_to_compile with a clean compile", report)
+	}
+	if !hasNoteContaining(report.Notes, "skipped the compile") {
+		t.Errorf("notes = %v, want one saying the connector skipped the compile", report.Notes)
+	}
+}
+
 func TestEditorCmd_RefreshCompileDistinguishesTimeout(t *testing.T) {
 	compileTestBudgets(t)
 	base := int64(1_000)
@@ -863,10 +884,29 @@ func TestEditorCmd_RefreshCompileTruncatedErrorsSaySo(t *testing.T) {
 // ignoring it would leave the console cleared when the caller asked to keep it.
 func TestEditorCmd_RefreshKeepConsoleNeedsCompile(t *testing.T) {
 	f := &fakeEditor{t: t, diagnostics: clean()}
-	if _, err := editorCmd(context.Background(), []string{"refresh", "--keep-console"}, f.send, f.resolve); err == nil {
-		t.Fatal("want an error for --keep-console without --compile")
+	_, err := editorCmd(context.Background(), []string{"refresh", "--keep-console"}, f.send, f.resolve)
+	if err == nil || !strings.Contains(err.Error(), "--keep-console only applies with --compile") {
+		t.Fatalf("error = %v, want --keep-console without --compile refused", err)
 	}
 	if f.called("refresh_unity") {
 		t.Errorf("calls = %v, want nothing sent", f.calls)
+	}
+}
+
+// TestEditorCmd_ContradictoryPlayFlagsAreRefused: `editor play --wait --no-wait` used to be accepted
+// and entered play mode while honouring only one of them (F10).
+func TestEditorCmd_ContradictoryPlayFlagsAreRefused(t *testing.T) {
+	send := func(command string, params interface{}) (*client.CommandResponse, error) {
+		t.Fatalf("no request may be sent for contradictory flags (saw %q)", command)
+		return nil, nil
+	}
+	for _, args := range [][]string{
+		{"play", "--wait", "--no-wait"},
+		{"stop", "--no-wait", "--wait"},
+	} {
+		_, err := editorCmd(context.Background(), args, send, stateResolver("ready"))
+		if err == nil || !strings.Contains(err.Error(), "--wait and --no-wait are mutually exclusive") {
+			t.Errorf("editor %v: error = %v, want the contradiction", args, err)
+		}
 	}
 }

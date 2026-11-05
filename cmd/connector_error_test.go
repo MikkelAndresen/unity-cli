@@ -52,6 +52,13 @@ func TestConnectorErrorHint(t *testing.T) {
 			want: "the command ran and its effects stand",
 		},
 		{
+			name: "a parameter the tool does not know",
+			resp: &client.CommandResponse{Success: false,
+				Message: "spawn_enemy does not take the parameter 'colour'.",
+				Data:    json.RawMessage(`{"code":"unknown_parameter","command":"spawn_enemy","parameter":"colour","started":false}`)},
+			want: "the request was refused before the tool ran",
+		},
+		{
 			name: "an ordinary tool error gets no guess",
 			resp: &client.CommandResponse{Success: false, Message: "exec failed: CS0103",
 				Data: json.RawMessage(`{"compiling":true}`)},

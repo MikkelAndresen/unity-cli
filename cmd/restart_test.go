@@ -438,3 +438,26 @@ func TestRestartCmd_MissingExecutableRefusesBeforeQuittingOrCleaning(t *testing.
 		t.Fatalf("expected executable-not-found error, got %v", err)
 	}
 }
+
+// TestRestartCmd_ContradictoryFlagsStopNothing: restart quits the editor before it relaunches, so a
+// refused flag combination has to be caught before the executable lookup and the quit (F9).
+func TestRestartCmd_ContradictoryFlagsStopNothing(t *testing.T) {
+	var stderr bytes.Buffer
+	deps := restartTestDeps(t, &stderr)
+	deps.discover = func(string, int) (*client.Instance, error) {
+		t.Fatal("discover must not run for a refused flag combination")
+		return nil, nil
+	}
+	deps.findExecutable = func(string, string) (string, error) {
+		t.Fatal("the executable lookup must not run for a refused flag combination")
+		return "", nil
+	}
+
+	_, err := restartCmd([]string{"--save", "--discard"}, deps)
+	if err == nil || !strings.Contains(err.Error(), "--save and --discard are mutually exclusive") {
+		t.Fatalf("error = %v, want the local contradiction check", err)
+	}
+	if stderr.Len() != 0 {
+		t.Errorf("stderr = %q, want nothing printed before the refusal", stderr.String())
+	}
+}

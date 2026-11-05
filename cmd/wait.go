@@ -142,6 +142,9 @@ func waitCmd(ctx context.Context, args []string, send sendFn, resolve instanceRe
 				_, _ = fmt.Fprintf(out, " — %s", r.Reason)
 			}
 			_, _ = fmt.Fprintln(out)
+		} else if r.Reason != "" {
+			// The editor is idle but --compile could not be proven; the reason is the verdict.
+			_, _ = fmt.Fprintln(out, r.Reason)
 		}
 		printProvenance(out, prov)
 		for _, n := range r.Notes {
@@ -225,15 +228,20 @@ func waitCmd(ctx context.Context, args []string, send sendFn, resolve instanceRe
 				return finish(waitIdle)
 			}
 			if status.CompileFinishedAt == 0 {
-				r.Notes = append(r.Notes, "this connector reports no compile clock, so the wait cannot prove your edit was compiled; unity-cli verify does")
+				// --compile is a promise that the edit is in the compile. A connector with no compile
+				// clock cannot keep it, and answering 0 would let `wait --compile && test` run the tests
+				// against code this wait could not prove was built.
+				r.Reason = "this connector reports no compile clock, so the wait cannot prove your edit was compiled"
+				r.Notes = append(r.Notes, "run unity-cli verify (or unity-cli editor refresh --compile) to compile it and get the provenance line")
 				askProvenance(false)
-				return finish(waitIdle)
+				return finish(waitTimedOut)
 			}
 
 			askProvenance(false)
 			if prov == nil {
-				r.Notes = append(r.Notes, "compile_status did not answer, so nothing can say whether the source tree is newer than the last compile; unity-cli verify compiles and proves it")
-				return finish(waitIdle)
+				r.Reason = "compile_status did not answer, so nothing can say whether the source tree is newer than the last compile"
+				r.Notes = append(r.Notes, "run unity-cli verify, which compiles and proves what the compile covers")
+				return finish(waitTimedOut)
 			}
 			if prov.StaleCount == 0 {
 				if prov.ScanNote != provenanceNotScanned {

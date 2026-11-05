@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -423,6 +424,7 @@ type compileBaseline struct {
 type compileOutcome struct {
 	Evidence         bool // a compile was seen to finish after the request
 	NothingToCompile bool // the grace window passed with the editor ready and no compile
+	SkipProven       bool // the connector skipped the compile because nothing was out of date
 	TimedOut         bool // neither happened before compileWaitTimeout
 	Restarted        bool // the editor process changed while waiting
 	Untracked        bool // the connector reports no compile clock: the wait cannot prove one ran
@@ -490,6 +492,16 @@ func waitForCompileTo(ctx context.Context, resolve instanceResolver, logw io.Wri
 
 	_, _ = fmt.Fprintf(logw, "Timed out waiting for compilation (%s).\n", compileWaitTimeout)
 	return compileOutcome{TimedOut: true, HasErrors: lastErrors, Elapsed: time.Since(start)}, nil
+}
+
+// noteSkippedCompile folds the refresh reply's nothing_to_compile into the outcome. The connector
+// stamps its compile clock when it skips a provably unneeded compile, so the wait sees that as a
+// finished compile; without this the report would claim a compile ran.
+func noteSkippedCompile(outcome *compileOutcome, refreshReply json.RawMessage) {
+	if outcome.TimedOut || !reportFieldBool(refreshReply, "nothing_to_compile") {
+		return
+	}
+	outcome.NothingToCompile, outcome.SkipProven = true, true
 }
 
 func compileResultLine(hasErrors bool) string {

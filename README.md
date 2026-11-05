@@ -192,7 +192,7 @@ unity-cli editor play --wait
 # Stop play mode
 unity-cli editor stop
 
-# Request the change without reading the resulting state back
+# Request the change without reading the resulting state back (--wait and --no-wait are exclusive)
 unity-cli editor stop --no-wait
 
 # Toggle pause (only works during play mode)
@@ -251,6 +251,9 @@ skips the clear. Connectors without the compile-finished clock fall back to the 
 ```bash
 # Quit and wait until Unity has actually exited (unsaved scene changes are discarded)
 unity-cli editor quit
+
+# --save and --discard contradict each other: the CLI refuses the pair before it stops anything
+# unity-cli editor quit --save --discard   -> exit 1, nothing quits
 
 # Save open scenes and assets first
 unity-cli editor quit --save
@@ -534,7 +537,7 @@ PDB so those frames carry line numbers, and Unity's engine frames are collapsed 
 
 **Result shape.** A returned value is serialized from its public fields and readable public properties, so anonymous types, property-only editor API objects, lists, dictionaries, and nested objects come back as JSON objects rather than `ToString()` text. Collections cap at 100 entries and depth at 6, cycles are reported as `"<cycle: Type>"`, and a property that throws becomes `"<error: Type: message>"` without dropping its siblings. Unity objects keep their identity string (`"Main Camera (UnityEngine.Camera)"`), and Unity math structs expose their data members rather than derived values such as `Vector3.normalized`. If serialization itself fails, `data` falls back to a string and `meta` carries `serialization_error`; use `--meta` to see it.
 
-**Compiled-snippet cache.** `exec` compiles the snippet with `csc` in a subprocess and waits for it **without** blocking the editor's main thread, then loads and invokes it back on that thread. The same call again — same body, same `--usings`, same reference set — reuses the already-loaded assembly instead of compiling, which is the difference between a repeated probe costing one frame or three seconds. The response reports that as `meta: {"compile":"compiled|cached","compile_ms":N,"reference_assemblies":N}`, kept out of `data` so parsing a result is unchanged; `--meta` prints it to stderr:
+**Compiled-snippet cache.** `exec` compiles the snippet with `csc` in a subprocess and waits for it **without** blocking the editor's main thread, then loads and invokes it back on that thread. The same call again — same body, same `--usings`, same reference set — reuses the already-loaded assembly instead of compiling, which is the difference between a repeated probe costing one frame or three seconds. The response reports that as `meta: {"compile":"compiled|cached","compile_ms":N,"reference_assemblies":N}`, kept out of `data` so parsing a result is unchanged; `--meta` prints it to stderr. `compile_ms` is the csc subprocess only — a cache hit reports `0`, and the snippet's own run time (including `await`) is not part of it:
 
 ```bash
 unity-cli exec --meta "return Application.dataPath;"   # meta: {"compile":"compiled","compile_ms":403,…}
@@ -579,6 +582,15 @@ unity-cli api UnityEngine.Object.FindObjectOfType --docs
 ```
 
 A type query accepts the simple name, the full name, and either spelling of a generic (`BufferLookup`, `BufferLookup<T>`, `` BufferLookup`1 ``). An answer that is a nearest-match fallback says so: `exact: false` plus a `note` (`no member named 'Lerpp' on UnityEngine.Vector3; closest: Lerp, Slerp`) and, for a query that names nothing at all, an empty `types` list with the closest type names in `closest_types` — the CLI exits 1 on that, because the API the caller asked for does not exist. When several types match, each one is described, best match first (up to `--max_types`, default 5). `[Obsolete]` members report the message, whether it is an error, and the replacement when the notice names one (`Use X instead`, `(UnityUpgradable) -> X`). `--docs` adds the `<summary>` from the `.xml` sitting next to the assembly — Unity ships one for its own modules, most third-party assemblies ship none, and a missing doc file prints nothing.
+
+A query that names nothing real is not a successful lookup. The Connector answers a typo with the closest real names and a sentence saying what did not exist, and the CLI prints that sentence first while still printing the answer and exiting 0:
+
+```
+no member named 'Lerpp' on UnityEngine.Vector3, System.Numerics.Vector3; closest: Lerp, Slerp
+{ "exact": false, "matched_by": "type.member", ... }
+```
+
+A query with nothing close at all (`api NoSuchTypeXyz`) exits 1 with the Connector's `no type or member named …` message. The reply carries `exact`, `note` and `matched_by` (`type`, `type.member`, `member`, `closest_types`), so a script can decide without parsing the sentence; when a reply marks itself inexact without a `note`, the CLI builds the line itself (`no exact match; closest: …`).
 
 The index is built lazily and cached for the editor session. `--budget <ms>` (default 1500) bounds one call; `index.complete: false` means the budget ran out before every assembly was searchable, so raise the budget or ask again. The command stays available while the project does not compile: the loaded assemblies are the last good ones, which is exactly when the real API is wanted.
 
@@ -757,8 +769,9 @@ unity-cli test --mode PlayMode
 # Save dirty open scenes before running tests
 unity-cli test --auto-save-scenes
 
-# Filter by test name (substring match)
-unity-cli test --filter MyTestClass
+# Only one test (its full name) or one class (the namespace-qualified class name)
+unity-cli test --filter MyNamespace.MyTests
+unity-cli test --filter MyNamespace.MyTests.SpecificTest
 
 # Only tests in these assemblies (comma-separated)
 unity-cli test --assembly MyGame.Tests.Editor
@@ -766,6 +779,8 @@ unity-cli test --assembly MyGame.Tests.Editor
 # Run anyway when an assembly is older than its sources
 unity-cli test --allow-stale
 ```
+
+`--filter` is matched against the test's full name, exactly: `MyNamespace.MyTests` runs that class's tests and `MyNamespace.MyTests.SpecificTest` runs one test, while a partial name or a bare namespace selects nothing. A run that selects no test is a failure, not a pass: `test` exits 1 with `no tests matched (filter …, assembly …)`, the same verdict `verify` gives when no test ran. With `--assembly` given, a stale assembly *outside* that selection is reported too (`N stale assembly(ies) are outside --assembly; the tests will not load them`), because the run cannot see it.
 
 Requires the Unity Test Framework package. Tests are blocked by default when any open scene has unsaved changes. Use `--auto-save-scenes` to save them first, or `--allow-dirty-scenes` to run anyway. They are also blocked when a project assembly under test is older than its sources — a stale DLL runs old code and looks exactly like a real result. Rebuild with `unity-cli editor refresh --compile`, or pass `--allow-stale` deliberately. PlayMode tests trigger a domain reload — the CLI polls for results automatically.
 
@@ -873,7 +888,10 @@ unity-cli compile_status --scan_budget 1000  # let the scan take up to a second
 
 `wait` exits 0 when the editor is idle (heartbeat `ready`, `playing` or `paused` — not starting,
 compiling, refreshing, reloading, building, and no dialog open), 1 when it gave up, and 2 when the editor could
-not answer, naming a modal dialog and the command that answers it. `--timeout` is seconds and belongs
+not answer, naming a modal dialog and the command that answers it. `--compile` turns "idle" into "idle and
+provably compiled": when the connector cannot prove that (no compile clock on the heartbeat, `compile_status`
+not answering), `wait --compile` exits 1 with the reason and the command that does prove it, so
+`wait --compile && test` never runs tests against code the wait could not see built. `--timeout` is seconds and belongs
 after the command name; the global `--timeout` before it stays a request timeout in milliseconds.
 
 With `--compile`, one of two things has to be true to exit 0: the connector's compile-finished clock
@@ -1065,7 +1083,10 @@ unity-cli exec --params '{"code":"return 42;"}' --params '{"await_timeout":1000}
 
 `--params` is the only repeatable subcommand flag. Any other subcommand flag may be given
 once; a second occurrence (for example `--filter a --filter b`) is an error instead of silently
-replacing the first value.
+replacing the first value. A flag the command does not take is an error too — `test --filtre x` exits 1 with
+`unknown flag --filtre for test; see unity-cli test --help` instead of running the whole suite. Custom tools
+keep their parameters on the connector side, which refuses one it does not know with
+`data.code: "unknown_parameter"` (nothing ran; check the schema with `unity-cli list`).
 Invalid JSON in any `--params` object is also an error. When the same key comes from both a plain
 flag and `--params`, the `--params` value wins.
 
@@ -1199,7 +1220,7 @@ own timing such as `exec`'s `compile_ms` sits inside the handler time, which sit
 | `--project <path>` | Select Unity instance by project path | latest |
 | `--timeout <ms>` | One budget per invocation, shared by discovery, waiting for a fresh heartbeat, and the request. The remaining budget is sent to the Connector as `deadline_ms`, so it answers a queued command before this deadline does — see [Queued Commands and Server-Side Deadlines](#queued-commands-and-server-side-deadlines). A client deadline is reported as `timed out ... (the editor may still be running it)`, not as a connection failure. `test`, `verify` and `editor refresh --compile` default to 1800000 (30 min); an explicit `0` means no deadline (the Connector still answers a queued command after its 60 s default). That is a compatibility break from older releases, where `--timeout 0` made the heartbeat wait fail at once; a script that relied on the old meaning must pass a small positive value. `wait --timeout` and build polling keep their own budgets. For `editor quit`/`restart` it is also the wait-to-exit and startup budget. | 120000 |
 | `--ignore-version-mismatch` | Suppress the version-drift warning (and the refusal for a connector older than 0.7.0) | false |
-| `--meta` | Print the response's `meta` (how the call was served, e.g. `exec`'s compile cache state) to stderr | false |
+| `--meta` | Print the response's `meta` (how the call was served, e.g. `exec`'s compile cache state) to stderr. `compile_ms` is the csc subprocess only; `queue_wait_ms` is the wait before the handler started and `total_ms` the whole editor-side span, which contains both. None is a wall-clock total — see [Queued Commands and Server-Side Deadlines](#queued-commands-and-server-side-deadlines) | false |
 
 ```bash
 # Select an active Unity instance by heartbeat port
