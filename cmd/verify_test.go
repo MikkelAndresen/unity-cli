@@ -294,6 +294,29 @@ func TestVerify_FailingTestsShowFirstLineOfEach(t *testing.T) {
 	}
 }
 
+func TestVerify_LoggedExceptionsAreShownUnderTheirFailure(t *testing.T) {
+	f := &fakeEditor{t: t, diagnostics: clean(), testsMessage: "2 test(s) failed.", tests: map[string]interface{}{
+		"total": 3, "passed": 1, "failed": 2, "skipped": 0,
+		"failures": []string{"Ns.T.Fires: Expected: 2\n  But was: 0", "Ns.T.Other: Expected: true"},
+		"logged_exceptions": []map[string]string{
+			{"test": "Ns.T.Fires", "exception": "InvalidOperationException: not played back", "at": "Runtime/BowSystem.cs:42"},
+			{"test": "Ns.T.Fires", "exception": "NullReferenceException"},
+		},
+	}}
+	code, out := f.run()
+	if code != verifyFailed {
+		t.Fatalf("exit = %d, want 1", code)
+	}
+	want := "compile: ok\ntests: 1/3 passed, 2 failed\n" +
+		"  Ns.T.Fires: Expected: 2\n" +
+		"    logged InvalidOperationException: not played back (at Runtime/BowSystem.cs:42)\n" +
+		"    logged NullReferenceException\n" +
+		"  Ns.T.Other: Expected: true\n"
+	if out != want {
+		t.Errorf("output = %q, want %q", out, want)
+	}
+}
+
 func TestVerify_ForwardsTestOptions(t *testing.T) {
 	f := &fakeEditor{t: t, diagnostics: clean(), tests: passing(1), testsSuccess: true}
 	if code, out := f.run("--assembly", "A.Tests,B.Tests", "--filter", "Ns.Class"); code != verifyOK {
@@ -634,6 +657,32 @@ func TestVerify_BurstLineFollowsTheCompile(t *testing.T) {
 	}
 	if f.params["burst_status"]["wait"] != defaultBurstWaitSeconds {
 		t.Errorf("burst_status wait = %v, want %d", f.params["burst_status"]["wait"], defaultBurstWaitSeconds)
+	}
+}
+
+func TestVerify_CleanBurstWithNothingCompiledPrintsNothing(t *testing.T) {
+	f := &fakeEditor{t: t, diagnostics: clean(), tests: passing(2), testsSuccess: true,
+		burstSuccess: true,
+		burst: map[string]interface{}{
+			"idle": true, "compiled": 0, "error_count": 0,
+			"notes": []string{"Burst has not scheduled an eager compile in this editor session"},
+		}}
+	code, out := f.run()
+	if code != verifyOK || out != "compile: ok\ntests: 2/2 passed\n" {
+		t.Errorf("exit = %d, output = %q; want no burst line when nothing is wrong", code, out)
+	}
+}
+
+func TestVerify_CleanBurstNamesItsTargetsWithoutCaveats(t *testing.T) {
+	f := &fakeEditor{t: t, diagnostics: clean(), tests: passing(1), testsSuccess: true,
+		burstSuccess: true,
+		burst: map[string]interface{}{
+			"idle": true, "compiled": 3, "error_count": 0,
+			"notes": []string{"a caveat that only matters when something is off"},
+		}}
+	_, out := f.run()
+	if out != "compile: ok\nburst: 3 targets compiled, 0 error(s)\ntests: 1/1 passed\n" {
+		t.Errorf("output = %q", out)
 	}
 }
 

@@ -146,7 +146,7 @@ func waitCmd(ctx context.Context, args []string, send sendFn, resolve instanceRe
 			// The editor is idle but --compile could not be proven; the reason is the verdict.
 			_, _ = fmt.Fprintln(out, r.Reason)
 		}
-		printProvenance(out, prov)
+		printProvenance(out, prov, true)
 		for _, n := range r.Notes {
 			_, _ = fmt.Fprintf(out, "  (%s)\n", n)
 		}

@@ -111,8 +111,9 @@ type compileFindings struct {
 // printProvenance writes the one line that tells the reader which edit this result reflects, plus the
 // stale-source and covered-DLL lines when there are any. (The stale *assembly* line is left to the
 // caller that acts on it: verify prints it as part of its refusal, test refuses through the
-// connector.)
-func printProvenance(out io.Writer, p *compileProvenance) {
+// connector.) verify passes covered=false: a covered DLL changes nothing it does, and its readers
+// are agents paying for every line; --json still carries it.
+func printProvenance(out io.Writer, p *compileProvenance, covered bool) {
 	if p == nil {
 		return
 	}
@@ -122,7 +123,7 @@ func printProvenance(out io.Writer, p *compileProvenance) {
 	if p.StaleLine != "" {
 		_, _ = fmt.Fprintln(out, p.StaleLine)
 	}
-	if p.StaleAssemblyCoveredLine != "" {
+	if covered && p.StaleAssemblyCoveredLine != "" {
 		_, _ = fmt.Fprintln(out, p.StaleAssemblyCoveredLine)
 	}
 	if p.ScanNote != "" {

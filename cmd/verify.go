@@ -40,19 +40,30 @@ type verifyResult struct {
 		Provenance   json.RawMessage `json:"provenance,omitempty"`
 	} `json:"compile"`
 	Burst *verifyBurst `json:"burst,omitempty"`
-	Tests *struct {
-		Total    int      `json:"total"`
-		Passed   int      `json:"passed"`
-		Failed   int      `json:"failed"`
-		Skipped  int      `json:"skipped"`
-		Failures []string `json:"failures,omitempty"`
-	} `json:"tests,omitempty"`
-	Notes []string `json:"notes,omitempty"`
+	Tests *verifyTests `json:"tests,omitempty"`
+	Notes []string     `json:"notes,omitempty"`
 	// Burst could not be checked at all (old connector answers, editor busy, HTTP timeout). The tool
 	// being absent is not an error: it means the project has no Burst to ask.
 	BurstError string `json:"burst_error,omitempty"`
 	Error      string `json:"error,omitempty"`
 	Exit       int    `json:"exit"`
+}
+
+type verifyTests struct {
+	Total    int               `json:"total"`
+	Passed   int               `json:"passed"`
+	Failed   int               `json:"failed"`
+	Skipped  int               `json:"skipped"`
+	Failures []string          `json:"failures,omitempty"`
+	Logged   []loggedException `json:"logged_exceptions,omitempty"`
+}
+
+// loggedException is an exception a failing test logged instead of throwing (Entities logs what a
+// system throws in OnUpdate), so the failure's own message never names it.
+type loggedException struct {
+	Test      string `json:"test"`
+	Exception string `json:"exception"`
+	At        string `json:"at,omitempty"`
 }
 
 // verifyBurst is the burst_status reply. Compiled/failed/... count the [BurstCompile] targets in the
@@ -180,7 +191,7 @@ func verifyCmd(ctx context.Context, args []string, send, testSend sendFn, resolv
 	r.Compile.OK = findings.Total == 0 && !hasErrors
 	if !asJSON {
 		printCompile(out, r.Compile.OK, findings.Total, findings.TotalAtLeast, findings.Diags, findings.Source, hasErrors)
-		printProvenance(out, findings.Provenance)
+		printProvenance(out, findings.Provenance, false)
 	}
 	if outcome.NothingToCompile {
 		note := "no script compilation was observed after the refresh; the compile verdict is the editor's current state"
@@ -265,12 +276,13 @@ func verifyCmd(ctx context.Context, args []string, send, testSend sendFn, resolv
 		return noReply("tests: %v", err)
 	}
 	var summary struct {
-		Total    int      `json:"total"`
-		Passed   int      `json:"passed"`
-		Failed   int      `json:"failed"`
-		Skipped  int      `json:"skipped"`
-		Failures []string `json:"failures"`
-		Blocked  string   `json:"blocked"`
+		Total    int               `json:"total"`
+		Passed   int               `json:"passed"`
+		Failed   int               `json:"failed"`
+		Skipped  int               `json:"skipped"`
+		Failures []string          `json:"failures"`
+		Logged   []loggedException `json:"logged_exceptions"`
+		Blocked  string            `json:"blocked"`
 	}
 	if len(tresp.Data) > 0 {
 		_ = json.Unmarshal(tresp.Data, &summary)
@@ -279,21 +291,17 @@ func verifyCmd(ctx context.Context, args []string, send, testSend sendFn, resolv
 		// Not a test failure: dirty untitled scene, compile gate, missing Test Framework, ...
 		return noReply("tests: %s", tresp.Message)
 	}
-	r.Tests = &struct {
-		Total    int      `json:"total"`
-		Passed   int      `json:"passed"`
-		Failed   int      `json:"failed"`
-		Skipped  int      `json:"skipped"`
-		Failures []string `json:"failures,omitempty"`
-	}{summary.Total, summary.Passed, summary.Failed, summary.Skipped, firstLines(summary.Failures, max)}
+	r.Tests = &verifyTests{summary.Total, summary.Passed, summary.Failed, summary.Skipped,
+		firstLines(summary.Failures, max), summary.Logged}
+	printed := len(r.Notes) // notes before this point were printed where they arose
 	if _, ok := flags["assembly"]; ok {
 		if inst, err := resolve(); err == nil && inst != nil && versionBefore(inst.ConnectorVersion, 0, 7) {
 			r.Notes = append(r.Notes, "connector < 0.7.0 ignores --assembly: every test ran")
 		}
 	}
 	if !asJSON {
-		printTests(out, r.Tests.Total, r.Tests.Passed, r.Tests.Failed, r.Tests.Skipped, r.Tests.Failures)
-		for _, n := range r.Notes {
+		printTests(out, r.Tests)
+		for _, n := range r.Notes[printed:] {
 			_, _ = fmt.Fprintf(out, "  (%s)\n", n)
 		}
 	}
@@ -474,6 +482,12 @@ func printBurst(out io.Writer, b *verifyBurst) {
 	if b == nil {
 		return
 	}
+	// Agents read every verify; a Burst line with nothing wrong in it is noise they pay for each
+	// time. --json keeps the full reply.
+	clean := b.ErrorCount == 0 && b.Failed == 0 && b.NotCompiled == 0 && b.Unknown == 0 && !b.TimedOut
+	if clean && b.Compiled == 0 {
+		return
+	}
 	line := fmt.Sprintf("burst: %d targets compiled, %d error(s)", b.Compiled, b.ErrorCount)
 	if b.Failed > 0 {
 		line += fmt.Sprintf(", %d failed", b.Failed)
@@ -504,12 +518,13 @@ func printBurst(out io.Writer, b *verifyBurst) {
 		_, _ = fmt.Fprintf(out, "  %s%s%s\n", where, code, e.Message)
 	}
 	// One caveat line is enough for a two-line summary; the tool keeps the rest for burst_status.
-	if len(b.Notes) > 0 {
+	if !clean && len(b.Notes) > 0 {
 		_, _ = fmt.Fprintf(out, "  (%s)\n", b.Notes[0])
 	}
 }
 
-func printTests(out io.Writer, total, passed, failed, skipped int, failures []string) {
+func printTests(out io.Writer, t *verifyTests) {
+	total, passed, failed, skipped := t.Total, t.Passed, t.Failed, t.Skipped
 	if total == 0 {
 		_, _ = fmt.Fprintln(out, "tests: none ran (check --assembly / --filter)")
 		return
@@ -522,8 +537,18 @@ func printTests(out io.Writer, total, passed, failed, skipped int, failures []st
 		line += fmt.Sprintf(", %d skipped", skipped)
 	}
 	_, _ = fmt.Fprintln(out, line)
-	for _, f := range failures {
+	for _, f := range t.Failures {
 		_, _ = fmt.Fprintf(out, "  %s\n", f)
+		for _, e := range t.Logged {
+			if !strings.HasPrefix(f, e.Test+":") {
+				continue
+			}
+			if e.At != "" {
+				_, _ = fmt.Fprintf(out, "    logged %s (at %s)\n", e.Exception, e.At)
+			} else {
+				_, _ = fmt.Fprintf(out, "    logged %s\n", e.Exception)
+			}
+		}
 	}
 }
 

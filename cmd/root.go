@@ -949,7 +949,8 @@ Burst:
 Tests:
   test                            Run EditMode tests (default)
   test --mode PlayMode            Run PlayMode tests
-  test --filter <name>            One test's full name (Namespace.Class.Test), or a class's
+  test --filter <name>            A class, test or namespace, by whole name segments (BowTests,
+                                  Ns.BowTests, BowTests.Fires); a regex is used as one
   test --allow-dirty-scenes       Run even when open scenes have unsaved changes
   test --auto-save-scenes         Save dirty open scenes before running tests
   test --assembly <a,b>           Only tests in these assemblies
@@ -1501,10 +1502,12 @@ Run Unity tests via the Test Runner API.
 
 Options:
   --mode <EditMode|PlayMode>    Test mode (default: EditMode)
-  --filter <name>               Only the tests whose full name matches exactly: one test
-                                (Namespace.Class.TestName) or one class (Namespace.Class). A partial
-                                name or a bare namespace matches nothing — a filter that selects no
-                                test is reported as such, not as a passing run
+  --filter <name>               Only the tests whose full name contains <name> as whole dot-separated
+                                segments: a class (MyTests or Namespace.MyTests), a test
+                                (MyTests.TestName) or a namespace prefix. Part of a segment matches
+                                nothing (My does not select MyTests). A filter with regex syntax
+                                (^ $ * + ? [ ] { } | \) is used as a regex on the full name. A filter
+                                that selects no test is reported as such, not as a passing run
   --assembly <a,b>              Only tests in these assemblies (comma-separated)
   --allow-dirty-scenes          Run even when open scenes have unsaved changes
   --auto-save-scenes            Save dirty open scenes before running tests
@@ -1552,9 +1555,10 @@ brief enough for an agent's context:
   4. Asks Burst (burst_status) whether it is still compiling, what compiled, and
      what failed, waiting up to --burst-wait seconds. Burst errors print the same
      way as compile errors and fail verify. --no-burst skips the step; projects
-     without Burst print nothing.
+     without Burst, or with nothing compiled and nothing wrong, print nothing.
   5. Unless --no-tests: saves dirty open scenes and runs the tests, then
-     prints passed/total and the first line of each failure.
+     prints passed/total and the first line of each failure, plus any exception
+     the failing test logged ("logged <Exception>: … (at file:line)").
 
 Every compile result says which compile it reflects, so a clean answer is told apart from a stale
 one. verify prints the connector's provenance line after the compile verdict:
@@ -1563,12 +1567,12 @@ one. verify prints the connector's provenance line after the compile verdict:
   compiled 14:02:11 (3 s ago, took 2.2 s) · 1 source file changed since previous compile · rebuilt: Game.Tests.Editor
   stale: Assets/Foo.cs modified after this compile — run verify again
   stale assembly: Game.Tests.dll (built 14:01:50) is older than Assets/Game/Tests.cs (14:04:02) — run unity-cli editor refresh --compile
-  not stale: Game.Tests.dll (built 14:01:50) is older than Assets/Game/Tests.cs (14:04:02), but the compile that started 14:05:10 read that source and kept the DLL; a moved mtime alone does not mean the DLL is out of date
 
 The stale line means a source file under Assets/ or a file:/embedded package was written after that
 compile: the edit is in the project but not in the result. A stale assembly means the DLL the tests
 would load is older than its sources; verify refuses to run tests until a clean refresh, unless
---allow-stale is passed. The "not stale" line is the opposite case: Unity does not rewrite a DLL whose
+--allow-stale is passed. The "not stale" case (printed by 'unity-cli wait'; verify keeps it to
+--json, since it changes nothing verify does) is the opposite: Unity does not rewrite a DLL whose
 contents it considers current, so a source whose timestamp merely moved (touch, re-checkout) stays
 older than its DLL even though a compile read it — it is reported, and the tests run. --json carries
 the same fields under compile.provenance (unix ms and ISO timestamps). See 'unity-cli wait --help' to
@@ -1580,8 +1584,8 @@ Options:
   --burst-wait <seconds>        How long to wait for Burst to go idle (default 60)
   --assembly <a,b>              Only tests in these assemblies (comma-separated). A stale
                                 assembly outside this list is reported but does not refuse.
-  --filter <name>               Only tests whose full name matches exactly (one test, Namespace.
-                                Class.TestName, or one class, Namespace.Class)
+  --filter <name>               Only tests whose full name contains <name> as whole segments (a
+                                class, Class.Test, or a namespace prefix); see 'unity-cli test --help'
   --mode <EditMode|PlayMode>    Test mode (default: EditMode)
   --max <n>                     List at most n errors and n failures (default 20); the error
                                 count is still the true total

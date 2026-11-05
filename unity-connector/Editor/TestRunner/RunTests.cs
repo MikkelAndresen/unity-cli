@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Text.RegularExpressions;
 using System.Threading.Tasks;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
@@ -90,15 +91,16 @@ namespace UnityCliConnector.TestRunner
             var passed  = new List<string>();
             var failed  = new List<string>();
             var skipped = new List<string>();
+            var logged  = new List<RunTests.LoggedException>();
 
             var api = ScriptableObject.CreateInstance<TestRunnerApi>();
             var callbacks = new TestCallbacks(
-                onResult: r => CollectResult(r, passed, failed, skipped),
+                onResult: r => CollectResult(r, passed, failed, skipped, logged),
                 onFinished: _ =>
                 {
                     if (tcs.Task.IsCompleted) return;
                     Object.DestroyImmediate(api);
-                    tcs.TrySetResult(BuildResponse(passed, failed, skipped));
+                    tcs.TrySetResult(BuildResponse(passed, failed, skipped, logged));
                 }
             );
 
@@ -117,15 +119,16 @@ namespace UnityCliConnector.TestRunner
             var passed  = new List<string>();
             var failed  = new List<string>();
             var skipped = new List<string>();
+            var logged  = new List<RunTests.LoggedException>();
 
             var api = ScriptableObject.CreateInstance<TestRunnerApi>();
             var callbacks = new TestCallbacks(
-                onResult: r => CollectResult(r, passed, failed, skipped),
+                onResult: r => CollectResult(r, passed, failed, skipped, logged),
                 onFinished: _ =>
                 {
                     Object.DestroyImmediate(api);
                     TestRunnerState.ClearPending(port);
-                    WriteResultsFile(port, passed, failed, skipped);
+                    WriteResultsFile(port, passed, failed, skipped, logged);
                 }
             );
 
@@ -187,19 +190,73 @@ namespace UnityCliConnector.TestRunner
         // --- Shared helpers (used by TestRunnerState after domain reload) ---
 
         internal static void CollectResult(ITestResultAdaptor result,
-            List<string> passed, List<string> failed, List<string> skipped)
+            List<string> passed, List<string> failed, List<string> skipped, List<LoggedException> logged)
         {
             if (result.Test.IsSuite) return;
             var name = result.Test.FullName;
             switch (result.TestStatus)
             {
                 case TestStatus.Passed:  passed.Add(name); break;
-                case TestStatus.Failed:  failed.Add($"{name}: {result.Message}"); break;
+                case TestStatus.Failed:
+                    failed.Add($"{name}: {result.Message}");
+                    logged.AddRange(ExceptionsLogged(name, result.Output));
+                    break;
                 default:                 skipped.Add(name); break;
             }
         }
 
-        internal static void WriteResultsFile(int port, List<string> passed, List<string> failed, List<string> skipped)
+        /// An exception a failing test logged rather than threw: Entities catches what a system
+        /// throws in OnUpdate and logs it, so the test fails later on an assertion whose message
+        /// never mentions the exception.
+        internal sealed class LoggedException
+        {
+            public string test;
+            public string exception;
+            public string at;
+        }
+
+        private const int MaxLoggedPerTest = 3;
+        private const int MaxExceptionLength = 300;
+        private static readonly Regex ExceptionHeader = new Regex(@"^[A-Za-z_][\w.`+]*Exception(: .*)?$");
+        private static readonly Regex FrameLocation = new Regex(@"\(at (.+?:\d+)\)\s*$");
+
+        /// Reads Unity's log capture in ITestResultAdaptor.Output: an exception is logged as
+        /// "TypeException: message" followed by its stack, whose first "(at file:line)" frame is
+        /// the throw site.
+        internal static List<LoggedException> ExceptionsLogged(string test, string output)
+        {
+            var found = new List<LoggedException>();
+            if (string.IsNullOrEmpty(output)) return found;
+            var lines = output.Split('\n');
+            for (var i = 0; i < lines.Length && found.Count < MaxLoggedPerTest; i++)
+            {
+                var line = lines[i].Trim();
+                if (!ExceptionHeader.IsMatch(line)) continue;
+                string at = null;
+                for (var j = i + 1; j < lines.Length && at == null; j++)
+                {
+                    var frame = lines[j].Trim();
+                    if (frame.Length == 0 || ExceptionHeader.IsMatch(frame)) break;
+                    var m = FrameLocation.Match(frame);
+                    if (m.Success) at = ProjectRelative(m.Groups[1].Value);
+                }
+                var exception = line.Length > MaxExceptionLength ? line.Substring(0, MaxExceptionLength) + "…" : line;
+                if (found.Any(e => e.exception == exception && e.at == at)) continue;
+                found.Add(new LoggedException { test = test, exception = exception, at = at });
+            }
+            return found;
+        }
+
+        private static string ProjectRelative(string path)
+        {
+            var root = Path.GetDirectoryName(Application.dataPath)?.Replace('\\', '/') + "/";
+            path = path.Replace('\\', '/');
+            if (path.StartsWith(root, StringComparison.Ordinal)) return path.Substring(root.Length);
+            return path.StartsWith("./", StringComparison.Ordinal) ? path.Substring(2) : path;
+        }
+
+        internal static void WriteResultsFile(int port, List<string> passed, List<string> failed, List<string> skipped,
+            List<LoggedException> logged)
         {
             var data = new
             {
@@ -214,6 +271,7 @@ namespace UnityCliConnector.TestRunner
                     failed  = failed.Count,
                     skipped = skipped.Count,
                     failures = failed,
+                    logged_exceptions = logged,
                     passes   = passed,
                 }
             };
@@ -232,7 +290,8 @@ namespace UnityCliConnector.TestRunner
         internal static string ResultsFilePath(int port) =>
             Path.Combine(StatusDir, $"test-results-{port}.json");
 
-        internal static object BuildResponse(List<string> passed, List<string> failed, List<string> skipped)
+        internal static object BuildResponse(List<string> passed, List<string> failed, List<string> skipped,
+            List<LoggedException> logged)
         {
             var summary = new
             {
@@ -241,6 +300,7 @@ namespace UnityCliConnector.TestRunner
                 failed  = failed.Count,
                 skipped = skipped.Count,
                 failures = failed,
+                logged_exceptions = logged,
                 passes   = passed,
             };
             return failed.Count > 0
@@ -251,14 +311,24 @@ namespace UnityCliConnector.TestRunner
         internal static Filter BuildFilter(TestMode mode, string filterStr, string[] assemblies = null)
         {
             var f = new Filter { testMode = mode };
+            // groupNames only: the Test Framework ANDs testNames with groupNames, and testNames
+            // matches whole full names, so a class name without its namespace selected nothing.
             if (!string.IsNullOrEmpty(filterStr))
-            {
-                f.testNames  = new[] { filterStr };
-                f.groupNames = new[] { filterStr };
-            }
+                f.groupNames = new[] { FilterPattern(filterStr) };
             if (assemblies != null && assemblies.Length > 0)
                 f.assemblyNames = assemblies;
             return f;
+        }
+
+        private static readonly char[] RegexOnlyChars = { '^', '$', '*', '+', '?', '[', ']', '{', '}', '|', '\\' };
+
+        /// A plain name matches whole dot-separated segments of a test's full name, so `BowTests`,
+        /// `Ns.BowTests`, `BowTests.Fires` and a namespace prefix all select what they name, and
+        /// `Bow` does not select `BowTests`. A filter using regex syntax is passed through as a regex.
+        internal static string FilterPattern(string filter)
+        {
+            if (filter.IndexOfAny(RegexOnlyChars) >= 0) return filter;
+            return @"(^|\.)" + Regex.Escape(filter) + @"($|\.|\()";
         }
 
         internal static string[] ParseAssemblies(string value)

@@ -55,9 +55,9 @@ func TestWaitHelpSaysAnUnprovableCompileFails(t *testing.T) {
 	}
 }
 
-// TestDocsAgreeOnTheTestFilter is the anti-drift check for F14: the connector matches --filter against
-// the full test name (RunTests.BuildFilter hands it to NUnit as a test name and a group name), so the
-// help must not call it a namespace or substring match.
+// TestDocsAgreeOnTheTestFilter is the anti-drift check for F14: the connector matches --filter as whole
+// dot-separated segments of the full test name (RunTests.FilterPattern), so the help must not call it a
+// substring match, and must say a partial segment selects nothing.
 func TestDocsAgreeOnTheTestFilter(t *testing.T) {
 	help := topicHelpText(t, "test")
 	for _, stale := range []string{
@@ -69,8 +69,8 @@ func TestDocsAgreeOnTheTestFilter(t *testing.T) {
 			t.Errorf("test --help still contains the contradictory wording %q", stale)
 		}
 	}
-	if !strings.Contains(help, "full name matches exactly") {
-		t.Error("test --help does not say the filter is matched against the full name")
+	if !strings.Contains(help, "whole dot-separated") || !strings.Contains(help, "Part of a segment matches") {
+		t.Error("test --help does not say the filter matches whole segments of the full name")
 	}
 
 	for _, path := range []string{"../README.md", "../README.ko.md"} {

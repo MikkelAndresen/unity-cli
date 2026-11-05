@@ -15,7 +15,7 @@ func TestPrintProvenance_PrintsTheCoveredDllLineOnce(t *testing.T) {
 		StaleAssemblyLine:         "stale assembly: Game.dll is older than Assets/Game.cs — run unity-cli editor refresh --compile",
 		StaleAssemblyCoveredLine:  "not stale: Game.Tests.dll is older than Assets/Tests.cs — unity-cli editor refresh --compile clean",
 		StaleAssemblyCoveredCount: 1,
-	})
+	}, true)
 
 	lines := strings.Split(strings.TrimSpace(out.String()), "\n")
 	if len(lines) != 2 {
@@ -29,5 +29,18 @@ func TestPrintProvenance_PrintsTheCoveredDllLineOnce(t *testing.T) {
 	}
 	if strings.Contains(out.String(), "stale assembly:") {
 		t.Errorf("output = %q, want the stale assembly line left to verify's refusal path", out.String())
+	}
+}
+
+// verify's text output leaves the covered-DLL line out: it changes nothing verify does.
+func TestPrintProvenance_CoveredLineCanBeLeftOut(t *testing.T) {
+	var out bytes.Buffer
+	printProvenance(&out, &compileProvenance{
+		ProvenanceLine:            provLine,
+		StaleAssemblyCoveredLine:  "not stale: Game.Tests.dll is older than Assets/Tests.cs",
+		StaleAssemblyCoveredCount: 1,
+	}, false)
+	if got := strings.TrimSpace(out.String()); got != provLine {
+		t.Errorf("output = %q, want only the provenance line", got)
 	}
 }
