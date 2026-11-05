@@ -127,6 +127,17 @@ namespace UnityCliConnector
             return Invoke(tool.Handler, command, parameters);
         }
 
+        /// Runs another tool from inside a handler (verify runs refresh_unity, compile_diagnostics,
+        /// burst_status and run_tests this way). No command lock: the calling handler holds it and the
+        /// lock is not reentrant. No compilation gate: the caller decides what a compile error means.
+        internal static Task<object> InvokeTool(string command, JObject parameters)
+        {
+            var tool = ToolDiscovery.FindTool(command);
+            if (tool == null)
+                return Task.FromResult<object>(new ErrorResponse($"Unknown command: {command}"));
+            return Invoke(tool.Handler, command, parameters);
+        }
+
         static async Task<object> Invoke(MethodInfo handler, string command, JObject parameters)
         {
             try

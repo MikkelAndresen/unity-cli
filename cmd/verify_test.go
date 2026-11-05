@@ -43,6 +43,10 @@ type fakeEditor struct {
 
 func (f *fakeEditor) send(command string, params interface{}) (*client.CommandResponse, error) {
 	p, _ := params.(map[string]interface{})
+	if command == "verify" {
+		// A connector without the in-editor verify: the CLI runs the steps itself.
+		return &client.CommandResponse{Success: false, Message: "Unknown command: verify"}, nil
+	}
 	key := command
 	if command == "compile_diagnostics" {
 		key = fmt.Sprintf("compile_diagnostics(source_tree_only=%v)", p["source_tree_only"])

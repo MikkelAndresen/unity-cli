@@ -9,6 +9,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/youngwoocho02/unity-cli/internal/client"
 )
 
 // Exit codes of `unity-cli verify`.
@@ -124,6 +126,12 @@ func verifyCmd(ctx context.Context, args []string, send, testSend sendFn, resolv
 	}
 
 	var r verifyResult
+	if code, handled := verifyInEditor(ctx, verifyOptions{
+		flags: flags, noTests: noTests, noBurst: noBurst, keepConsole: keepConsole, allowStale: allowStale,
+		asJSON: asJSON, burstWait: burstWait, max: max,
+	}, testSend, resolve, port, out); handled {
+		return code
+	}
 	finish := func(code int) int {
 		r.Exit = code
 		if asJSON {
@@ -262,6 +270,16 @@ func verifyCmd(ctx context.Context, args []string, send, testSend sendFn, resolv
 		return finish(verifyOK)
 	}
 
+	tresp, err := runVerifyTests(ctx, flags, allowStale, testSend, port)
+	if err != nil {
+		return noReply("tests: %v", err)
+	}
+	return reportVerifyTests(&r, tresp.Success, tresp.Message, tresp.Data, flags, resolve, out, asJSON, max, false, finish, noReply)
+}
+
+// runVerifyTests runs the tests the CLI way: `test` with verify's selection, which polls PlayMode
+// results across the domain reload.
+func runVerifyTests(ctx context.Context, flags map[string]string, allowStale bool, testSend sendFn, port int) (*client.CommandResponse, error) {
 	testArgs := []string{"--auto-save-scenes"}
 	for _, k := range []string{"mode", "filter", "assembly"} {
 		if v, ok := flags[k]; ok {
@@ -271,10 +289,15 @@ func verifyCmd(ctx context.Context, args []string, send, testSend sendFn, resolv
 	if allowStale {
 		testArgs = append(testArgs, "--allow-stale")
 	}
-	tresp, err := testCmd(ctx, testArgs, testSend, port)
-	if err != nil {
-		return noReply("tests: %v", err)
-	}
+	return testCmd(ctx, testArgs, testSend, port)
+}
+
+// reportVerifyTests prints a run_tests reply as verify's test section and returns verify's exit
+// code. alsoFailed carries an earlier failure that did not stop the tests (Burst errors in the
+// in-editor verify, which runs the tests while Burst finishes).
+func reportVerifyTests(r *verifyResult, success bool, message string, data json.RawMessage, flags map[string]string,
+	resolve instanceResolver, out io.Writer, asJSON bool, max int, alsoFailed bool,
+	finish func(int) int, noReply func(string, ...interface{}) int) int {
 	var summary struct {
 		Total    int               `json:"total"`
 		Passed   int               `json:"passed"`
@@ -284,12 +307,12 @@ func verifyCmd(ctx context.Context, args []string, send, testSend sendFn, resolv
 		Logged   []loggedException `json:"logged_exceptions"`
 		Blocked  string            `json:"blocked"`
 	}
-	if len(tresp.Data) > 0 {
-		_ = json.Unmarshal(tresp.Data, &summary)
+	if len(data) > 0 {
+		_ = json.Unmarshal(data, &summary)
 	}
-	if !tresp.Success && summary.Failed == 0 {
+	if !success && summary.Failed == 0 {
 		// Not a test failure: dirty untitled scene, compile gate, missing Test Framework, ...
-		return noReply("tests: %s", tresp.Message)
+		return noReply("tests: %s", message)
 	}
 	r.Tests = &verifyTests{summary.Total, summary.Passed, summary.Failed, summary.Skipped,
 		firstLines(summary.Failures, max), summary.Logged}
@@ -305,7 +328,7 @@ func verifyCmd(ctx context.Context, args []string, send, testSend sendFn, resolv
 			_, _ = fmt.Fprintf(out, "  (%s)\n", n)
 		}
 	}
-	if summary.Failed > 0 || summary.Total == 0 {
+	if alsoFailed || summary.Failed > 0 || summary.Total == 0 {
 		return finish(verifyFailed)
 	}
 	return finish(verifyOK)
