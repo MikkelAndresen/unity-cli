@@ -794,6 +794,8 @@ unity-cli test --allow-stale
 
 Requires the Unity Test Framework package. Tests are blocked by default when any open scene has unsaved changes. Use `--auto-save-scenes` to save them first, or `--allow-dirty-scenes` to run anyway. They are also blocked when a project assembly under test is older than its sources — a stale DLL runs old code and looks exactly like a real result. Rebuild with `unity-cli editor refresh --compile`, or pass `--allow-stale` deliberately. PlayMode tests trigger a domain reload — the CLI polls for results automatically.
 
+EditMode runs are synchronous when no test in the selected assemblies spans frames (`[UnityTest]`, `[UnitySetUp]`, `[UnityTearDown]`, an `IOuterUnityTestAction` attribute). The Test Framework otherwise advances a run one step per editor update, and an editor that is not the focused app updates about 6 times a second: 16 tests took 12.6 s that way and 0.5 s synchronously. A synchronous run leaves frame-spanning tests out, so an assembly that has any keeps the stepped run.
+
 Tests run for minutes, so `test`'s invocation budget defaults to 30 minutes instead of the global 120 s. `--timeout <ms>` overrides it, and `--timeout 0` means no deadline (PlayMode result polling included); a run that exceeds the budget is reported as a client deadline, not as a lost editor.
 
 ### Verify

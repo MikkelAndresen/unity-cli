@@ -94,18 +94,31 @@ namespace UnityCliConnector.TestRunner
             var logged  = new List<RunTests.LoggedException>();
 
             var api = ScriptableObject.CreateInstance<TestRunnerApi>();
-            var callbacks = new TestCallbacks(
+            TestCallbacks callbacks = null;
+            callbacks = new TestCallbacks(
                 onResult: r => CollectResult(r, passed, failed, skipped, logged),
                 onFinished: _ =>
                 {
                     if (tcs.Task.IsCompleted) return;
+                    // Registered callbacks outlive the TestRunnerApi instance: without this, every
+                    // earlier run's callbacks fire again on each later run in the same domain.
+                    api.UnregisterCallbacks(callbacks);
                     Object.DestroyImmediate(api);
                     tcs.TrySetResult(BuildResponse(passed, failed, skipped, logged));
                 }
             );
 
             api.RegisterCallbacks(callbacks);
-            api.Execute(new ExecutionSettings(BuildFilter(mode, filter, assemblies)));
+            // The Test Framework advances a stepped run by one task per editor update, and an editor
+            // that is not the focused app updates ~6 times a second whatever its interaction mode:
+            // 16 tests took 12.6 s stepped, 0.5 s synchronously (bench project, 2026-11-05).
+            // A synchronous run silently leaves out tests that span frames, so those keep the
+            // stepped run.
+            var settings = new ExecutionSettings(BuildFilter(mode, filter, assemblies))
+            {
+                runSynchronously = mode == TestMode.EditMode && !MultiFrameTests.AnyIn(assemblies),
+            };
+            api.Execute(settings);
             return tcs.Task;
         }
 
@@ -122,10 +135,12 @@ namespace UnityCliConnector.TestRunner
             var logged  = new List<RunTests.LoggedException>();
 
             var api = ScriptableObject.CreateInstance<TestRunnerApi>();
-            var callbacks = new TestCallbacks(
+            TestCallbacks callbacks = null;
+            callbacks = new TestCallbacks(
                 onResult: r => CollectResult(r, passed, failed, skipped, logged),
                 onFinished: _ =>
                 {
+                    api.UnregisterCallbacks(callbacks);
                     Object.DestroyImmediate(api);
                     TestRunnerState.ClearPending(port);
                     WriteResultsFile(port, passed, failed, skipped, logged);
