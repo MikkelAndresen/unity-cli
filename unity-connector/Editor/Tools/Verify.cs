@@ -99,6 +99,9 @@ namespace UnityCliConnector.Tools
             public long baseline;
             public bool skip;
             public long started_ms;
+            // Domains this job's steps have started in: each one after the first means a reload
+            // restarted them.
+            public int runs;
         }
 
         private static State Pending()
@@ -156,6 +159,8 @@ namespace UnityCliConnector.Tools
         {
             var state = Pending();
             if (state == null) return Error("", "verify: no job is pending", 2);
+            state.runs++;
+            SessionState.SetString(PendingKey, JsonConvert.SerializeObject(state));
             JObject result;
             // A job resumed after a domain reload runs before the CLI's request for it arrives, so
             // no request is holding the editor awake for it.
@@ -164,6 +169,7 @@ namespace UnityCliConnector.Tools
                 try { result = await Steps(state); }
                 catch (Exception e) { result = Error(state.job, "verify failed: " + e.Message, 2); }
             }
+            VerifyLog.Append(state.job, state.started_ms, state.runs, state.refresh, result);
             return Finish(result);
         }
 
@@ -196,11 +202,16 @@ namespace UnityCliConnector.Tools
                 while (true)
                 {
                     var idle = !EditorApplication.isCompiling && !EditorApplication.isUpdating;
-                    if (idle && CompilationGate.LastCompileFinishedAt > state.baseline) break;
+                    if (idle && CompilationGate.LastCompileFinishedAt > state.baseline)
+                    {
+                        timings["compile_wait_end"] = "clock";
+                        break;
+                    }
                     var elapsed = NowMs() - state.started_ms;
                     if (idle && elapsed > CompileIdleGraceMs)
                     {
                         compile["nothing_to_compile"] = true;
+                        timings["compile_wait_end"] = "grace";
                         break;
                     }
                     if (elapsed > CompileTimeoutMs)
