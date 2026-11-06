@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"strings"
 )
 
 // compileProvenance mirrors the connector's provenance payload (unity-connector
@@ -53,6 +52,11 @@ type staleAssembly struct {
 	Missing             bool   `json:"missing,omitempty"`
 }
 
+// provenanceNotScanned is the connector's scan_note when compile_status answered without walking
+// the source tree (it does that while the editor is compiling). stale_count is then 0 because
+// nothing was looked at, not because nothing is stale.
+const provenanceNotScanned = "source tree not scanned"
+
 // provenanceIn reads the provenance object a compile_diagnostics reply nests under "provenance".
 // It returns it parsed (for the lines the CLI prints) and verbatim (for the JSON reports, which then
 // pass through fields this CLI version does not model and keep the values the connector chose).
@@ -85,9 +89,6 @@ func fetchProvenance(send sendFn) (*compileProvenance, json.RawMessage) {
 	if err != nil || resp == nil || !resp.Success || len(resp.Data) == 0 {
 		return nil, nil
 	}
-	if strings.Contains(resp.Message, "Unknown command") {
-		return nil, nil
-	}
 	var p compileProvenance
 	if err := json.Unmarshal(resp.Data, &p); err != nil {
 		return nil, resp.Data
@@ -101,6 +102,7 @@ func fetchProvenance(send sendFn) (*compileProvenance, json.RawMessage) {
 type compileFindings struct {
 	Diags          []verifyDiag
 	Total          int
+	TotalAtLeast   bool   // Total is a lower bound: the console scan stopped once it had enough entries
 	Source         string // "console" when the connector predates compile_diagnostics
 	Provenance     *compileProvenance
 	ProvenanceJSON json.RawMessage
@@ -109,8 +111,9 @@ type compileFindings struct {
 // printProvenance writes the one line that tells the reader which edit this result reflects, plus the
 // stale-source and covered-DLL lines when there are any. (The stale *assembly* line is left to the
 // caller that acts on it: verify prints it as part of its refusal, test refuses through the
-// connector.)
-func printProvenance(out io.Writer, p *compileProvenance) {
+// connector.) verify passes covered=false: a covered DLL changes nothing it does, and its readers
+// are agents paying for every line; --json still carries it.
+func printProvenance(out io.Writer, p *compileProvenance, covered bool) {
 	if p == nil {
 		return
 	}
@@ -120,7 +123,7 @@ func printProvenance(out io.Writer, p *compileProvenance) {
 	if p.StaleLine != "" {
 		_, _ = fmt.Fprintln(out, p.StaleLine)
 	}
-	if p.StaleAssemblyCoveredLine != "" {
+	if covered && p.StaleAssemblyCoveredLine != "" {
 		_, _ = fmt.Fprintln(out, p.StaleAssemblyCoveredLine)
 	}
 	if p.ScanNote != "" {

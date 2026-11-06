@@ -105,6 +105,16 @@ namespace UnityCliConnector.Tests
         }
 
         [Test]
+        public void AssemblyFilter_IsAppliedBeforeTheTypeLimit()
+        {
+            ApiIndex.EnsureIndexed(int.MaxValue);
+            var data = Run("Vector3", ("assembly", "System.Numerics"), ("max_types", 1));
+            var types = (JArray)data["types"];
+            Assert.IsNotEmpty(types, "--max_types must not truncate away the only assembly the filter allows");
+            Assert.AreEqual("System.Numerics.Vector3", types[0]["type"].Value<string>());
+        }
+
+        [Test]
         public void Docs_AreOffByDefaultAndComeFromTheXmlFileWhenAsked()
         {
             var withoutDocs = (JObject)((JArray)Run("UnityEngine.Vector3")["types"])[0];
@@ -125,7 +135,50 @@ namespace UnityCliConnector.Tests
             var data = Run("NoSuchTypeAnywhereInTheDomain");
             Assert.AreEqual(0, data["matches"].Value<int>());
             Assert.AreEqual("closest_types", data["matched_by"].Value<string>());
-            Assert.IsEmpty((JArray)data["types"]);
+            Assert.IsEmpty((JArray)data["types"], "a nonexistent type must not answer with unrelated types");
+            Assert.IsFalse(data["exact"].Value<bool>(),
+                "exact:false is what tells the CLI this lookup found nothing (and it exits non-zero)");
+        }
+
+        [Test]
+        public void UnknownMember_IsMarkedFuzzyAndNamesTheClosestOnes()
+        {
+            // `api Vector3.Lerpp` used to list Lerp/Slerp as if they were the match, with no marker.
+            var data = Run("Vector3.Lerpp", ("limit", 5));
+
+            Assert.IsFalse(data["exact"].Value<bool>());
+            StringAssert.Contains("no member named 'Lerpp'", data["note"].Value<string>());
+            StringAssert.Contains("Lerp", data["note"].Value<string>());
+            StringAssert.Contains("no member named 'Lerpp'", data["summary"].Value<string>());
+        }
+
+        [Test]
+        public void ExactLookups_SayTheyAreExact()
+        {
+            Assert.IsTrue(Run("Vector3")["exact"].Value<bool>());
+            Assert.IsTrue(Run("Vector3.Lerp")["exact"].Value<bool>());
+            Assert.IsNull(Run("Vector3.Lerp")["note"].Value<string>(), "an exact answer needs no caveat");
+        }
+
+        [Test]
+        public void MemberQuery_OnAnAmbiguousTypeName_AnswersFromTheTypesThatHaveIt()
+        {
+            // With Odin installed, `api Vector3.Lerp` matched three Vector3s; the shim without Lerp
+            // turned the whole answer into "no member named 'Lerp'".
+            var data = Run("ApiAmbiguityProbe.OnlyOnA", ("limit", 5));
+
+            Assert.IsTrue(data["exact"].Value<bool>(), data["summary"].Value<string>());
+            var types = ((JArray)data["types"]).Select((JToken t) => t["type"].Value<string>()).ToList();
+            CollectionAssert.AreEqual(new[] { "UnityCliConnector.Tests.ProbeA.ApiAmbiguityProbe" }, types);
+        }
+
+        [Test]
+        public void MemberQuery_OnAnAmbiguousTypeName_StaysFuzzyWhenNoTypeHasIt()
+        {
+            var data = Run("ApiAmbiguityProbe.OnNeither", ("limit", 5));
+
+            Assert.IsFalse(data["exact"].Value<bool>());
+            StringAssert.Contains("no member named 'OnNeither'", data["note"].Value<string>());
         }
 
         [Test]
@@ -135,5 +188,22 @@ namespace UnityCliConnector.Tests
             Assert.IsFalse(response.success);
             StringAssert.Contains("needs a type", response.message);
         }
+    }
+}
+
+namespace UnityCliConnector.Tests.ProbeA
+{
+    // Looked up by name in ApiLookupTests: two types sharing a short name, one declaring the member.
+    public class ApiAmbiguityProbe
+    {
+        public static int OnlyOnA() => 1;
+    }
+}
+
+namespace UnityCliConnector.Tests.ProbeB
+{
+    public class ApiAmbiguityProbe
+    {
+        public static int Other() => 2;
     }
 }

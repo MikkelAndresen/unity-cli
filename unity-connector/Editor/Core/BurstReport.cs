@@ -82,10 +82,6 @@ namespace UnityCliConnector.Tools
             @"^(?<file>[^()]+)\((?<line>\d+),(?<col>\d+)\):\s*Burst\s+error\s+(?<code>BC\d+):\s*(?<msg>.*)$",
             RegexOptions.Compiled);
 
-        // The Burst Inspector's own "did this compile fail" test on a disassembly reply.
-        private static readonly Regex DisassemblyPattern = new Regex(
-            @"\(\d+,\d+\):\s*Burst\s+error", RegexOptions.Compiled);
-
         // Names Burst quotes in its messages: "the struct `MyGame.HeavyJob`".
         private static readonly Regex QuotedNamePattern = new Regex(
             @"`(?<name>[A-Za-z_][\w.+]*)`", RegexOptions.Compiled);
@@ -99,11 +95,6 @@ namespace UnityCliConnector.Tools
         // Burst errors inside a job's generated producer cite the engine's own job struct; that path
         // is not the user's code, so a frame outside it is preferred.
         private const string EnginePathMarker = "build/output/unity";
-
-        public static bool IsBurstErrorText(string text)
-        {
-            return text != null && DisassemblyPattern.IsMatch(text);
-        }
 
         /// Reads a Burst error out of a full console message (head plus stack trace). A BCxxxx code
         /// without a parseable header still counts as Burst; its position then comes from the first
@@ -361,6 +352,15 @@ namespace UnityCliConnector.Tools
             return hay.IndexOf(needle, StringComparison.OrdinalIgnoreCase);
         }
 
+        /// Whether a target's resolved assembly is one of the project's own. Having an assembly name
+        /// is not enough: on Burst 1.8 every target carries the assembly of its job type, including
+        /// package and engine jobs.
+        public static bool IsProjectTarget(BurstTargetInfo target, IReadOnlyCollection<string> projectAssemblies)
+        {
+            if (target == null || string.IsNullOrEmpty(target.Assembly) || projectAssemblies == null) return false;
+            return projectAssemblies.Any(name => string.Equals(name?.Trim(), target.Assembly, StringComparison.OrdinalIgnoreCase));
+        }
+
         public static string NamespaceOf(string declaringType)
         {
             if (string.IsNullOrEmpty(declaringType)) return "";
@@ -398,20 +398,24 @@ namespace UnityCliConnector.Tools
                 }
         }
 
-        /// Whether a source file belongs to a package rather than to the project's own code.
-        /// packageRoots are the absolute resolved paths of registered packages, which is the only
-        /// way to catch file: packages that live outside Packages/ (e.g. LocalPackages/...).
-        public static bool IsPackageSourcePath(string sourceFile, IReadOnlyCollection<string> packageRoots)
+        /// Whether a source file belongs to a package the project does not develop: a registry, git,
+        /// built-in or tarball package. Assets/, embedded packages (Packages/<name>) and file:
+        /// packages are the project's own code. The compile pipeline reports package sources as
+        /// virtual "Packages/<name>/..." paths, so the package is told by name; fixedRoots catch
+        /// absolute paths. An unknown source counts as fixed: it is not shown as the project's code.
+        public static bool IsFixedPackageSource(string sourceFile, IReadOnlyCollection<string> fixedNames,
+            IReadOnlyCollection<string> fixedRoots)
         {
             if (string.IsNullOrEmpty(sourceFile)) return true;
             var path = sourceFile.Replace('\\', '/');
-            if (path.StartsWith("Packages/", StringComparison.OrdinalIgnoreCase)) return true;
-            // Embedded packages live in <project>/Packages/<name>, and resolved registry packages under
-            // Library/PackageCache; both show up as absolute paths here.
-            if (path.Contains("/Packages/", StringComparison.OrdinalIgnoreCase)) return true;
             if (path.Contains("PackageCache/", StringComparison.OrdinalIgnoreCase)) return true;
-            if (packageRoots == null) return false;
-            foreach (var root in packageRoots)
+
+            var name = PackageNameOf(path);
+            if (name != null)
+                return fixedNames != null && fixedNames.Contains(name);
+
+            if (fixedRoots == null) return false;
+            foreach (var root in fixedRoots)
             {
                 if (string.IsNullOrEmpty(root)) continue;
                 var normalized = root.Replace('\\', '/');
@@ -419,6 +423,21 @@ namespace UnityCliConnector.Tools
                 if (path.StartsWith(normalized, StringComparison.OrdinalIgnoreCase)) return true;
             }
             return false;
+        }
+
+        /// "com.x" from "Packages/com.x/A.cs" or "/proj/Packages/com.x/A.cs"; null otherwise.
+        static string PackageNameOf(string path)
+        {
+            int start;
+            if (path.StartsWith("Packages/", StringComparison.OrdinalIgnoreCase)) start = "Packages/".Length;
+            else
+            {
+                var at = path.IndexOf("/Packages/", StringComparison.OrdinalIgnoreCase);
+                if (at < 0) return null;
+                start = at + "/Packages/".Length;
+            }
+            var end = path.IndexOf('/', start);
+            return end > start ? path.Substring(start, end - start) : null;
         }
     }
 }

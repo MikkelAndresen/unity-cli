@@ -299,3 +299,41 @@ func TestDroppedConnection(t *testing.T) {
 		}
 	}
 }
+
+// TestPrevLogDetail_HandledExceptionIsNotACrash: a normal session that logged (and caught) an
+// exception is not evidence that the editor that wrote the log died.
+func TestPrevLogDetail_HandledExceptionIsNotACrash(t *testing.T) {
+	project := t.TempDir()
+	path := writeCrashFile(t, project, "Editor-prev.log", time.Second,
+		"NullReferenceException: Object reference not set to an instance of an object\n"+
+			"  at Foo.Bar () — caught by the asset importer, continuing\n"+
+			"Exception handled; import finished.\n")
+
+	if detail := prevLogDetail(path); detail != "" {
+		t.Errorf("a caught exception must not count as crash wording, got %q", detail)
+	}
+}
+
+// TestExplainDroppedConnection_AncientBeatSkipsTheDumpGrace: no dump is still being written for an
+// editor that went silent minutes ago, so the extra reading only delays the answer.
+func TestExplainDroppedConnection_AncientBeatSkipsTheDumpGrace(t *testing.T) {
+	stubProcessTable(t, containerTable())
+	origGrace := crashArtifactGrace
+	crashArtifactGrace = 2 * time.Second
+	t.Cleanup(func() { crashArtifactGrace = origGrace })
+
+	project := t.TempDir()
+	writeInstanceFiles(t, map[string]Instance{
+		"one.json": {State: "ready", ProjectPath: project, Port: 8090, PID: 65279, Timestamp: time.Now().Add(-time.Hour).UnixMilli()},
+	})
+	inst := NewestHeartbeat(project, 0)
+
+	start := time.Now()
+	err := explainDroppedConnection(inst, time.Now().Add(-time.Minute), io.EOF)
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Errorf("an ancient heartbeat must not pay the crash-dump grace, took %v", elapsed)
+	}
+	if !strings.Contains(err.Error(), "cannot connect to Unity at port 8090") {
+		t.Errorf("expected the original transport answer, got:\n%s", err)
+	}
+}

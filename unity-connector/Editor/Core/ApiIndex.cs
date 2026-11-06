@@ -57,6 +57,10 @@ namespace UnityCliConnector
         public static IReadOnlyList<Type> Types => s_Types;
         public static int IndexedAssemblyCount => s_TypesOf.Count;
 
+        /// <summary>True once every eligible assembly is indexed, so a lookup that found nothing
+        /// knows the answer is absent rather than merely not indexed yet.</summary>
+        public static bool Complete => s_Complete;
+
         /// <summary>Indexed assemblies in lookup priority order (Unity's core modules first, then
         /// project and package code), so a budgeted scan sees the likely answers first.</summary>
         public static IReadOnlyList<Assembly> IndexedAssemblies() =>
@@ -72,10 +76,15 @@ namespace UnityCliConnector
         /// so call <see cref="EnsureIndexed"/> with a budget that fits the caller.</summary>
         public static IReadOnlyList<Type> FindTypes(string query, int limit) => FindTypes(query, limit, int.MaxValue);
 
+        public static IReadOnlyList<Type> FindTypes(string query, int limit, int maxRank) =>
+            FindTypes(query, limit, maxRank, null);
+
         /// <summary>The same, but refusing matches looser than <paramref name="maxRank"/>
         /// (<see cref="ApiReflection.QueryForm.Rank"/>): 0 when the caller means "a type the query
-        /// names exactly", larger when it wants typos suggested too.</summary>
-        public static IReadOnlyList<Type> FindTypes(string query, int limit, int maxRank)
+        /// names exactly", larger when it wants typos suggested too. <paramref name="accept"/> is
+        /// applied before the limit, so a caller that wants one assembly cannot have it truncated
+        /// out by better-ranked matches from others.</summary>
+        public static IReadOnlyList<Type> FindTypes(string query, int limit, int maxRank, Func<Type, bool> accept)
         {
             var form = new ApiReflection.QueryForm(query);
             if (form.IsEmpty || limit <= 0) return Array.Empty<Type>();
@@ -85,6 +94,7 @@ namespace UnityCliConnector
             {
                 var rank = form.Rank(type);
                 if (rank < 0 || rank > maxRank) continue;
+                if (accept != null && !accept(type)) continue;
                 matches.Add((rank, RankOf(type.Assembly), IsPublicType(type) ? 0 : 1, type));
                 if (matches.Count >= 200) break;
             }
@@ -120,7 +130,8 @@ namespace UnityCliConnector
                 members.AddRange(type.GetProperties(flags));
                 members.AddRange(type.GetFields(flags));
                 members.AddRange(type.GetEvents(flags));
-                members.RemoveAll(m => m is MethodInfo mi && (mi.IsSpecialName || mi.IsPrivate));
+                members.RemoveAll(m => m is MethodInfo mi &&
+                    ((mi.IsSpecialName && !mi.Name.StartsWith("op_", StringComparison.Ordinal)) || mi.IsPrivate));
                 return members;
             }
             catch (Exception e) when (e is TypeLoadException || e is NotSupportedException || e is ArgumentException)
@@ -161,7 +172,8 @@ namespace UnityCliConnector
                 {
                     foreach (var member in type.GetMember(name, flags))
                     {
-                        if (member is MethodInfo mi && mi.IsSpecialName) continue;
+                        if (member is MethodInfo mi && mi.IsSpecialName &&
+                            !mi.Name.StartsWith("op_", StringComparison.Ordinal)) continue;
                         found.Add(member);
                     }
                 }
@@ -177,7 +189,10 @@ namespace UnityCliConnector
         /// <summary>Types declaring a public member of this exact name, in lookup priority order.
         /// Bounded by <paramref name="budget"/>: a whole domain is ~47 000 types, and one type
         /// whose name lookup fails must not cost the caller the answer.</summary>
-        public static List<Type> TypesWithMember(string memberName, int limit, Deadline budget)
+        public static List<Type> TypesWithMember(string memberName, int limit, Deadline budget) =>
+            TypesWithMember(memberName, limit, budget, null);
+
+        public static List<Type> TypesWithMember(string memberName, int limit, Deadline budget, Func<Type, bool> accept)
         {
             var types = new List<Type>();
             if (string.IsNullOrEmpty(memberName) || limit <= 0) return types;
@@ -188,7 +203,7 @@ namespace UnityCliConnector
                 foreach (var member in FindMembersByName(assembly, memberName))
                 {
                     var declaring = member.DeclaringType;
-                    if (declaring == null || !seen.Add(declaring)) continue;
+                    if (declaring == null || (accept != null && !accept(declaring)) || !seen.Add(declaring)) continue;
                     types.Add(declaring);
                     if (types.Count >= limit) break;
                 }

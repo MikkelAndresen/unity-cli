@@ -196,3 +196,22 @@ warning deduplication, and `--ignore-version-mismatch` suppression.
 - `minConnectorVersion` is a protocol claim, not an observed handshake. It is
   set to 0.7.0 per the oldest protocol the current commands are built around;
   moving it down requires checking every newer heartbeat field and tool.
+
+## Review follow-up
+
+- `api` and `burst_status` joined the diagnostic exemptions, so the read-only tools that explain
+  what the loaded assemblies/Burst are doing still answer under version drift.
+- A connector below the minimum is still refused for `verify`, but that refusal now exits 1 with its
+  message (a failure), not 2 (the editor could not answer). The same mapping applies if the refusal
+  arrives mid-run from a send.
+- `README.ko.md` was not updated in this stack; Korean docs are deferred.
+
+## Review follow-up (round 2)
+
+- `versionExemptCommands` no longer lists commands that never reach the gate (`status`, `dialogs`,
+  `help`, `version`, `update`). `tool_describe` stays: it is a connector tool that the CLI's default
+  dispatch sends like a command, and it is part of the same diagnosis. The
+  `connectorCompatibility.Compatible` field is gone: "compatible" is exactly "no refusal", so the
+  two can no longer drift apart.
+- The exemption test now exercises every entry's behaviour (it must answer a refused connector)
+  instead of restating the map, and a separate test pins the state-changing commands as gated.

@@ -18,41 +18,171 @@ namespace UnityCliConnector
 
 		// Wall-clock ms of the last observed script-compilation start/finish. Statics reset on
 		// domain reload, so afterAssemblyReload re-stamps the finish; a failed compile never
-		// reloads, which is why compilationFinished has to cover that case.
-		private static long s_CompileStartedAt;
-		private static long s_CompileFinishedAt;
-		// A reload proves the compile succeeded, so console entries older than its finish are stale.
-		// compilationFinished can also announce a failed compile; if this domain missed the start,
-		// its console errors are younger than the finish and must not be discarded.
-		private static bool s_CompileFinishedViaReload;
+		// reloads, which is why compilationFinished has to cover that case. SessionState carries
+		// the pair across a reload too: the new domain only sees the finish, and the console
+		// diagnostics of the compile that caused the reload have to be judged against its start.
+		//
+		// Console ordinals (LogEntry.globalLineIndex) are the freshness order the gate uses: they
+		// grow while the console keeps its entries, and LogEntries.Clear restarts them at 0. A read
+		// taken inside compilationStarted does not agree with the ordinals that same compile gives
+		// its own diagnostics, so the boundary is snapshotted while the editor is idle — on every
+		// gate read and after every compile that rebuilt an assembly — and compilationStarted only
+		// adopts the last snapshot. A compile that rebuilds nothing must not advance it: the console
+		// then still holds the previous compile's diagnostics, which remain current, and the CLI can
+		// trigger exactly such a no-op compile right after a real one.
+		const string SessionKey = "unity-cli/console-freshness";
+		static Freshness s_State = new();
 
-		public static long LastCompileFinishedAt => s_CompileFinishedAt;
+		internal sealed class Freshness
+		{
+			public bool snapshot_known;
+			public int snapshot_first = -1;
+			public int snapshot_max = -1;
+			public bool boundary_known;
+			public int boundary_first = -1;
+			public int boundary_max = -1;
+			public long started_at_ms;
+			public long finished_at_ms;
+			// A reload proves the compile succeeded, so console entries older than its finish are
+			// stale. compilationFinished can also announce a failed compile; if this domain missed
+			// the start, its console errors are younger than the finish and must not be discarded.
+			public bool finished_via_reload;
+			public bool rebuilt;
+		}
+
+		public static long LastCompileFinishedAt => s_State.finished_at_ms;
+
+		/// When the last compile the gate observed started. Heartbeat keeps a requested "compiling"
+		/// state until this moves, so a compile queued behind an import is not reported as nothing.
+		public static long LastCompileStartedAt => s_State.started_at_ms;
+
+		/// "ordinal" while a console ordinal boundary pins the last compile; "timestamp" when the
+		/// gate has to fall back to console time-of-day, which cannot separate entries a day apart.
+		public static string ConsoleFreshnessMode => s_State.boundary_known ? "ordinal" : "timestamp";
 
 		static CompilationGate()
 		{
+			Load();
+
 			// CompileProvenance rides the same events: it needs the compile's start, the assemblies
 			// that were rebuilt, and the finish, and two subscriptions could drift apart.
 			CompilationPipeline.compilationStarted += _ =>
 			{
-				s_CompileStartedAt = NowMs();
-				s_CompileFinishedViaReload = false;
-				ByAssembly.Clear();
+				NoteCompileStarted();
 				CompileProvenance.NoteCompileStarted();
 			};
 			CompilationPipeline.assemblyCompilationFinished += (path, messages) =>
 			{
+				s_State.rebuilt = true;
 				ByAssembly[path] = messages;
+				// Persisted here as well as on the finish: a reload must not be able to lose the
+				// fact that this compile rebuilt something.
+				Save();
 				CompileProvenance.NoteAssemblyCompiled(path);
+				if (!HasErrors(messages))
+					AssemblyStaleness.NoteAssemblyCompiled(path);
 			};
 			CompilationPipeline.compilationFinished += _ => NoteCompileFinished(false);
 			AssemblyReloadEvents.afterAssemblyReload += () => NoteCompileFinished(true);
 		}
 
-		private static void NoteCompileFinished(bool afterReload)
+		private static bool HasErrors(CompilerMessage[] messages)
 		{
-			s_CompileFinishedAt = NowMs();
-			s_CompileFinishedViaReload = afterReload;
-			CompileProvenance.NoteCompileFinished(afterReload);
+			if (messages == null) return false;
+			foreach (var message in messages)
+				if (message.type == CompilerMessageType.Error)
+					return true;
+			return false;
+		}
+
+		private static void NoteCompileStarted(bool live = true)
+		{
+			s_State.started_at_ms = NowMs();
+			s_State.finished_via_reload = false;
+			s_State.rebuilt = false;
+			s_State.boundary_known = s_State.snapshot_known;
+			s_State.boundary_first = s_State.snapshot_first;
+			s_State.boundary_max = s_State.snapshot_max;
+			ByAssembly.Clear();
+			Save(live);
+		}
+
+		private static void NoteCompileFinished(bool afterReload, bool live = true)
+		{
+			s_State.finished_at_ms = NowMs();
+			s_State.finished_via_reload = afterReload;
+			if (s_State.rebuilt && TryReadFreshnessRange(out var first, out var last))
+			{
+				s_State.snapshot_known = true;
+				s_State.snapshot_first = first;
+				s_State.snapshot_max = last;
+			}
+			Save(live);
+			// Only a successful compile reloads the domain. A failed one ends here and never
+			// reaches afterAssemblyReload, so it must not leave a reload pending for the next one.
+			CompileProvenance.NoteCompileFinished(afterReload,
+				willReload: !afterReload && s_State.rebuilt && !AnyErrors());
+		}
+
+		private static bool AnyErrors()
+		{
+			foreach (var messages in ByAssembly.Values)
+				if (HasErrors(messages))
+					return true;
+			return false;
+		}
+
+		private static void ObserveConsoleRange(int first, int last)
+		{
+			if (s_State.snapshot_known && s_State.snapshot_first == first && s_State.snapshot_max == last)
+				return;
+			s_State.snapshot_known = true;
+			s_State.snapshot_first = first;
+			s_State.snapshot_max = last;
+			Save();
+		}
+
+		private static void Load()
+		{
+			var json = SessionState.GetString(SessionKey, null);
+			if (string.IsNullOrEmpty(json)) return;
+			try
+			{
+				s_State = Newtonsoft.Json.JsonConvert.DeserializeObject<Freshness>(json) ?? new Freshness();
+			}
+			catch (Newtonsoft.Json.JsonException)
+			{
+				s_State = new Freshness();
+			}
+		}
+
+		/// <param name="live">true for a real compile event: it goes to the live key even while a test
+		/// holds the gate, because a compile that lands mid-test is what the editor really did and the
+		/// restore afterwards must not roll the clock back over it. Test-driven mutations pass false.</param>
+		private static void Save(bool live = true)
+		{
+			var key = s_TestMode && !live ? TestSessionKey : SessionKey;
+			SessionState.SetString(key, Newtonsoft.Json.JsonConvert.SerializeObject(s_State));
+		}
+
+		/// True when the editor holds compile diagnostics the gate would block on. refresh_unity uses it
+		/// to refuse to skip a compile it cannot prove unneeded.
+		public static bool HasOutstandingErrors() => CollectErrors().Count > 0;
+
+		/// Publishes a compile that rebuilt nothing because every assembly was already current (see
+		/// RefreshUnity). The clocks have to move: the CLI waits for the compile clock to advance as its
+		/// proof that a requested compile finished, and "nothing was out of date" is that proof.
+		/// CompilationGate deliberately does not take the compile-start path here — that would clear the
+		/// diagnostics cache and adopt a new console boundary for a compile that never read the console.
+		public static void NoteNothingToCompile()
+		{
+			var now = NowMs();
+			s_State.started_at_ms = now;
+			s_State.finished_at_ms = now;
+			s_State.finished_via_reload = false;
+			s_State.rebuilt = false;
+			Save();
+			CompileProvenance.NoteNothingToCompile(now);
 		}
 
 		/// Returns an ErrorResponse with compile diagnostics if the editor is mid-compile or has
@@ -87,17 +217,17 @@ namespace UnityCliConnector
 				{
 					compile_errors = errors,
 					total = errors.Count,
-					compile_started_at_ms = s_CompileStartedAt,
-					compiled_at_ms = s_CompileFinishedAt,
+					compile_started_at_ms = s_State.started_at_ms,
+					compiled_at_ms = s_State.finished_at_ms,
+					console_freshness = ConsoleFreshnessPayload(),
 					provenance_line = CompileProvenance.DescribeLastCompile(),
 					console_fallback_available = ConsoleLogEntries.IsAvailable,
 					console_fallback_error = ConsoleLogEntries.InitError
 				});
 		}
 
-		/// Names the first few errors and says how old the compile is, so the caller can act
-		/// without a second call. The escape hatch is part of the message because that is where
-		/// an agent first meets the gate.
+		/// The escape hatch is part of the message because that is where an agent first meets the
+		/// gate, before it has read any help.
 		private static string GateMessage(List<GateDiagnostic> errors)
 		{
 			var sb = new System.Text.StringBuilder();
@@ -118,6 +248,19 @@ namespace UnityCliConnector
 
 			sb.Append(" Fix them, or pass --skip_compile_check / skip_compile_check=true to run anyway.");
 			return sb.ToString();
+		}
+
+		/// Reports which rule filtered the console, so a caller that sees an empty or surprising set
+		/// of console diagnostics knows whether it was the ordinal pin or the timestamp fallback.
+		private static object ConsoleFreshnessPayload()
+		{
+			if (s_State.boundary_known)
+				return new { mode = ConsoleFreshnessMode, baseline_index = s_State.boundary_max };
+			return new
+			{
+				mode = ConsoleFreshnessMode,
+				note = "no compile-start console ordinal recorded; console entries were filtered by their timestamp instead"
+			};
 		}
 
 		/// Live, correctly-invalidated compile diagnostics — the same set the gate
@@ -252,25 +395,48 @@ namespace UnityCliConnector
 				return result;
 
 			var now = NowMs();
+			var range = ConsoleRange();
 			foreach (var d in consoleDiags)
 			{
-				if (!IsCurrentConsoleDiagnostic(d, now, s_CompileStartedAt, s_CompileFinishedAt,
-						s_CompileFinishedViaReload, DiagnosticFileExists))
+				if (!IsCurrentConsoleDiagnostic(d, now, s_State, range, DiagnosticFileExists))
 					continue;
 				result.Add(d);
 			}
 			return result;
 		}
 
-		/// A console entry is current only when it belongs to the compile this gate is judging.
-		/// The console survives successful recompiles, so an old ScriptCompileError (or a sticky
-		/// build/runtime failure) must not keep blocking after the live pipeline is clean.
+		// The console survives successful recompiles, so an old ScriptCompileError (or a sticky
+		// build/runtime failure) must not keep blocking after the live pipeline is clean.
 		internal static bool IsCurrentConsoleDiagnostic(ConsoleLogEntries.CompileDiag d, long nowMs,
-			long compileStartedMs, long compileFinishedMs, bool finishedViaReload, Func<string, bool> fileExists)
+			Freshness state, ConsoleIndexRange range, Func<string, bool> fileExists)
 		{
-			if (d.Sticky) return false;
+			// A sticky build/runtime failure is not a compiler diagnostic, but the sticky "compiler
+			// errors" banner is — and it can be the only console evidence of a failed compile.
+			if (d.Sticky && !d.StickyCompileFailure) return false;
 			if (fileExists != null && !fileExists(d.File)) return false;
 
+			if (state.boundary_known)
+			{
+				if (range.Known && ConsoleRestartedSince(state, range)) return true;
+				if (d.HasConsoleIndex) return d.ConsoleIndex > state.boundary_max;
+			}
+
+			// No ordinal boundary (no idle snapshot preceded this compile, or this Unity version
+			// does not expose globalLineIndex): fall back to the console timestamp.
+			return IsCurrentByTimestamp(d, nowMs, state.started_at_ms, state.finished_at_ms,
+				state.finished_via_reload);
+		}
+
+		/// Unity's console Clear restarts globalLineIndex at 0, so an ordinal below what the boundary
+		/// saw — the oldest entry's, or the newest one's when the console now holds fewer entries than
+		/// it did — means the buffer was cleared after the compile started. Everything left in it was
+		/// therefore logged after the compile started, whatever its restarted ordinal says.
+		private static bool ConsoleRestartedSince(Freshness state, ConsoleIndexRange range)
+			=> range.FirstIndex < state.boundary_first || range.MaxIndex < state.boundary_max;
+
+		private static bool IsCurrentByTimestamp(ConsoleLogEntries.CompileDiag d, long nowMs,
+			long compileStartedMs, long compileFinishedMs, bool finishedViaReload)
+		{
 			// Prefer the start: errors are logged during the compile, so a start-clock threshold
 			// keeps this compile's diagnostics and drops everything older. A domain that joined
 			// after a successful compile only has the reload's finish clock.
@@ -299,7 +465,7 @@ namespace UnityCliConnector
 			return seconds < 0 ? seconds + 86400 : seconds;
 		}
 
-		private static bool DiagnosticFileExists(string file)
+		internal static bool DiagnosticFileExists(string file)
 		{
 			if (FileExistsForTests != null) return FileExistsForTests(file);
 			if (string.IsNullOrEmpty(file)) return true;
@@ -307,11 +473,14 @@ namespace UnityCliConnector
 			var path = file.Replace('\\', '/');
 			if (path.StartsWith("./", StringComparison.Ordinal)) path = path.Substring(2);
 			// Compiler/Burst diagnostics can name generated or virtual sources with no file on disk.
-			if (path.IndexOf("unknown", StringComparison.OrdinalIgnoreCase) >= 0) return true;
+			if (IsVirtualSourceName(path)) return true;
 
 			if (Path.IsPathRooted(path)) return File.Exists(path);
+			// `Packages/<name>/...` is a logical asset path, not a path under the project's Packages
+			// directory: registry packages live in Library/PackageCache/<name>@<hash> and `file:`
+			// packages wherever the manifest points.
+			if (path.StartsWith("Packages/", StringComparison.Ordinal)) return PackagePathExists(path);
 			if (!path.StartsWith("Assets/", StringComparison.Ordinal) &&
-			    !path.StartsWith("Packages/", StringComparison.Ordinal) &&
 			    !path.StartsWith("Library/", StringComparison.Ordinal))
 				return true;
 
@@ -319,10 +488,82 @@ namespace UnityCliConnector
 			return string.IsNullOrEmpty(projectRoot) || File.Exists(Path.Combine(projectRoot, path));
 		}
 
+		private static bool PackagePathExists(string assetPath)
+		{
+			var package = UnityEditor.PackageManager.PackageInfo.FindForAssetPath(assetPath);
+			if (package == null) return false;
+
+			var relative = assetPath.Length > package.assetPath.Length
+				? assetPath.Substring(package.assetPath.Length).TrimStart('/')
+				: "";
+			return relative.Length == 0 || File.Exists(Path.Combine(package.resolvedPath, relative));
+		}
+
+		// The file name is the only part that decides this: a real directory called e.g. `unknown`
+		// must keep its existence check, while a synthesized source ("unknown", "<unknown>") is not
+		// a file that can be missing.
+		private static bool IsVirtualSourceName(string path)
+		{
+			var name = Path.GetFileName(path).Trim();
+			if (name.Length == 0) return false;
+			if (name.Length > 1 && name[0] == '<' && name[name.Length - 1] == '>') return true;
+			return string.Equals(name, "unknown", StringComparison.OrdinalIgnoreCase);
+		}
+
 		private static string DedupKey(string file, int line, int col)
 		{
 			var norm = string.IsNullOrEmpty(file) ? "" : file.Replace('\\', '/');
 			return norm + ":" + line + ":" + col;
+		}
+
+		// A console read must never break a compile event or a tool response: reflection into
+		// LogEntries throws TargetInvocationException when the console is mid-update.
+		private static bool TryReadConsoleRange(out int first, out int last)
+		{
+			try
+			{
+				return ConsoleLogEntries.TryGetConsoleIndexRange(out first, out last);
+			}
+			catch (System.Reflection.TargetInvocationException)
+			{
+				first = -1;
+				last = -1;
+				return false;
+			}
+		}
+
+		private static ConsoleIndexRange ConsoleRange()
+		{
+			if (!TryReadFreshnessRange(out var first, out var last)) return ConsoleIndexRange.Unknown;
+			if (!EditorApplication.isCompiling) ObserveConsoleRange(first, last);
+			return new ConsoleIndexRange(true, first, last);
+		}
+
+		private static bool TryReadFreshnessRange(out int first, out int last)
+		{
+			if (ConsoleRangeForTests != null)
+			{
+				first = ConsoleRangeForTests.Value.FirstIndex;
+				last = ConsoleRangeForTests.Value.MaxIndex;
+				return ConsoleRangeForTests.Value.Known;
+			}
+			return TryReadConsoleRange(out first, out last);
+		}
+
+		internal readonly struct ConsoleIndexRange
+		{
+			public static readonly ConsoleIndexRange Unknown = default;
+
+			public readonly bool Known;
+			public readonly int FirstIndex;
+			public readonly int MaxIndex;
+
+			public ConsoleIndexRange(bool known, int firstIndex, int maxIndex)
+			{
+				Known = known;
+				FirstIndex = firstIndex;
+				MaxIndex = maxIndex;
+			}
 		}
 
 		private static long NowMs() => DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
@@ -343,26 +584,67 @@ namespace UnityCliConnector
 
 		internal static Func<string, bool> FileExistsForTests;
 
+		internal static ConsoleIndexRange? ConsoleRangeForTests;
+
+		internal static void SeedConsoleBoundaryForTests(int maxIndex, int firstIndex)
+		{
+			s_State.boundary_known = true;
+			s_State.boundary_max = maxIndex;
+			s_State.boundary_first = firstIndex;
+		}
+
+		internal static void SeedConsoleSnapshotForTests(int maxIndex, int firstIndex)
+		{
+			s_State.snapshot_known = true;
+			s_State.snapshot_max = maxIndex;
+			s_State.snapshot_first = firstIndex;
+		}
+
+		internal static void NoteCompileStartedForTests() => NoteCompileStarted(live: false);
+
+		internal static void NoteAssemblyCompiledForTests() => s_State.rebuilt = true;
+
 		internal static void SeedForTests(string assemblyPath, CompilerMessage[] messages)
 		{
 			ByAssembly[assemblyPath] = messages;
 		}
 
-		internal static void SeedCompileClockForTests(long startedAtMs, long finishedAtMs)
+		internal static void SeedCompileClockForTests(long startedAtMs, long finishedAtMs, bool finishedViaReload = false)
 		{
-			s_CompileStartedAt = startedAtMs;
-			s_CompileFinishedAt = finishedAtMs;
+			s_State.started_at_ms = startedAtMs;
+			s_State.finished_at_ms = finishedAtMs;
+			s_State.finished_via_reload = finishedViaReload;
 		}
+
+		// Tests run in the live editor, so they must not be able to clobber the record the CLI reads:
+		// while a test holds the gate, Save/Load go to a separate SessionState key, and a test that
+		// forgets its restore can only lose its own state. The heartbeat file is still written from
+		// the in-memory state, which is why Heartbeat falls back to CompileProvenance for the clock.
+		static bool s_TestMode;
+		static readonly string TestSessionKey = SessionKey + ".tests";
 
 		internal static void ResetForTests()
 		{
+			s_TestMode = true;
 			ByAssembly.Clear();
-			s_CompileStartedAt = 0;
-			s_CompileFinishedAt = 0;
-			s_CompileFinishedViaReload = false;
+			s_State = new Freshness();
+			ConsoleRangeForTests = null;
 			FileExistsForTests = null;
+			SessionState.EraseString(TestSessionKey);
 		}
 
-		internal static void NoteCompileFinishedForTests() => NoteCompileFinished(false);
+		/// Reloads whatever the live record holds now, rather than a snapshot taken when the test started:
+		/// a compile that finished while the test held the gate wrote the live key (Save(live: true)), and
+		/// restoring an older snapshot over it is exactly how the heartbeat lost the compile clock.
+		internal static void RestoreLiveStateForTests()
+		{
+			if (!s_TestMode) return;
+			s_TestMode = false;
+			SessionState.EraseString(TestSessionKey);
+			Load();
+		}
+
+		internal static void NoteCompileFinishedForTests(bool afterReload = false)
+			=> NoteCompileFinished(afterReload, live: false);
 	}
 }

@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Concurrent;
 using System.Threading;
+using System.Threading.Tasks;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
 using NUnit.Framework;
@@ -224,6 +225,22 @@ namespace UnityCliConnector.Tests
         }
 
         [Test]
+        public void BuildReloadError_AQueuedRequestDuringAQuitIsNotToldToWait()
+        {
+            // The editor is gone, so "retry it once Unity answers again" would be advice the caller
+            // can never act on; a queued request only has to learn that nothing was applied.
+            var queued = RequestTracker.Track(new RequestTicket("exec", 60000));
+
+            var error = RequestTracker.BuildReloadError(queued, "the editor is quitting", quitting: true);
+
+            Assert.That(error.message, Does.Contain("exec never ran"));
+            Assert.That(error.message, Does.Not.Contain("Retry it once Unity answers again"),
+                "a quit editor is not coming back, so there is no answer to wait for");
+            var json = JObject.Parse(JsonConvert.SerializeObject(error));
+            Assert.IsNull(json["data"]["code"].Value<string>());
+        }
+
+        [Test]
         public void BuildRefusedError_SaysNothingRanAndCarriesTheReloadCode()
         {
             // A request that arrives once the reload has begun must be refused on the spot instead of
@@ -234,6 +251,20 @@ namespace UnityCliConnector.Tests
             var json = JObject.Parse(JsonConvert.SerializeObject(error));
             Assert.AreEqual(ErrorCodes.DomainReload, json["data"]["code"].Value<string>());
             Assert.AreEqual("exec", json["data"]["command"].Value<string>());
+            Assert.AreEqual(false, json["data"]["started"].Value<bool>());
+        }
+
+        [Test]
+        public void BuildRefusedError_DuringQuit_HasNoRetryAdviceAndNoCode()
+        {
+            // The editor is going away: "retry once Unity answers again" would send the caller waiting
+            // for an editor nobody is relaunching.
+            var error = RequestTracker.BuildRefusedError("exec", "the editor is quitting", quitting: true);
+            Assert.That(error.message, Does.Not.Contain("Retry"));
+            Assert.That(error.message, Does.Contain("nothing was applied"));
+
+            var json = JObject.Parse(JsonConvert.SerializeObject(error));
+            Assert.IsNull(json["data"]["code"].Value<string>());
             Assert.AreEqual(false, json["data"]["started"].Value<bool>());
         }
 
@@ -273,6 +304,7 @@ namespace UnityCliConnector.Tests
             // started). Overwriting it with the queue numbers hid that from every slow pickup.
             var ticket = new RequestTicket("exec", 60000);
             Thread.Sleep(HttpServer.SLOW_QUEUE_WAIT_MS + 150);
+            Assert.IsTrue(ticket.TryBegin(), "a queue wait only exists once the handler started");
             object result = new SuccessResponse("OK", 42, new { compile = "cached", state_change = "entered play mode" });
 
             HttpServer.ReportSlowQueue(ticket, ref result);
@@ -281,6 +313,48 @@ namespace UnityCliConnector.Tests
             Assert.AreEqual("cached", json["meta"]["compile"].Value<string>());
             Assert.AreEqual("entered play mode", json["meta"]["state_change"].Value<string>());
             Assert.That(json["meta"]["queue_wait_ms"].Value<int>(), Is.GreaterThanOrEqualTo(HttpServer.SLOW_QUEUE_WAIT_MS));
+            Assert.That(json["meta"]["total_ms"].Value<int>(),
+                Is.GreaterThanOrEqualTo(json["meta"]["queue_wait_ms"].Value<int>()),
+                "total_ms covers the whole request, queue_wait_ms only the pick-up wait");
+        }
+
+        [Test]
+        public void ReportSlowQueue_QueueWaitStopsWhenTheHandlerStarts()
+        {
+            // queue_wait_ms used to be measured to the answer, so `exec --meta` reported a queue wait
+            // that contained its compile and the fields added up to more than the wall time.
+            var ticket = new RequestTicket("exec", 60000);
+            Thread.Sleep(HttpServer.SLOW_QUEUE_WAIT_MS + 150);
+            Assert.IsTrue(ticket.TryBegin());
+            Thread.Sleep(150);
+            object result = new SuccessResponse("OK", 42, new { compile = "compiled", compile_ms = 140 });
+
+            HttpServer.ReportSlowQueue(ticket, ref result);
+
+            var meta = JObject.Parse(JsonConvert.SerializeObject(result))["meta"];
+            var queue = meta["queue_wait_ms"].Value<int>();
+            var total = meta["total_ms"].Value<int>();
+            Assert.That(queue, Is.LessThan(total), "the handler's own time is not queue time");
+            Assert.That(queue, Is.LessThan(HttpServer.SLOW_QUEUE_WAIT_MS + 500),
+                "the pick-up wait ends when the handler begins");
+            Assert.That(meta["compile_ms"].Value<int>() + queue, Is.LessThanOrEqualTo(total + 10),
+                "disjoint fields: compile_ms is inside the handler time, which is inside total");
+        }
+
+        [Test]
+        public async Task Responses_AskTheClientNotToReuseTheConnection()
+        {
+            // Mono's HttpListener answers a still-open connection with an empty 200 when it stops for a
+            // domain reload, and a client that had already pooled the connection reported that as an
+            // "unsolicited response on idle HTTP channel". `modal` runs off the main thread, so this
+            // does not need the editor's update loop to answer.
+            using var client = new System.Net.Http.HttpClient();
+            var body = new System.Net.Http.StringContent("{\"command\":\"modal\",\"params\":{}}",
+                System.Text.Encoding.UTF8, "application/json");
+            using var response = await client.PostAsync($"http://127.0.0.1:{HttpServer.Port}/command", body);
+
+            Assert.IsTrue(response.Headers.ConnectionClose ?? false,
+                "the response must tell the client to close, not to pool this connection");
         }
 
         // ---- response serialization can never be the thing that leaves a connection unanswered ----

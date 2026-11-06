@@ -216,3 +216,68 @@ files kept their contents.
   request as proof of a rebuild, `RunTests` started without checking DLL age, and `verify` never asked.
   Those code readings stand and the code they describe is what the live round refined; the mtime
   comparison they shipped is the part that never worked as intended.
+
+## Review follow-up
+
+The review found that the compile-clock "covered" rule still defined away #29: an edit made before a
+compile that did not rewrite the DLL had a source older than the compile start, so it was reported
+`not stale:` and tests could run the old DLL. That rule is now content-based:
+
+- `CompilationGate`'s `assemblyCompilationFinished` hook (only when that assembly had no errors) asks
+  `AssemblyStaleness.NoteAssemblyCompiled` to record a SHA-256 per source file, keyed by assembly name
+  and DLL path, in `Library/unity-cli/assembly-sources.json`. The file survives domain reloads and
+  editor restarts; SessionState alone would lose it on restart.
+- A source newer than the DLL is hashed only when its mtime is newer too. Different from the record
+  means stale even when a compile ran since (#29); identical means a touch, reported as `not stale:`
+  because the content matches. With no record, the old compile-clock rule still applies but the line
+  is marked `unverified, no content record`.
+- The scan budget now covers source path collection (and dedup is a hash set), not just the stat loop.
+  A deadline hit while scanning one assembly's sources no longer evaluates that partial assembly, and
+  `run_tests` refuses an incomplete scan with `blocked:"stale-assembly-scan-incomplete"` instead of
+  silently running (the `--allow-stale` escape hatch remains).
+- The covered line names the compile that *finished* when `LastCompileStartedAtMs` fell back to the
+  finish clock.
+- `refresh_unity` advertises `clean_compile_supported` only where `CleanBuildCache` exists (Unity
+  2021.1+), and rejects an explicit `compile:"clean"` on an older editor instead of silently doing a
+  plain request. The Go-side gating of `editor refresh --compile clean` is handled with finding 4.
+
+The covered unit tests were updated: the no-record case now asserts the `unverified` wording, and new
+tests cover a touch with matching content, a content change before a compile that did not rebuild the
+DLL (the previously masked #29 sequence), a source missing from the record, and the finish-clock
+wording. `RunTests_AnIncompleteScanRefusesInsteadOfRunningTheOldDll` covers the new refusal.
+
+Live, against the running editor: touching `Heartbeat.cs` then `editor refresh --compile` reported the
+DLL as covered because "its content matches what the compile recorded for it"; a real edit to
+`Tests/Editor/HeartbeatPayloadTests.cs` rebuilt `UnityCliConnector.Tests.Editor` and left no stale
+assembly; editing `Heartbeat.cs` and calling `compile_status` before any compile reported
+`stale_assembly_count: 1` while the content record still held the old hash. All edited files were
+restored byte-for-byte.
+
+## Review follow-up (Go half)
+
+- `verify --assembly A,B` now applies that filter to the provenance's stale-assembly list, the same
+  rule `test --assembly` uses: a stale assembly outside the requested set is reported but no longer
+  refuses the tests, and a stale assembly inside it still does. A truncated list keeps the full
+  count because it cannot prove the requested assemblies are clean.
+- An explicit `editor refresh --compile clean` is refused when the connector's reply does not
+  advertise `clean_compile_supported`; an older connector would ignore the mode and answer a plain
+  refresh, so the CLI no longer reports "nothing to compile" (exit 0) for a rebuild that never ran.
+
+## Review follow-up (end-to-end run)
+
+- **The content record was never created for a project the connector first saw already built.** A
+  record was only written on `assemblyCompilationFinished`, so an assembly whose DLL Unity had left
+  alone got no record and every later `touch` printed the noisiest line —
+  `not stale (unverified, no content record): Main.dll …` — on every `verify`/`wait`, forever.
+  `Evaluate` now writes the record during the first scan that finds the DLL current (the one state in
+  which the DLL's contents provably are what the compile read), bounded by the same scan budget, with
+  `saveRecords` as the persistence seam. The unverified line is shortened to
+  `not stale, no content record yet: … read it, so a moved mtime alone is not an edit`.
+  `AssemblyStalenessTests.Evaluate_CleanScan_RecordsContentsSoALaterTouchIsVerified` covers it.
+- **Live:** after a clean `verify`, a byte-identical restore of an edited test file reports
+  `not stale: UnityCliConnector.Tests.Editor.dll (built 19:07:36) is older than … but its content
+  matches what the compile recorded for it` — the covered line, not the unverified one.
+- **A stale-assembly refusal glued two sentences together:** `… run unity-cli editor refresh
+  --compile Tests were not run; pass --allow-stale …`. A period now separates them; the refusal was
+  reproduced live by appending a line to a test file and calling `test --assembly …` before Unity
+  compiled (exit 1, one stale assembly, `--allow-stale` runs).

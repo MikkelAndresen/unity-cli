@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"os"
 	"strconv"
 	"time"
 
@@ -46,6 +47,8 @@ type waitResult struct {
 	CompileWanted bool `json:"compile"`
 	CompileLanded bool `json:"compile_landed,omitempty"`
 	TimedOut      bool `json:"timed_out,omitempty"`
+	// StartingForMs is how long a "starting" editor has been waiting for its first update tick.
+	StartingForMs int64 `json:"starting_for_ms,omitempty"`
 	// Reason says why a wait gave up, which timed_out alone does not: the budget ran out, or the
 	// editor sat idle with uncompiled sources instead of compiling them.
 	Reason     string          `json:"reason,omitempty"`
@@ -81,7 +84,7 @@ func isStartingState(state string) bool {
 func waitCmd(ctx context.Context, args []string, send sendFn, resolve instanceResolver, out io.Writer) int {
 	flags, err := parseSubFlags(args)
 	if err != nil {
-		_, _ = fmt.Fprintf(out, "wait: %v\n", err)
+		_, _ = fmt.Fprintf(os.Stderr, "wait: %v\n", err)
 		return waitTimedOut
 	}
 	_, wantCompile := flags["compile"]
@@ -91,7 +94,13 @@ func waitCmd(ctx context.Context, args []string, send sendFn, resolve instanceRe
 	if raw, ok := flags["timeout"]; ok {
 		seconds, err := strconv.Atoi(raw)
 		if err != nil || seconds <= 0 {
-			_, _ = fmt.Fprintf(out, "wait: --timeout wants a whole number of seconds, got %q\n", raw)
+			msg := fmt.Sprintf("wait: --timeout wants a whole number of seconds, got %q", raw)
+			if asJSON {
+				b, _ := json.Marshal(waitResult{Error: msg, Exit: waitTimedOut})
+				_, _ = fmt.Fprintln(out, string(b))
+				return waitTimedOut
+			}
+			_, _ = fmt.Fprintln(out, msg)
 			return waitTimedOut
 		}
 		timeout = time.Duration(seconds) * time.Second
@@ -126,12 +135,18 @@ func waitCmd(ctx context.Context, args []string, send sendFn, resolve instanceRe
 		_, _ = fmt.Fprintf(out, "Unity (port %d): %s\n", r.Port, r.State)
 		if r.TimedOut {
 			_, _ = fmt.Fprintf(out, "gave up after %s: still %s", time.Since(start).Truncate(time.Second), r.State)
+			if r.StartingForMs > 0 {
+				_, _ = fmt.Fprintf(out, " (for %s)", client.FormatAge(time.Duration(r.StartingForMs)*time.Millisecond))
+			}
 			if r.Reason != "" {
 				_, _ = fmt.Fprintf(out, " — %s", r.Reason)
 			}
 			_, _ = fmt.Fprintln(out)
+		} else if r.Reason != "" {
+			// The editor is idle but --compile could not be proven; the reason is the verdict.
+			_, _ = fmt.Fprintln(out, r.Reason)
 		}
-		printProvenance(out, prov)
+		printProvenance(out, prov, true)
 		for _, n := range r.Notes {
 			_, _ = fmt.Fprintf(out, "  (%s)\n", n)
 		}
@@ -146,7 +161,7 @@ func waitCmd(ctx context.Context, args []string, send sendFn, resolve instanceRe
 	if err != nil {
 		return noReply("editor: %v", err)
 	}
-	if age := heartbeatAge(baseline); age > staleHeartbeatAge {
+	if age := client.HeartbeatAge(baseline); age > staleHeartbeatAge {
 		report := stalledEditorReport(baseline, age, assessCrash(baseline))
 		return noReply("%s", report)
 	}
@@ -155,6 +170,7 @@ func waitCmd(ctx context.Context, args []string, send sendFn, resolve instanceRe
 	deadline := start.Add(timeout)
 	var staleSince time.Time
 	restartNoted := false
+	reloadNoted := false
 	for {
 		status, err := resolve()
 		if err != nil {
@@ -166,22 +182,44 @@ func waitCmd(ctx context.Context, args []string, send sendFn, resolve instanceRe
 			return noReply("%s", modalBlockedError(status, "wait", true))
 		}
 		r.State, r.Port, r.PID = status.State, status.Port, status.PID
-		r.CompileLanded = status.CompileFinishedAt > baseline.CompileFinishedAt
+		r.StartingForMs = 0
+		if age, ok := status.StartingFor(); ok {
+			r.StartingForMs = age.Milliseconds()
+		}
 
 		// The editor coming back under a new pid restamps the compile clock too, and that is not
-		// evidence the caller's edit was compiled into anything.
-		if !restartNoted && baseline.PID != 0 && status.PID != 0 && status.PID != baseline.PID {
-			restartNoted = true
-			r.Notes = append(r.Notes, "the Unity editor restarted while waiting; the compile clock shows its startup compile")
+		// evidence the caller's edit was compiled into anything. Rebase the clock so a compile this
+		// new process runs after the restart is still proof, while its startup compile is not.
+		if baseline.PID != 0 && status.PID != 0 && status.PID != baseline.PID {
+			if !restartNoted {
+				restartNoted = true
+				r.Notes = append(r.Notes, "the Unity editor restarted while waiting; the compile clock shows its startup compile")
+			}
+			baseline = status
+			r.CompileLanded = false
+		} else {
+			r.CompileLanded = status.CompileFinishedAt > baseline.CompileFinishedAt
 		}
 
 		// The connector rewrites its heartbeat twice a second even while compiling, and a player build
 		// has its own writer, so long silence means the editor wedged or restarted: no amount of
-		// --timeout will make it answer. The threshold is looser than statusCmd's because a domain
-		// reload pauses the writes for a couple of seconds.
-		if age := heartbeatAge(status); age > waitSilentHeartbeat {
-			report := stalledEditorReport(status, age, assessCrash(status))
-			return noReply("%s", report)
+		// --timeout will make it answer. A domain reload also stops the update-driven writes for its
+		// whole duration, so silence there is only a reason to stop if the editor died in it.
+		if age := client.HeartbeatAge(status); age > waitSilentHeartbeat {
+			verdict := assessCrash(status)
+			if status.State != "reloading" || verdict.Crashed {
+				return noReply("%s", stalledEditorReport(status, age, verdict))
+			}
+			if !reloadNoted {
+				reloadNoted = true
+				r.Notes = append(r.Notes, fmt.Sprintf("the heartbeat has been silent for %s, but the editor reports a domain reload; still waiting (--timeout bounds it)", age.Truncate(time.Second)))
+			}
+		}
+
+		// The grace is for an idle editor with stale sources; time spent compiling or reloading is
+		// not part of it, or a compile that finished between polls would leave the timer expired.
+		if !isIdleState(status.State) {
+			staleSince = time.Time{}
 		}
 
 		if isIdleState(status.State) {
@@ -190,36 +228,45 @@ func waitCmd(ctx context.Context, args []string, send sendFn, resolve instanceRe
 				return finish(waitIdle)
 			}
 			if status.CompileFinishedAt == 0 {
-				r.Notes = append(r.Notes, "this connector reports no compile clock, so the wait cannot prove your edit was compiled; unity-cli verify does")
+				// --compile is a promise that the edit is in the compile. A connector with no compile
+				// clock cannot keep it, and answering 0 would let `wait --compile && test` run the tests
+				// against code this wait could not prove was built.
+				r.Reason = "this connector reports no compile clock, so the wait cannot prove your edit was compiled"
+				r.Notes = append(r.Notes, "run unity-cli verify (or unity-cli editor refresh --compile) to compile it and get the provenance line")
 				askProvenance(false)
-				return finish(waitIdle)
+				return finish(waitTimedOut)
 			}
 
 			askProvenance(false)
 			if prov == nil {
-				r.Notes = append(r.Notes, "compile_status did not answer, so nothing can say whether the source tree is newer than the last compile; unity-cli verify compiles and proves it")
-				return finish(waitIdle)
+				r.Reason = "compile_status did not answer, so nothing can say whether the source tree is newer than the last compile"
+				r.Notes = append(r.Notes, "run unity-cli verify, which compiles and proves what the compile covers")
+				return finish(waitTimedOut)
 			}
 			if prov.StaleCount == 0 {
-				r.Notes = append(r.Notes, "no compilation ran while waiting and no source file is newer than the last compile: your edit is already in")
-				if !prov.ScanComplete {
-					r.Notes = append(r.Notes, "the source scan stopped early, so \"not stale\" is not certain")
+				if prov.ScanNote != provenanceNotScanned {
+					r.Notes = append(r.Notes, "no compilation ran while waiting and no source file is newer than the last compile: your edit is already in")
+					if !prov.ScanComplete {
+						r.Notes = append(r.Notes, "the source scan stopped early, so \"not stale\" is not certain")
+					}
+					return finish(waitIdle)
 				}
-				return finish(waitIdle)
-			}
-
-			// Stale and not compiling: the editor has not picked the change up yet. Wait for it to
-			// start; the compile clock ends the wait, so the tree is not scanned again.
-			if staleSince.IsZero() {
-				staleSince = time.Now()
-			} else if time.Since(staleSince) > waitStaleGrace {
-				r.TimedOut = true
-				r.Reason = fmt.Sprintf("no compilation started within %s of finding uncompiled sources", waitStaleGrace)
-				r.Notes = append(r.Notes, "Unity only auto-refreshes while it has focus; run unity-cli verify (or unity-cli editor refresh --compile) to compile them")
-				// Re-ask: the lines the editor wrote say "(3 s ago)" as of when it wrote them, and
-				// these were written one grace period ago.
-				askProvenance(true)
-				return finish(waitTimedOut)
+				// compile_status answered a compiling editor from the previous record without a scan;
+				// "not stale" there means "not looked", so wait for the compile to move the clock.
+			} else {
+				// Stale and not compiling: the editor has not picked the change up yet. Wait for it to
+				// start; the compile clock ends the wait, so the tree is not scanned again.
+				if staleSince.IsZero() {
+					staleSince = time.Now()
+				} else if time.Since(staleSince) > waitStaleGrace {
+					r.TimedOut = true
+					r.Reason = fmt.Sprintf("no compilation started within %s of finding uncompiled sources", waitStaleGrace)
+					r.Notes = append(r.Notes, "Unity only auto-refreshes while it has focus; run unity-cli verify (or unity-cli editor refresh --compile) to compile them")
+					// Re-ask: the lines the editor wrote say "(3 s ago)" as of when it wrote them, and
+					// these were written one grace period ago.
+					askProvenance(true)
+					return finish(waitTimedOut)
+				}
 			}
 		}
 
@@ -236,14 +283,6 @@ func waitCmd(ctx context.Context, args []string, send sendFn, resolve instanceRe
 		case <-time.After(statusPollInterval):
 		}
 	}
-}
-
-// heartbeatAge is how old the instance's last heartbeat is. A missing timestamp counts as ancient.
-func heartbeatAge(inst *client.Instance) time.Duration {
-	if inst == nil || inst.Timestamp == 0 {
-		return time.Hour
-	}
-	return time.Since(time.UnixMilli(inst.Timestamp))
 }
 
 // staleHeartbeatAge is the cut-off statusCmd uses before calling an editor unresponsive. The client

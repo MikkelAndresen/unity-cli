@@ -4,6 +4,7 @@ using System.ComponentModel;
 using System.Diagnostics;
 using System.IO;
 using System.Text;
+using System.Threading;
 using System.Threading.Tasks;
 
 namespace UnityCliConnector
@@ -25,21 +26,24 @@ namespace UnityCliConnector
         {
             internal readonly bool Ok;
             internal readonly byte[] Bytes;
+            /// Portable PDB for <see cref="Bytes"/>, so a runtime stack can name the snippet line.
+            internal readonly byte[] Pdb;
             /// Raw compiler output when the compile failed; null when it timed out.
             internal readonly string Diagnostics;
             internal readonly bool TimedOut;
 
-            Result(bool ok, byte[] bytes, string diagnostics, bool timedOut)
+            Result(bool ok, byte[] bytes, byte[] pdb, string diagnostics, bool timedOut)
             {
                 Ok = ok;
                 Bytes = bytes;
+                Pdb = pdb;
                 Diagnostics = diagnostics;
                 TimedOut = timedOut;
             }
 
-            internal static Result Success(byte[] bytes) => new Result(true, bytes, null, false);
-            internal static Result Failure(string diagnostics) => new Result(false, null, diagnostics, false);
-            internal static Result Timeout() => new Result(false, null, null, true);
+            internal static Result Success(byte[] bytes, byte[] pdb) => new Result(true, bytes, pdb, null, false);
+            internal static Result Failure(string diagnostics) => new Result(false, null, null, diagnostics, false);
+            internal static Result Timeout() => new Result(false, null, null, null, true);
         }
 
         /// <param name="id">File-name stem for this compile. Names must stay unique: two
@@ -56,6 +60,7 @@ namespace UnityCliConnector
 
             var srcFile = Path.Combine(tmpDir, id + ".cs");
             var outFile = Path.Combine(tmpDir, id + ".dll");
+            var pdbFile = Path.Combine(tmpDir, id + ".pdb");
             var rspFile = Path.Combine(tmpDir, id + ".rsp");
 
             try
@@ -81,14 +86,23 @@ namespace UnityCliConnector
                 if (run.ExitCode != 0)
                     return Result.Failure(string.IsNullOrEmpty(run.Stderr) ? run.Stdout : run.Stderr);
 
-                return Result.Success(File.ReadAllBytes(outFile));
+                return Result.Success(File.ReadAllBytes(outFile), ReadPdb(pdbFile));
             }
             finally
             {
                 try { File.Delete(srcFile); } catch (IOException) { }
                 try { File.Delete(outFile); } catch (IOException) { }
+                try { File.Delete(pdbFile); } catch (IOException) { }
                 try { File.Delete(rspFile); } catch (IOException) { }
             }
+        }
+
+        /// A missing PDB only costs stack line numbers, so an unreadable one is not a compile failure.
+        static byte[] ReadPdb(string path)
+        {
+            try { return File.Exists(path) ? File.ReadAllBytes(path) : null; }
+            catch (IOException) { return null; }
+            catch (UnauthorizedAccessException) { return null; }
         }
 
         static string BuildResponseFile(string outFile, string srcFile, IReadOnlyList<string> references)
@@ -97,6 +111,9 @@ namespace UnityCliConnector
             rsp.AppendLine("-target:library");
             rsp.AppendLine($"-out:\"{outFile}\"");
             rsp.AppendLine("-nologo");
+            // The PDB is what lets a runtime exception name the snippet line it came from: the
+            // generated body carries #line directives, so the symbols map straight to the caller.
+            rsp.AppendLine("-debug:portable");
             rsp.AppendLine("-nowarn:0105,1701,1702");
             rsp.AppendLine("-langversion:latest");
             rsp.AppendLine($"\"{srcFile}\"");
@@ -149,13 +166,26 @@ namespace UnityCliConnector
                 ObserveFault(stderrTask);
 
                 var exited = ExitedTask(proc);
-                var timedOut = !ReferenceEquals(await Task.WhenAny(exited, Task.Delay(timeoutMs)).ConfigureAwait(false), exited);
+                bool timedOut;
+                using (var timeoutCts = new CancellationTokenSource())
+                {
+                    // Cancel the losing delay: without that the timer for a 2 s compile keeps a
+                    // thread-pool timer alive for the whole 30 s timeout.
+                    var timeoutTask = Task.Delay(timeoutMs, timeoutCts.Token);
+                    timedOut = !ReferenceEquals(await Task.WhenAny(exited, timeoutTask).ConfigureAwait(false), exited);
+                    if (!timedOut) timeoutCts.Cancel();
+                }
                 if (timedOut) TryKill(proc);
 
                 // Give the readers a moment to finish after the kill before the process is
                 // disposed under them; a lingering one is detached and its fault observed.
-                await Task.WhenAny(Task.WhenAll(stdoutTask, stderrTask), Task.Delay(StreamDrainGraceMs))
-                    .ConfigureAwait(false);
+                var drained = Task.WhenAll(stdoutTask, stderrTask);
+                using (var drainCts = new CancellationTokenSource())
+                {
+                    var grace = Task.Delay(StreamDrainGraceMs, drainCts.Token);
+                    if (!ReferenceEquals(await Task.WhenAny(drained, grace).ConfigureAwait(false), drained))
+                        drainCts.Cancel();
+                }
 
                 var stdout = Finished(stdoutTask) ? stdoutTask.Result : string.Empty;
                 var stderr = Finished(stderrTask) ? stderrTask.Result : string.Empty;

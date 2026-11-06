@@ -81,16 +81,44 @@ namespace UnityCliConnector.Tools
                 if (usingsToken.Type == JTokenType.Array)
                     extraUsings.AddRange(usingsToken.ToObject<string[]>());
                 else
-                    extraUsings.AddRange(usingsToken.ToString().Split(','));
+                    extraUsings.AddRange(SplitUsingList(usingsToken.ToString()));
             }
 
             var includeDefaults = !(p.GetBool("no_default_usings") || p.GetBool("noDefaultUsings"));
             var cscPath = p.Get("csc");
             var dotnetPath = p.Get("dotnet");
             var awaitTimeout = p.GetInt("await_timeout") ?? p.GetInt("awaitTimeout") ?? ExecAwait.DefaultTimeoutMs;
-            return await CompileAndExecute(
-                ExecSource.Build(code, extraUsings, includeDefaults, DetectBodyKind(code)),
-                cscPath, dotnetPath, awaitTimeout);
+            var kind = DetectBodyKind(code);
+            var statementForm = ExecSource.BuildMapped(code, extraUsings, includeDefaults, kind, returnExpression: false);
+            // A snippet that is one expression and nothing else is compiled as `return (expr);`, so
+            // `exec "Time.time"` returns the value instead of failing with "; expected". The statement
+            // form is kept as the retry for the one case that is a valid statement but not a value: a
+            // void call (`Debug.Log("x")`), which only compiles — and only answers — as a statement.
+            if (!ExecSource.WrapSingleExpression(code, kind))
+                return await CompileAndExecute(statementForm, null, cscPath, dotnetPath, awaitTimeout);
+            var expressionForm = ExecSource.BuildMapped(code, extraUsings, includeDefaults, kind, returnExpression: true);
+            return await CompileAndExecute(expressionForm, statementForm, cscPath, dotnetPath, awaitTimeout);
+        }
+
+        /// <summary>
+        /// Splits the comma-separated --usings value, leaving commas inside a generic
+        /// argument list (`Map = Dictionary<string, int>`) in the same entry.
+        /// </summary>
+        private static IEnumerable<string> SplitUsingList(string raw)
+        {
+            var depth = 0;
+            var start = 0;
+            for (var i = 0; i < raw.Length; i++)
+            {
+                if (raw[i] == '<') depth++;
+                else if (raw[i] == '>' && depth > 0) depth--;
+                else if (raw[i] == ',' && depth == 0)
+                {
+                    yield return raw.Substring(start, i - start);
+                    start = i + 1;
+                }
+            }
+            yield return raw.Substring(start);
         }
 
         /// <summary>
@@ -159,7 +187,8 @@ namespace UnityCliConnector.Tools
             };
         }
 
-        private static async Task<object> CompileAndExecute(string source, string cscOverride = null,
+        private static async Task<object> CompileAndExecute(ExecSource.Generated source,
+            ExecSource.Generated? statementFallback = null, string cscOverride = null,
             string dotnetOverride = null, int awaitTimeoutMs = ExecAwait.DefaultTimeoutMs)
         {
             // Compiler discovery and the reference set read Unity APIs and this domain's
@@ -178,11 +207,12 @@ namespace UnityCliConnector.Tools
 
             var csc = resolved.Csc;
             var dotnet = resolved.Dotnet;
-            var key = ExecCompileCache.KeyFor(source, csc, dotnet, references);
+            var key = ExecCompileCache.KeyFor(source.Text, csc, dotnet, references);
 
             string compileState;
             long compileMs = 0;
             MethodInfo method;
+            var sourceName = "";
 
             if (ExecCompileCache.TryGet(key, out var cached))
             {
@@ -193,15 +223,41 @@ namespace UnityCliConnector.Tools
             {
                 var id = ExecAssemblyPrefix + Guid.NewGuid().ToString("N").Substring(0, 12);
                 var sw = Stopwatch.StartNew();
-                var compiled = await ExecCompiler.CompileAsync(source, references, csc, dotnet, id, CompileTimeoutMs);
+                var compiled = await ExecCompiler.CompileAsync(source.Text, references, csc, dotnet, id, CompileTimeoutMs);
+                var generated = source;
+                var snippetName = id;
+                // Only a void call needs the statement fallback: `return (Debug.Log("x"));` cannot
+                // convert void to object, while as a statement it runs and the snippet answers null.
+                // Any other failure would fail in both shapes, so it is reported from the shape the
+                // caller wrote — and a broken expression pays for one compile, not two.
+                if (!compiled.Ok && !compiled.TimedOut && statementFallback is { } statement &&
+                    compiled.Diagnostics != null &&
+                    compiled.Diagnostics.IndexOf("'void'", StringComparison.OrdinalIgnoreCase) >= 0)
+                {
+                    var statementId = ExecAssemblyPrefix + Guid.NewGuid().ToString("N").Substring(0, 12);
+                    var retried = await ExecCompiler.CompileAsync(statement.Text, references, csc, dotnet, statementId,
+                        CompileTimeoutMs);
+                    if (retried.Ok)
+                    {
+                        compiled = retried;
+                        generated = statement;
+                        snippetName = statementId;
+                        key = ExecCompileCache.KeyFor(statement.Text, csc, dotnet, references);
+                    }
+                    else if (retried.TimedOut)
+                    {
+                        compiled = retried;
+                    }
+                }
                 compileMs = sw.ElapsedMilliseconds;
+                sourceName = snippetName;
 
                 if (compiled.TimedOut)
                     return new ErrorResponse($"Compile timed out after {compileMs}ms.")
                         { meta = CompileMeta("timeout", compileMs, references.Count) };
 
                 if (!compiled.Ok)
-                    return new ErrorResponse($"Compile error:\n{FormatErrors(compiled.Diagnostics)}")
+                    return new ErrorResponse($"Compile error:\n{FormatErrors(compiled.Diagnostics, generated.BodyStartLine)}")
                         { meta = CompileMeta("failed", compileMs, references.Count) };
 
                 // See ReloadedMessage: the compile finished, but not on the thread that may
@@ -210,7 +266,7 @@ namespace UnityCliConnector.Tools
                     return new ErrorResponse(ReloadedMessage)
                         { meta = CompileMeta("interrupted", compileMs, references.Count) };
 
-                var assembly = Assembly.Load(compiled.Bytes);
+                var assembly = Load(compiled);
                 method = assembly.GetType(ExecSource.TypeName)?.GetMethod("Execute");
                 if (method == null)
                     return new ErrorResponse("Internal error: compiled type or method not found.")
@@ -222,6 +278,7 @@ namespace UnityCliConnector.Tools
 
             var playModeBefore = EditorApplication.isPlaying;
             var playModeChangingBefore = EditorApplication.isPlayingOrWillChangePlaymode;
+            var compilingBefore = EditorApplication.isCompiling;
             object result;
             try
             {
@@ -230,7 +287,7 @@ namespace UnityCliConnector.Tools
             catch (TargetInvocationException tie)
             {
                 var inner = tie.InnerException ?? tie;
-                return new ErrorResponse($"Runtime error: {inner.GetType().Name}: {inner.Message}")
+                return new ErrorResponse(FormatRuntimeError(inner, sourceName, source.BodyStartLine))
                     { meta = CompileMeta(compileState, compileMs, references.Count) };
             }
 
@@ -239,7 +296,7 @@ namespace UnityCliConnector.Tools
             var outcome = await ExecAwait.ResolveAsync(result, awaitTimeoutMs);
 
             if (outcome.Error != null)
-                return new ErrorResponse($"Runtime error: {outcome.Error.GetType().Name}: {outcome.Error.Message}")
+                return new ErrorResponse(FormatRuntimeError(outcome.Error, sourceName, source.BodyStartLine))
                     { meta = CompileMeta(compileState, compileMs, references.Count) };
 
             if (outcome.TimedOut)
@@ -267,13 +324,15 @@ namespace UnityCliConnector.Tools
                 ? $"OK (routine completed in {outcome.Steps} steps)"
                 : "OK";
             // A snippet that changed play mode may have reloaded the domain this very response is
-            // being written from, so the answer says what the snippet set in motion. It is reported
-            // in meta rather than guessed at, because the reload may still be a tick away.
+            // being written from, so the answer says what the editor's state moved to. It is reported
+            // in meta rather than guessed at, because the reload may still be a tick away, and it
+            // names the state rather than the snippet because a change made by an asset import or by
+            // the user while the snippet yields is indistinguishable from one the snippet asked for.
             var stateChange = MainThread.IsCurrent
-                ? PlayModeTransitions.ChangeStartedSince(playModeBefore, playModeChangingBefore)
+                ? PlayModeTransitions.ChangeStartedSince(playModeBefore, playModeChangingBefore, compilingBefore)
                 : null;
             if (stateChange != null)
-                message += $" (this snippet started {stateChange}; the next command may have to wait for the editor)";
+                message += $" (since the snippet started: {stateChange}; the next command may have to wait for the editor)";
             string serializationError;
             var data = Serialize(outcome.Value, out serializationError);
             return new SuccessResponse(message, data,
@@ -297,7 +356,12 @@ namespace UnityCliConnector.Tools
                     ? await Task.Run(() => FindDotnetFile(dotnetOverride, contentsPath, isWindowsEditor))
                         .ConfigureAwait(false)
                     : null;
-                s_CompilerMemoKey = memoKey;
+                // A missing compiler is not memoized: the lookup can run while the Unity
+                // install is still being populated, and caching that would fail every later
+                // exec until a domain reload.
+                if (s_CscPath != null &&
+                    (!s_CscPath.EndsWith(".dll", StringComparison.OrdinalIgnoreCase) || s_DotnetPath != null))
+                    s_CompilerMemoKey = memoKey;
             }
 
             if (s_CscPath == null)
@@ -385,7 +449,7 @@ namespace UnityCliConnector.Tools
             return null;
         }
 
-        private static string FormatErrors(string raw)
+        private static string FormatErrors(string raw, int bodyStartLine = 0)
         {
             var lines = raw.Split('\n');
             var errors = new List<string>();
@@ -393,13 +457,93 @@ namespace UnityCliConnector.Tools
             {
                 var trimmed = line.Trim();
                 if (string.IsNullOrEmpty(trimmed)) continue;
-                var m = Regex.Match(trimmed, @"\((\d+),\d+\):\s*error\s+\w+:\s*(.+)");
+                var m = Regex.Match(trimmed, @"^(.+?)\((\d+),\d+\):\s*error\s+\w+:\s*(.+)");
                 if (m.Success)
-                    errors.Add($"L{m.Groups[1].Value}: {m.Groups[2].Value}");
+                {
+                    var lineNumber = int.Parse(m.Groups[2].Value);
+                    var snippetLine = SnippetLine(m.Groups[1].Value, lineNumber, bodyStartLine);
+                    errors.Add($"L{snippetLine}: {m.Groups[3].Value}");
+                }
                 else if (trimmed.Contains("error"))
                     errors.Add(trimmed);
             }
             return errors.Count > 0 ? string.Join("\n", errors) : raw;
+        }
+
+        /// <summary>
+        /// Maps a compiler line to the line the caller wrote. The generated body carries a
+        /// `#line 1 "exec-snippet"` directive, so a diagnostic in it already says the snippet's line;
+        /// only a diagnostic in the generated prologue (a bad --usings directive, a malformed wrapper)
+        /// still names the temporary file, and it is clamped to the first snippet line.
+        /// </summary>
+        internal static int SnippetLine(string file, int lineNumber, int bodyStartLine)
+        {
+            if (file.IndexOf(ExecSource.Generated.SnippetFileName, StringComparison.Ordinal) >= 0)
+                return lineNumber;
+            if (bodyStartLine <= 0) return lineNumber;
+            return Math.Max(1, lineNumber - bodyStartLine + 1);
+        }
+
+        // A runtime stack is a diagnostic, not a payload: a handful of user frames is enough to see
+        // which snippet line threw, and the entry cap keeps a deep graph from flooding the answer.
+        private const int RuntimeStackFrames = 5;
+        private const int RuntimeStackChars = 1200;
+
+        /// <summary>
+        /// The exception type, message and a short stack, with generated-file frames rewritten to the
+        /// snippet line they came from. Frames inside Unity's engine are collapsed by the same filter
+        /// read_console uses, so what is left is where the caller's code actually threw.
+        /// </summary>
+        internal static string FormatRuntimeError(Exception exception, string snippetName, int bodyStartLine)
+        {
+            var formatted = StackTraceFilter.Format(exception.ToString(), StackTraceFilter.StacktraceMode.User,
+                RuntimeStackFrames, RuntimeStackChars);
+            return "Runtime error: " + RewriteSnippetFrames(formatted.Text, snippetName, bodyStartLine);
+        }
+
+        /// <summary>
+        /// Rewrites `in <temp file>.cs:line N` to `in snippet:line N` using the same mapping as the
+        /// compiler diagnostics. A stack without symbols (no portable PDB) has no line numbers and is
+        /// left as the runtime printed it.
+        /// </summary>
+        internal static string RewriteSnippetFrames(string stack, string snippetName, int bodyStartLine)
+        {
+            if (string.IsNullOrEmpty(stack)) return stack;
+            // The portable PDB attributes frames to the #line document, so a frame reads
+            // `in <temp dir>/exec-snippet:3` and its number is already the snippet's.
+            stack = Regex.Replace(stack,
+                @"in\s+[^\r\n]*?" + Regex.Escape(ExecSource.Generated.SnippetFileName) + @":(?<line>\d+)",
+                match => $"in snippet:line {match.Groups["line"].Value}");
+            return Regex.Replace(stack,
+                @"in\s+(?<file>[^\r\n]*?)\.cs:line (?<line>\d+)",
+                match =>
+                {
+                    var file = match.Groups["file"].Value;
+                    var line = int.Parse(match.Groups["line"].Value);
+                    var mapped = file.IndexOf(ExecSource.Generated.SnippetFileName, StringComparison.Ordinal) >= 0
+                        ? line
+                        : SnippetLine(file + ".cs", line, bodyStartLine);
+                    return $"in snippet:line {mapped}";
+                });
+        }
+
+        /// <summary>
+        /// Loads the compiled snippet. The portable PDB travels with it so a stack trace can name the
+        /// snippet line; runtimes that refuse the symbol store still run the snippet, just without
+        /// line numbers in its frames.
+        /// </summary>
+        private static Assembly Load(ExecCompiler.Result compiled)
+        {
+            if (compiled.Pdb is { Length: > 0 })
+            {
+                try { return Assembly.Load(compiled.Bytes, compiled.Pdb); }
+                catch (Exception e) when (e is ArgumentException || e is BadImageFormatException ||
+                                          e is NotSupportedException || e is IOException)
+                {
+                    // Fall through to a symbol-less load.
+                }
+            }
+            return Assembly.Load(compiled.Bytes);
         }
 
         private const int MaxDepth = 6;
@@ -418,16 +562,17 @@ namespace UnityCliConnector.Tools
             public int GetHashCode(object obj) => RuntimeHelpers.GetHashCode(obj);
         }
 
+        private sealed class SerializeContext
+        {
+            internal readonly HashSet<object> Path = new HashSet<object>(ReferenceComparer.Instance);
+            /// Set when a value had to be reported as ToString() because it exposed no members.
+            internal string Fallback;
+        }
+
         internal static object Serialize(object obj)
         {
             string ignored;
-            return Serialize(obj, 0, out ignored);
-        }
-
-        internal static object Serialize(object obj, int depth)
-        {
-            string ignored;
-            return Serialize(obj, depth, out ignored);
+            return Serialize(obj, out ignored);
         }
 
         internal static object Serialize(object obj, out string serializationError)
@@ -438,9 +583,14 @@ namespace UnityCliConnector.Tools
         private static object Serialize(object obj, int depth, out string serializationError)
         {
             serializationError = null;
+            var context = new SerializeContext();
             try
             {
-                return SerializeValue(obj, depth, new HashSet<object>(ReferenceComparer.Instance));
+                var value = SerializeValue(obj, depth, context);
+                // The issue's second half: a ToString() fallback must be visible in meta,
+                // not only an exception escaping the walk.
+                serializationError = context.Fallback;
+                return value;
             }
             catch (Exception ex)
             {
@@ -452,7 +602,15 @@ namespace UnityCliConnector.Tools
             }
         }
 
-        private static object SerializeValue(object obj, int depth, HashSet<object> path)
+        private static object FallbackToToString(object obj, SerializeContext context)
+        {
+            if (context.Fallback == null)
+                context.Fallback = "no serializable members on " + obj.GetType().FullName +
+                    "; returned ToString()";
+            return SafeToString(obj);
+        }
+
+        private static object SerializeValue(object obj, int depth, SerializeContext context)
         {
             if (obj == null) return null;
 
@@ -469,11 +627,16 @@ namespace UnityCliConnector.Tools
             // Transform/GameObject graphs contain cycles.
             if (obj is UnityEngine.Object) return SafeToString(obj);
 
+            // JToken is IEnumerable<JToken>, so the enumerable branch would emit its
+            // JProperty wrappers as nested arrays and lose the payload. Its ToString is
+            // the JSON text the caller returned.
+            if (obj is JToken) return SafeToString(obj);
+
             var tracked = !type.IsValueType;
             if (tracked)
             {
-                if (path.Contains(obj)) return "<cycle: " + type.Name + ">";
-                path.Add(obj);
+                if (context.Path.Contains(obj)) return "<cycle: " + type.Name + ">";
+                context.Path.Add(obj);
             }
 
             try
@@ -486,32 +649,32 @@ namespace UnityCliConnector.Tools
                     if (task.IsCompleted && !task.IsFaulted && !task.IsCanceled)
                     {
                         var inner = TaskResultOf(task);
-                        return inner == null ? "<completed>" : SerializeValue(inner, depth + 1, path);
+                        return inner == null ? "<completed>" : SerializeValue(inner, depth + 1, context);
                     }
                     return $"<task {task.Status}>";
                 }
 
                 if (depth >= MaxDepth) return "<truncated at depth " + MaxDepth + ">";
 
-                if (obj is IDictionary dict) return SerializeDictionary(dict, depth, path);
-                if (obj is IEnumerable enumerable) return SerializeEnumerable(enumerable, depth, path);
+                if (obj is IDictionary dict) return SerializeDictionary(dict, depth, context);
+                if (obj is IEnumerable enumerable) return SerializeEnumerable(enumerable, depth, context);
 
                 var mathMembers = MathMemberNames(type);
                 if (mathMembers != null)
-                    return SerializeMath(obj, type, mathMembers, depth, path);
+                    return SerializeMath(obj, type, mathMembers, depth, context);
 
                 if (type.IsValueType || type.IsClass)
-                    return SerializeMembers(obj, type, depth, path);
+                    return SerializeMembers(obj, type, depth, context);
 
-                return SafeToString(obj);
+                return FallbackToToString(obj, context);
             }
             finally
             {
-                if (tracked) path.Remove(obj);
+                if (tracked) context.Path.Remove(obj);
             }
         }
 
-        private static object SerializeDictionary(IDictionary dict, int depth, HashSet<object> path)
+        private static object SerializeDictionary(IDictionary dict, int depth, SerializeContext context)
         {
             var result = new Dictionary<string, object>();
             var count = 0;
@@ -525,13 +688,13 @@ namespace UnityCliConnector.Tools
 
                 var key = entry.Key == null ? "null" : SafeToString(entry.Key);
                 if (key == null) key = "null";
-                try { result[key] = SerializeValue(entry.Value, depth + 1, path); }
+                try { result[key] = SerializeValue(entry.Value, depth + 1, context); }
                 catch (Exception ex) { result[key] = ErrorText(ex); }
             }
             return result;
         }
 
-        private static object SerializeEnumerable(IEnumerable enumerable, int depth, HashSet<object> path)
+        private static object SerializeEnumerable(IEnumerable enumerable, int depth, SerializeContext context)
         {
             var result = new List<object>();
             var count = 0;
@@ -543,14 +706,14 @@ namespace UnityCliConnector.Tools
                     break;
                 }
 
-                try { result.Add(SerializeValue(item, depth + 1, path)); }
+                try { result.Add(SerializeValue(item, depth + 1, context)); }
                 catch (Exception ex) { result.Add(ErrorText(ex)); }
             }
             return result;
         }
 
         private static object SerializeMath(object obj, Type type, string[] memberNames, int depth,
-            HashSet<object> path)
+            SerializeContext context)
         {
             var result = new Dictionary<string, object>();
             foreach (var name in memberNames)
@@ -558,20 +721,20 @@ namespace UnityCliConnector.Tools
                 var property = type.GetProperty(name, BindingFlags.Public | BindingFlags.Instance);
                 if (property != null && property.CanRead && property.GetIndexParameters().Length == 0)
                 {
-                    try { result[name] = SerializeValue(property.GetValue(obj, null), depth + 1, path); }
+                    try { result[name] = SerializeValue(property.GetValue(obj, null), depth + 1, context); }
                     catch (Exception ex) { result[name] = ErrorText(ex); }
                     continue;
                 }
 
                 var field = type.GetField(name, BindingFlags.Public | BindingFlags.Instance);
                 if (field == null) continue;
-                try { result[name] = SerializeValue(field.GetValue(obj), depth + 1, path); }
+                try { result[name] = SerializeValue(field.GetValue(obj), depth + 1, context); }
                 catch (Exception ex) { result[name] = ErrorText(ex); }
             }
-            return result.Count > 0 ? (object)result : SafeToString(obj);
+            return result.Count > 0 ? (object)result : FallbackToToString(obj, context);
         }
 
-        private static object SerializeMembers(object obj, Type type, int depth, HashSet<object> path)
+        private static object SerializeMembers(object obj, Type type, int depth, SerializeContext context)
         {
             var result = new Dictionary<string, object>();
             var count = 0;
@@ -586,7 +749,7 @@ namespace UnityCliConnector.Tools
                 if (result.ContainsKey(property.Name)) continue;
 
                 count++;
-                try { result[property.Name] = SerializeValue(property.GetValue(obj, null), depth + 1, path); }
+                try { result[property.Name] = SerializeValue(property.GetValue(obj, null), depth + 1, context); }
                 catch (Exception ex) { result[property.Name] = ErrorText(ex); }
             }
 
@@ -598,13 +761,13 @@ namespace UnityCliConnector.Tools
                     if (field.IsStatic || result.ContainsKey(field.Name)) continue;
 
                     count++;
-                    try { result[field.Name] = SerializeValue(field.GetValue(obj), depth + 1, path); }
+                    try { result[field.Name] = SerializeValue(field.GetValue(obj), depth + 1, context); }
                     catch (Exception ex) { result[field.Name] = ErrorText(ex); }
                 }
             }
 
             if (truncated) result[TruncatedMarker] = TruncatedMarker;
-            return result.Count > 0 ? (object)result : SafeToString(obj);
+            return result.Count > 0 ? (object)result : FallbackToToString(obj, context);
         }
 
         /// <summary>

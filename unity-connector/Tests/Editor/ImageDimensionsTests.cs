@@ -57,6 +57,22 @@ namespace UnityCliConnector.Tests
             }
         }
 
+        [Test]
+        public void IsCompletePng_TrueOnlyWhenTheFileEndsWithIend()
+        {
+            // A capture still being written has the header and no IEND, wherever it stopped.
+            var complete = CompletePng(64, 64);
+            Assert.IsTrue(ImageDimensions.IsCompletePng(Write("complete", complete)));
+            Assert.IsFalse(ImageDimensions.IsCompletePng(Write("header-only", PngHeader(64, 64))));
+            Assert.IsFalse(ImageDimensions.IsCompletePng(Write("short-trailer", complete, complete.Length - 1)));
+
+            var badCrc = CompletePng(64, 64);
+            badCrc[badCrc.Length - 1] ^= 0xFF;
+            Assert.IsFalse(ImageDimensions.IsCompletePng(Write("bad-crc", badCrc)));
+
+            Assert.IsFalse(ImageDimensions.IsCompletePng(Path.Combine(Path.GetTempPath(), "no-such-file.png")));
+        }
+
         static byte[] PngHeader(int width, int height)
         {
             var bytes = new byte[24];
@@ -66,6 +82,15 @@ namespace UnityCliConnector.Tests
             bytes[12] = (byte)'I'; bytes[13] = (byte)'H'; bytes[14] = (byte)'D'; bytes[15] = (byte)'R';
             WriteBigEndian(bytes, 16, width);
             WriteBigEndian(bytes, 20, height);
+            return bytes;
+        }
+
+        static byte[] CompletePng(int width, int height)
+        {
+            var bytes = new byte[36];
+            System.Array.Copy(PngHeader(width, height), bytes, 24);
+            bytes[28] = (byte)'I'; bytes[29] = (byte)'E'; bytes[30] = (byte)'N'; bytes[31] = (byte)'D';
+            bytes[32] = 0xAE; bytes[33] = 0x42; bytes[34] = 0x60; bytes[35] = 0x82;
             return bytes;
         }
 

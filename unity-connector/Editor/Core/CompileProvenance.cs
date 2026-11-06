@@ -46,6 +46,8 @@ namespace UnityCliConnector
             public long previous_finished_at_ms;
             public List<string> rebuilt = new();
             public bool rebuilt_truncated;
+            // Persisted because the reload that reads it wipes the statics that could hold it.
+            public bool reload_expected;
         }
 
         internal sealed class SourceScan
@@ -65,8 +67,6 @@ namespace UnityCliConnector
         {
             Load();
         }
-
-        // ─── Compilation pipeline feed (called by CompilationGate) ─────────
 
         internal static void NoteCompileStarted()
         {
@@ -92,7 +92,11 @@ namespace UnityCliConnector
         /// that call re-stamps the finish time of the compile that already updated the record —
         /// keeping this clock in step with CompilationGate.LastCompileFinishedAt, which the CLI
         /// polls from the heartbeat.</param>
-        internal static void NoteCompileFinished(bool afterReload)
+        /// <param name="willReload">true when this finish came from a compile that succeeded and
+        /// will therefore be followed by a domain reload. A reload without that flag was not a
+        /// compile's (for example one triggered by a package resolve), and moving the clock for it
+        /// would make sources written since the last real compile look covered.</param>
+        internal static void NoteCompileFinished(bool afterReload, bool willReload = false)
         {
             var now = NowMs();
             if (!afterReload || s_Record.finished_at_ms == 0)
@@ -101,13 +105,17 @@ namespace UnityCliConnector
                 s_Record.started_at_ms = s_PendingStartedMs;
                 s_Record.rebuilt = new List<string>(s_RebuiltNames);
                 s_Record.rebuilt_truncated = s_RebuiltTruncated;
+                s_Record.finished_at_ms = now;
             }
-            s_Record.finished_at_ms = now;
+            else if (s_Record.reload_expected)
+            {
+                s_Record.finished_at_ms = now;
+            }
+
+            s_Record.reload_expected = !afterReload && willReload;
             s_PendingStartedMs = 0;
             Save();
         }
-
-        // ─── Payload ──────────────────────────────────────────────────────
 
         /// The object every compile-related result carries: compile_status returns it flat, and
         /// compile_diagnostics nests it under "provenance". The Go CLI prints provenance_line and
@@ -128,12 +136,37 @@ namespace UnityCliConnector
         /// how old the compile behind an answer is (the compile gate's error message).
         public static string DescribeLastCompile() => FormatProvenanceLine(s_Record, null, NowMs());
 
+        /// When the last script compilation finished, or 0 when none has been recorded. The
+        /// heartbeat's compile clock reads this when CompilationGate's own clock is missing, so the two
+        /// records cannot disagree about whether this editor can prove a compile happened.
+        internal static long LastCompileFinishedAtMs() => s_Record.finished_at_ms;
+
+        /// Records the compile RefreshUnity skipped because every assembly was already current: the
+        /// clocks move (the CLI waits for that), nothing was rebuilt, and every source became an input
+        /// the compile could read — which is what the caller verified before skipping.
+        internal static void NoteNothingToCompile(long nowMs)
+        {
+            s_Record.previous_finished_at_ms = s_Record.finished_at_ms;
+            s_Record.started_at_ms = nowMs;
+            s_Record.rebuilt = new List<string>();
+            s_Record.rebuilt_truncated = false;
+            s_Record.finished_at_ms = nowMs;
+            s_Record.reload_expected = false;
+            s_PendingStartedMs = 0;
+            Save();
+        }
+
         /// When the last observed script compilation started, or its finish if this domain never saw
         /// its start. Sources written before that moment were inputs that compile could read, which is
         /// what lets AssemblyStaleness tell "the edit was never compiled" from "the compile read the
         /// edit and kept the old DLL".
         internal static long LastCompileStartedAtMs() =>
             s_Record.started_at_ms > 0 ? s_Record.started_at_ms : s_Record.finished_at_ms;
+
+        /// True when LastCompileStartedAtMs had to fall back to the finish clock, so a message naming
+        /// it must not claim that time is a start.
+        internal static bool LastCompileClockFromFinish() =>
+            s_Record.started_at_ms <= 0 && s_Record.finished_at_ms > 0;
 
         internal static object BuildPayloadFrom(Record record, SourceScan scan, long nowMs,
             AssemblyStaleness.ScanResult assemblies = null)
@@ -247,10 +280,8 @@ namespace UnityCliConnector
             return ms / 60_000 + " min";
         }
 
-        // ─── Source tree scan ─────────────────────────────────────────────
-
         /// Counts .cs files written since the previous compile finished, and lists sources (.cs,
-        /// .asmdef, .asmref) written after the reported compile finished. Runs on the calling thread
+        /// .asmdef, .asmref, .rsp) written after the reported compile finished. Runs on the calling thread
         /// with a wall-clock budget; the counts stay a lower bound when it runs out.
         internal static SourceScan ScanSourceTree(int budgetMs)
         {
@@ -294,12 +325,14 @@ namespace UnityCliConnector
 
                     var ext = info.Extension.ToLowerInvariant();
                     var isSource = ext == ".cs";
-                    var isAssemblyDef = ext == ".asmdef" || ext == ".asmref";
+                    var isAssemblyDef = ext == ".asmdef" || ext == ".asmref" || ext == ".rsp";
                     if (!isSource && !isAssemblyDef) continue;
 
                     scan.scanned_files++;
                     var wroteMs = new DateTimeOffset(info.LastWriteTimeUtc).ToUnixTimeMilliseconds();
-                    if (isSource && scan.have_previous && wroteMs > previousMs) scan.changed_since_previous++;
+                    if (isSource && scan.have_previous && wroteMs > previousMs &&
+                        (finishedMs <= 0 || wroteMs <= finishedMs))
+                        scan.changed_since_previous++;
                     if (finishedMs <= 0 || wroteMs <= finishedMs) continue;
 
                     scan.stale_count++;
@@ -352,10 +385,7 @@ namespace UnityCliConnector
             roots.Add(path);
         }
 
-        static string ProjectRoot()
-        {
-            return Application.dataPath.Replace("/Assets", "");
-        }
+        static string ProjectRoot() => Heartbeat.ProjectRootFromDataPath(Application.dataPath);
 
         static string DisplayPath(string path, string projectRoot)
         {
@@ -367,8 +397,6 @@ namespace UnityCliConnector
         }
 
         static long NowMs() => DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
-
-        // ─── Persistence across the domain reload a compile ends with ─────
 
         static void Save()
         {
@@ -395,8 +423,6 @@ namespace UnityCliConnector
                 s_Record = new Record();
             }
         }
-
-        // ─── Testing hooks ────────────────────────────────────────────────
 
         internal static Record SnapshotForTests() => s_Record;
 

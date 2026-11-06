@@ -20,6 +20,8 @@ namespace UnityCliConnector.Tests
     [TestFixture]
     public class BuildJobTests
     {
+        const string TempSceneFolder = "Assets/TempBuildJobTests";
+
         static BuildJobRecord Job(string phase) => new()
         {
             id = "build-20240101-000000-abc123",
@@ -214,11 +216,11 @@ namespace UnityCliConnector.Tests
         public void TryCreate_ResolvesAProjectRelativeOutput()
         {
             var projectRoot = Path.GetDirectoryName(Application.dataPath);
-            Assume.That(ExistingAssetPath(), Is.Not.Null, "this project needs at least one asset on disk");
+            var scene = CreateTempScene();
 
             var ok = BuildJobRequest.TryCreate(
                 Params(("target", "StandaloneOSX"), ("output", "Temp/CliBuild/App.app"),
-                    ("scenes", ExistingAssetPath())), out var job, out var error);
+                    ("scenes", scene)), out var job, out var error);
 
             Assert.IsTrue(ok, error ?? "accepted");
             Assert.AreEqual(Path.Combine(projectRoot, "Temp", "CliBuild", "App.app").Replace('\\', '/'),
@@ -246,13 +248,31 @@ namespace UnityCliConnector.Tests
         }
 
         [Test]
-        public void TryValidateScenes_AcceptsAnAssetThatIsOnDisk()
+        public void TryValidateScenes_AcceptsASceneThatIsOnDisk()
         {
-            Assume.That(ExistingAssetPath(), Is.Not.Null, "this project needs at least one asset on disk");
+            var scene = CreateTempScene();
+
+            var ok = BuildJobRequest.TryValidateScenes(new[] { scene }, "param", out var error);
+
+            Assert.IsTrue(ok, error ?? "accepted");
+        }
+
+        [Test]
+        public void TryValidateScenes_RejectsAnAssetThatIsNotAScene()
+        {
+            // Any asset path passed here would only fail inside BuildPlayer, minutes later.
+            Assume.That(ExistingAssetPath(), Is.Not.Null, "this project needs at least one non-scene asset");
 
             var ok = BuildJobRequest.TryValidateScenes(new[] { ExistingAssetPath() }, "param", out var error);
 
-            Assert.IsTrue(ok, error ?? "accepted");
+            Assert.IsFalse(ok, "a build profile is not a scene");
+            Assert.That(error, Does.Contain("Scene not found"));
+        }
+
+        [TearDown]
+        public void DeleteTempScenes()
+        {
+            if (AssetDatabase.IsValidFolder(TempSceneFolder)) AssetDatabase.DeleteAsset(TempSceneFolder);
         }
 
         [Test]
@@ -283,7 +303,31 @@ namespace UnityCliConnector.Tests
             Assert.AreEqual(Array.Empty<string>(), BuildJobRequest.ReadScenes(null));
         }
 
-        /// <summary>Any asset whose file is really on disk; the validator checks paths, not scene-ness.</summary>
+        // Written by hand because EditorSceneManager.NewScene(Additive) refuses while the editor's
+        // untitled startup scene is unsaved, and this project ships no scenes to copy.
+        const string MinimalScene = @"%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!29 &1
+OcclusionCullingSettings:
+  m_ObjectHideFlags: 0
+  serializedVersion: 2
+  m_OcclusionBakeSettings:
+    smallestOccluder: 5
+    smallestHole: 0.25
+    backfaceThreshold: 100
+  m_SceneGUID: 00000000000000000000000000000000
+  m_OcclusionCullingData: {fileID: 0}
+";
+        static string CreateTempScene()
+        {
+            if (!AssetDatabase.IsValidFolder(TempSceneFolder)) AssetDatabase.CreateFolder("Assets", "TempBuildJobTests");
+            var path = TempSceneFolder + "/ValidationScene.unity";
+            File.WriteAllText(Path.Combine(Path.GetDirectoryName(Application.dataPath), path), MinimalScene);
+            AssetDatabase.ImportAsset(path);
+            return path;
+        }
+
+        /// <summary>Any non-scene asset whose file is really on disk.</summary>
         static string ExistingAssetPath()
         {
             foreach (var guid in AssetDatabase.FindAssets("t:BuildProfile"))

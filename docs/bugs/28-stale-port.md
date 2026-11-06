@@ -320,3 +320,33 @@ directly. The refresh itself reported `compile_succeeded: true`, `stale_after_co
 
 C# check: `verify --assembly UnityCliConnector.Tests.Editor` — compile ok, 331/332 tests passed (the
 skipped one is the opt-in real-dialog modal test).
+
+## Review follow-up
+
+- **PlayMode polling follows the run's port.** `run_tests` now reaches the editor through the
+  per-send resolver, but the results poll still used the port resolved before the send. The
+  connector stamps both the reply and the results file with `HttpServer.Port`, so `testCmd` reads
+  the port from the `running` reply (`testResultsPort`) and polls that; connectors that predate the
+  field fall back to the old port. A compile or reload between resolve and send no longer turns a
+  finished run into a ten-minute timeout.
+- **`console` and `modal` are no longer in `retrySafeCommands`.** The list is keyed by command, but
+  both tools carry mutating actions (`console --clear`, `modal --action answer`), so a resend after
+  an EOF could clear the log or click a second dialog. They now get the same "may have run" report
+  as `exec`. The dead keys `status`, `tools` and `tool_describe` (never connector command names) are
+  gone; the read-only `api` and `burst_status` are added. `profiler` stays out because
+  `enable`/`disable`/`clear` mutate.
+- **Retry targets the same project exactly, not by substring.** `ReconnectInstance` now compares
+  normalized full paths (`sameProject`) instead of reusing `projectMatches` (the `--project`
+  substring selector). `/work/Game2` no longer counts as `/work/Game` when picking the editor to
+  retry against.
+- The safe-command tests now use `list`/`compile_status` and a connection that is actually dropped,
+  so they exercise the EOF + safe-list path rather than a refused dial; a new test covers the
+  `console`/`modal` exclusion and a sibling-project `ReconnectInstance` test covers the exact match.
+
+- The retry target now comes from the same newest-record helper as `NewestHeartbeat`
+  (`newestMatching` over the prune-free instance list); the untestable pid tie-break is gone, and
+  both the newer-beat and unchanged-timestamp branches have tests.
+- An explicit `--port` pins the target: if the heartbeat moved to another port, the CLI reports the
+  original failure instead of silently retrying against an instance the caller did not select.
+- When the retry itself fails, the error keeps the first failure reachable, so the original reload
+  diagnosis is not replaced by a bare second refusal.

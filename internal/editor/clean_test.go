@@ -154,30 +154,3 @@ func TestCleanProject_RefusesTargetThatIsAFile(t *testing.T) {
 		t.Errorf("Library file must be left alone: %v", err)
 	}
 }
-
-func TestLockfileHeld(t *testing.T) {
-	root := makeProject(t)
-
-	held, err := LockfileHeld(root)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if !held {
-		t.Fatal("expected lockfile to be reported as held")
-	}
-
-	if err := os.Remove(filepath.Join(root, "Temp", "UnityLockfile")); err != nil {
-		t.Fatalf("failed to remove lockfile: %v", err)
-	}
-	held, err = LockfileHeld(root)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if held {
-		t.Fatal("expected lockfile to be reported as absent")
-	}
-
-	if _, err := LockfileHeld(""); err == nil {
-		t.Fatal("expected error for empty project path")
-	}
-}

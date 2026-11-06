@@ -63,10 +63,12 @@ namespace UnityCliConnector.Tests
         private int _savedConsoleFlags;
         private string _savedFilteringText;
         private bool _savedConsoleFilter;
+        private bool _savedIgnoreFailingMessages;
 
         [SetUp]
         public void SaveConsoleWindowFilter()
         {
+            _savedIgnoreFailingMessages = LogAssert.ignoreFailingMessages;
             if (ConsoleFlagsProperty == null || GetFilteringTextMethod == null || SetFilteringTextMethod == null)
                 return;
             _savedConsoleFlags = (int)ConsoleFlagsProperty.GetValue(null);
@@ -77,6 +79,7 @@ namespace UnityCliConnector.Tests
         [TearDown]
         public void RestoreConsoleWindowFilter()
         {
+            LogAssert.ignoreFailingMessages = _savedIgnoreFailingMessages;
             if (!_savedConsoleFilter) return;
             ConsoleFlagsProperty.SetValue(null, _savedConsoleFlags);
             SetFilteringTextMethod.Invoke(null, new object[] { _savedFilteringText });
@@ -84,10 +87,10 @@ namespace UnityCliConnector.Tests
 
         // The test runner gives SetUp/TearDown their own LogScope, so a flag set in SetUp does not
         // reach the scope that records the test body's logs; each test sets it itself.
-        private static void IgnoreFailingLogs() => LogAssert.ignoreFailingMessages = true;
+        private void IgnoreFailingLogs() => LogAssert.ignoreFailingMessages = true;
 
         [Test]
-        public void Lines_LimitsToTheNewestEntriesAndCountsTheRest()
+        public void Lines_LimitsToTheNewestEntriesAndSaysTheTotalIsALowerBound()
         {
             IgnoreFailingLogs();
             LogMarker("lines", 3);
@@ -97,11 +100,56 @@ namespace UnityCliConnector.Tests
             // The one entry must be the last one logged, not the first: LogEntries is oldest-first.
             Assert.AreEqual($"{Marker}_lines 2", data["entries"][0].Value<string>());
             Assert.AreEqual(1, data["entries_returned"].Value<int>());
-            Assert.GreaterOrEqual(data["entries_total"].Value<int>(), 3);
-            Assert.GreaterOrEqual(data["entries_omitted"].Value<int>(), 2);
+            Assert.IsTrue(data["entries_total_is_lower_bound"].Value<bool>(),
+                "the scan stops at --lines, so older matches were neither read nor counted");
+            Assert.AreEqual(1, data["entries_total"].Value<int>());
             Assert.IsTrue(data["truncated"].Value<bool>());
             Assert.That(data["truncated_by"].Values<string>(), Does.Contain("lines"));
             Assert.AreEqual(1, data["limits"]["lines"].Value<int>());
+        }
+
+        [Test]
+        public void Lines_ReportsAnExactTotalWhenTheScanReachesTheOldestEntry()
+        {
+            IgnoreFailingLogs();
+            LogMarker("exact", 3);
+
+            var data = Run(new JObject { ["type"] = "error", ["lines"] = 500, ["stacktrace"] = "none" });
+
+            Assert.IsFalse(data["entries_total_is_lower_bound"].Value<bool>());
+            Assert.GreaterOrEqual(data["entries_total"].Value<int>(), 3,
+                "without an early stop the total counts every matching entry");
+        }
+
+        [Test]
+        public void FailedFilterRestore_IsReportedInsteadOfLeavingTheConsoleWidenedSilently()
+        {
+            IgnoreFailingLogs();
+            RequireConsoleFilterBindings();
+            SetConsoleWindowFilter(0, "");
+
+            var calls = 0;
+            ReadConsole.SetFlagsForTests = _ => ++calls == 1;
+            try
+            {
+                var response = ReadConsole.HandleCommand(new JObject
+                {
+                    ["type"] = "error",
+                    ["lines"] = 1,
+                    ["stacktrace"] = "none",
+                }) as SuccessResponse;
+
+                Assert.IsNotNull(response);
+                var data = JObject.FromObject(response.data);
+                Assert.IsNotNull(data["console_filter_restore_error"],
+                    "a restore that fails must not be swallowed: the user's Console stays widened");
+                StringAssert.Contains("could not be restored", data["console_filter_restore_error"].Value<string>());
+                StringAssert.Contains("could not be restored", response.message);
+            }
+            finally
+            {
+                ReadConsole.SetFlagsForTests = null;
+            }
         }
 
         [Test]
@@ -214,6 +262,57 @@ namespace UnityCliConnector.Tests
         }
 
         [Test]
+        public void EntryTypes_AreReportedPerEntryInAParallelArray()
+        {
+            // The entries used to be bare strings, so a `--type error,warning,log` listing gave no way
+            // to tell which line was the error an agent was looking for.
+            IgnoreFailingLogs();
+            const string marker = Marker + "_typed";
+            Debug.Log(marker + "_log");
+            Debug.LogWarning(marker + "_warn");
+            Debug.LogError(marker + "_err");
+
+            var data = Run(new JObject { ["type"] = "error,warning,log", ["lines"] = 200, ["stacktrace"] = "none" });
+            var entries = data["entries"].Values<string>().ToList();
+            var types = data["types"].Values<string>().ToList();
+
+            Assert.AreEqual(entries.Count, types.Count, "the types array is index-aligned with entries");
+            var index = entries.FindIndex(e => e == marker + "_warn");
+            Assert.GreaterOrEqual(index, 0);
+            Assert.AreEqual("warning", types[index]);
+            index = entries.FindIndex(e => e == marker + "_err");
+            Assert.GreaterOrEqual(index, 0);
+            Assert.AreEqual("error", types[index]);
+            index = entries.FindIndex(e => e == marker + "_log");
+            Assert.GreaterOrEqual(index, 0);
+            Assert.AreEqual("log", types[index]);
+        }
+
+        [Test]
+        public void UnknownType_IsRejectedInsteadOfReturningNothing()
+        {
+            var response = ReadConsole.HandleCommand(new JObject { ["type"] = "bogus" }) as ErrorResponse;
+
+            Assert.IsNotNull(response, "a bad --type must not answer an empty list as if it were valid");
+            StringAssert.Contains("bogus", response.message);
+            var data = JObject.FromObject(response.data);
+            CollectionAssert.Contains(data["unknown_types"].ToObject<string[]>(), "bogus");
+            var known = data["known_types"].ToObject<string[]>();
+            CollectionAssert.Contains(known, "error");
+            CollectionAssert.Contains(known, "warning");
+            CollectionAssert.Contains(known, "log");
+        }
+
+        [Test]
+        public void NegativeLines_IsRejected()
+        {
+            var response = ReadConsole.HandleCommand(new JObject { ["lines"] = -1 }) as ErrorResponse;
+
+            Assert.IsNotNull(response);
+            StringAssert.Contains("--lines", response.message);
+        }
+
+        [Test]
         public void UnknownStacktraceMode_IsRejected()
         {
             var response = ReadConsole.HandleCommand(new JObject { ["stacktrace"] = "short" }) as ErrorResponse;
@@ -294,6 +393,93 @@ namespace UnityCliConnector.Tests
 
             Assert.IsNull(data["console_window_filter"]);
             Assert.AreEqual(visibleFlags, (int)ConsoleFlagsProperty.GetValue(null));
+        }
+
+        [Test]
+        public void StacktraceNone_StillCapsALongFirstLine()
+        {
+            IgnoreFailingLogs();
+            const string marker = Marker + "_none_long";
+            string entry = marker + new string('x', 4000);
+            Debug.LogError(entry);
+
+            string text = FindEntry(marker, new JObject
+            {
+                ["type"] = "error",
+                ["stacktrace"] = "none",
+                ["entry_chars"] = 120,
+            });
+
+            Assert.LessOrEqual(text.Length, 120);
+            StringAssert.Contains("characters omitted", text);
+        }
+
+        [Test]
+        public void MaxBytes_CountsUtf8BytesNotCharacters()
+        {
+            IgnoreFailingLogs();
+            string older = new string('가', 300);
+            string newer = new string('나', 300);
+            Debug.LogError(older);
+            Debug.LogError(newer);
+
+            var data = Run(new JObject
+            {
+                ["type"] = "error",
+                ["stacktrace"] = "none",
+                ["lines"] = 2,
+                ["entry_chars"] = 0,
+                ["max_bytes"] = 1000,
+            });
+
+            // 300 Hangul characters are 900 UTF-8 bytes; both entries would fit a 1000-char count.
+            Assert.AreEqual(1, data["entries_returned"].Value<int>());
+            Assert.AreEqual(newer, data["entries"][0].Value<string>());
+            Assert.That(data["truncated_by"].Values<string>(), Does.Contain("bytes"));
+        }
+
+        [Test]
+        public void MaxBytes_DoesNotExemptTheNewestEntry()
+        {
+            IgnoreFailingLogs();
+            const string marker = Marker + "_one_too_big";
+            Debug.LogError(marker + new string('x', 4000));
+
+            var data = Run(new JObject
+            {
+                ["type"] = "error",
+                ["stacktrace"] = "none",
+                ["lines"] = 1,
+                ["entry_chars"] = 0,
+                ["max_bytes"] = 500,
+            });
+
+            Assert.AreEqual(0, data["entries_returned"].Value<int>());
+            Assert.IsTrue(data["truncated"].Value<bool>());
+            Assert.That(data["truncated_by"].Values<string>(), Does.Contain("bytes"));
+        }
+
+        [Test]
+        public void UnavailableConsoleFilter_IsReported()
+        {
+            IgnoreFailingLogs();
+            var field = typeof(ReadConsole).GetField("_consoleFlagsProperty", StaticAny);
+            Assert.IsNotNull(field, "ReadConsole.consoleFlags binding field is missing");
+            var saved = field.GetValue(null);
+            try
+            {
+                field.SetValue(null, null);
+                var data = Run(new JObject { ["type"] = "error", ["lines"] = 1, ["stacktrace"] = "none" });
+
+                var reported = data["console_window_filter"];
+                Assert.IsNotNull(reported, "the reply should say the window filter could not be checked");
+                Assert.IsFalse(reported["available"].Value<bool>());
+                StringAssert.Contains("unavailable", reported["note"].Value<string>());
+            }
+            finally
+            {
+                field.SetValue(null, saved);
+            }
         }
 
         private static void RequireConsoleFilterBindings()

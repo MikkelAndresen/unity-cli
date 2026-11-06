@@ -15,7 +15,9 @@ var ErrEditorModal = errors.New("unity editor is blocked by a modal dialog")
 const (
 	defaultPollInterval = 100 * time.Millisecond
 	// A running editor rewrites its heartbeat every 0.5s, so a multi-second
-	// freeze means it is gone (or hung) even when its PID is not visible.
+	// freeze means it is gone (or hung). On the host a live PID vetoes the stale
+	// signal; in a container the host PID always looks dead, so the freeze is the
+	// only signal available.
 	defaultStaleAfter = 3 * time.Second
 )
 
@@ -44,9 +46,11 @@ type WaitForExitOptions struct {
 //   - the PID is confirmed dead and no project heartbeat is configured (a
 //     container sees the host editor's PID as ESRCH even while it is alive);
 //   - the project heartbeat reports state "stopped" (graceful quit);
-//   - the heartbeat timestamp has not advanced for StaleAfter. This is the
-//     fallback for containers where the host editor's PID is invisible and a
-//     hard kill leaves a stale "ready" heartbeat behind.
+//   - the heartbeat timestamp has not advanced for StaleAfter and the PID is
+//     not confirmed alive. This is the fallback for containers where the host
+//     editor's PID is invisible and a hard kill leaves a stale "ready"
+//     heartbeat behind. On the host, a live PID means a frozen heartbeat is a
+//     hung or still-shutting-down editor, not an exit.
 //
 // The two heartbeat signals are only trusted when the heartbeat's PID matches
 // opts.PID, or when opts.PID is 0 (unknown). A heartbeat belonging to another
@@ -97,7 +101,7 @@ func WaitForExit(opts WaitForExitOptions) error {
 					haveTimestamp = true
 					lastTimestamp = inst.Timestamp
 					lastAdvance = now
-				} else if now.Sub(lastAdvance) >= staleAfter {
+				} else if now.Sub(lastAdvance) >= staleAfter && (opts.PID <= 0 || !processAlive(opts.PID)) {
 					return nil
 				}
 			}

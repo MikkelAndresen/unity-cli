@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 	"os"
@@ -218,7 +219,7 @@ func TestWaitForAlive_FollowsResolverPortChange(t *testing.T) {
 		}, nil
 	}
 
-	inst, err := waitForAlive(resolve, 100)
+	inst, err := waitForAliveContext(context.Background(), resolve, 100)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -252,7 +253,7 @@ func TestWaitForAlive_DoesNotReturnWhileTheConnectorIsStarting(t *testing.T) {
 		}, nil
 	}
 
-	inst, err := waitForAlive(resolve, 200)
+	inst, err := waitForAliveContext(context.Background(), resolve, 200)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -272,7 +273,7 @@ func TestWaitForCompile_ReadyHeartbeatIsNotEvidence(t *testing.T) {
 		return &client.Instance{State: "ready", CompileFinishedAt: 1_000}, nil
 	}
 
-	out, err := waitForCompileTo(resolve, io.Discard, "editor refresh --compile", compileBaseline{FinishedAt: 1_000})
+	out, err := waitForCompileTo(context.Background(), resolve, io.Discard, "editor refresh --compile", compileBaseline{FinishedAt: 1_000})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -288,7 +289,7 @@ func TestWaitForCompile_ClockAdvanceAfterRequestIsEvidence(t *testing.T) {
 		return &client.Instance{State: "ready", CompileFinishedAt: 1_001, CompileErrors: true}, nil
 	}
 
-	out, err := waitForCompileTo(resolve, io.Discard, "editor refresh --compile", compileBaseline{FinishedAt: 1_000})
+	out, err := waitForCompileTo(context.Background(), resolve, io.Discard, "editor refresh --compile", compileBaseline{FinishedAt: 1_000})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -300,14 +301,28 @@ func TestWaitForCompile_ClockAdvanceAfterRequestIsEvidence(t *testing.T) {
 func TestWaitForCompile_KeepsWaitingWhileCompiling(t *testing.T) {
 	compileTestBudgets(t)
 	resolve := func() (*client.Instance, error) {
-		return &client.Instance{State: "compiling", CompileFinishedAt: 1_000}, nil
+		return &client.Instance{State: "compiling", CompileFinishedAt: 1_000, CompileErrors: true}, nil
 	}
 
-	out, err := waitForCompileTo(resolve, io.Discard, "editor refresh --compile", compileBaseline{FinishedAt: 1_000})
+	out, err := waitForCompileTo(context.Background(), resolve, io.Discard, "editor refresh --compile", compileBaseline{FinishedAt: 1_000})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if !out.TimedOut || out.NothingToCompile {
-		t.Errorf("outcome = %+v, want a timeout while the editor never left 'compiling'", out)
+	if !out.TimedOut || out.NothingToCompile || !out.HasErrors {
+		t.Errorf("outcome = %+v, want a timeout that keeps the last seen compile state", out)
+	}
+}
+
+func TestStartingNote_NamesAgeAndFlagsLongStartups(t *testing.T) {
+	short := startingNote(&client.Instance{State: "starting", StartingSince: 1, Timestamp: 1 + 90_000})
+	if !strings.Contains(short, "starting for 1m30s") || strings.Contains(short, "wedged") {
+		t.Errorf("short startup note: %s", short)
+	}
+	long := startingNote(&client.Instance{State: "starting", StartingSince: 1, Timestamp: 1 + int64(longStartup/time.Millisecond) + 1000})
+	if !strings.Contains(long, "wedged") {
+		t.Errorf("long startup should say how to tell an import from a wedge: %s", long)
+	}
+	if old := startingNote(&client.Instance{State: "starting", Timestamp: 5}); strings.Contains(old, "starting for") {
+		t.Errorf("a connector without startingSince has no age to print: %s", old)
 	}
 }

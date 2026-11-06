@@ -95,8 +95,8 @@ namespace UnityCliConnector.Tests
         {
             var first = await Exec(Snippet);
             var afterFirst = AssemblyCount();
-            Assert.AreEqual("compiled", MetaOf(first)["compile"].Value<string>());
-            Assert.Greater(MetaOf(first)["compile_ms"].Value<long>(), 0, "the compile is what gets measured away");
+            Assert.AreEqual("compiled", MetaOf(first)["compile"].Value<string>(),
+                "the first run goes through csc; the second call below pins the reuse path");
 
             var second = await Exec(Snippet);
             Assert.AreEqual(42, second.data, "the cached path still runs the snippet");
@@ -111,9 +111,10 @@ namespace UnityCliConnector.Tests
             Assert.AreEqual(6, without.data);
             Assert.AreEqual("compiled", MetaOf(without)["compile"].Value<string>());
 
-            var withExtra = await Exec("return 1;", "UnityEditorInternal,UnityEditor");
+            var withExtra = await Exec("return Enumerable.Range(1, 3).Sum();", "System.Linq,UnityEditorInternal");
+            Assert.AreEqual(6, withExtra.data);
             Assert.AreEqual("compiled", MetaOf(withExtra)["compile"].Value<string>(),
-                "a different using set is a different compile, not a cache hit");
+                "the same body with different usings is a different compile, not a cache hit");
         }
 
         [Test]

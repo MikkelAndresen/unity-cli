@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
 	"os"
 	"strings"
 	"time"
@@ -40,6 +39,9 @@ func editorCmd(ctx context.Context, args []string, send sendFn, resolve instance
 		return send("manage_editor", map[string]interface{}{"action": "pause"})
 
 	case "refresh":
+		if err := rejectIncompleteFlags("editor refresh", flags); err != nil {
+			return nil, err
+		}
 		_, force := flags["force"]
 		_, keepConsole := flags["keep-console"]
 		params := map[string]interface{}{}
@@ -53,7 +55,7 @@ func editorCmd(ctx context.Context, args []string, send sendFn, resolve instance
 				return nil, err
 			}
 			params["compile"] = mode
-			return editorRefreshCompile(send, resolve, params, keepConsole, os.Stderr)
+			return editorRefreshCompile(ctx, send, resolve, params, keepConsole, os.Stderr)
 		}
 		return send("refresh_unity", params)
 
@@ -80,13 +82,7 @@ func refreshCompileMode(raw string) (string, error) {
 // editorRefreshCompile requests a refresh plus script compilation, waits for the compile to
 // finish, and answers with one report that says what the compile did. It returns the report even
 // when the compile failed or timed out, so the JSON is printed before the non-zero exit.
-func editorRefreshCompile(send sendFn, resolve instanceResolver, params map[string]interface{}, keepConsole bool, logw io.Writer) (*client.CommandResponse, error) {
-	// The connector closes its connection across the domain reload the compile triggers, which Go's
-	// HTTP client logs as an "Unsolicited response" line — noise next to the report. Same as verify.
-	original := log.Writer()
-	log.SetOutput(&suppressWriter{w: original, suppress: "Unsolicited response received on idle HTTP channel"})
-	defer log.SetOutput(original)
-
+func editorRefreshCompile(ctx context.Context, send sendFn, resolve instanceResolver, params map[string]interface{}, keepConsole bool, logw io.Writer) (*client.CommandResponse, error) {
 	// A Burst error stays in the console after its code changes, so a stale one would be reported
 	// as this compile's failure; clear it first and let the compile log a live one. Same as verify,
 	// including the --keep-console opt-out.
@@ -103,37 +99,43 @@ func editorRefreshCompile(send sendFn, resolve instanceResolver, params map[stri
 	if !resp.Success {
 		return resp, nil
 	}
+	// An older connector only compiles when compile == "request", so it would answer a clean request
+	// with a refresh that rebuilt nothing (and the report would say "nothing to compile"). The reply
+	// advertises whether the mode exists; without that flag, refuse instead of pretending.
+	if mode, _ := params["compile"].(string); mode == "clean" && !reportFieldBool(resp.Data, "clean_compile_supported") {
+		resp.Success = false
+		resp.Message = `this connector does not support "editor refresh --compile clean"; update the com.youngwoocho02.unity-cli-connector package in Unity, or use --compile`
+		return resp, fmt.Errorf("%s", resp.Message)
+	}
 
 	// The reply carries the connector's own compile clock at request time, which is the only
 	// race-free baseline. The heartbeat fills it in for connectors that do not echo it, and gives
 	// the process id used to notice an editor restart while waiting.
 	baseline := compileBaseline{}
-	trackedReply := false
 	if v, ok := reportFieldInt(resp.Data, "compile_finished_at"); ok {
-		baseline.FinishedAt, trackedReply = v, true
+		baseline.FinishedAt, baseline.Tracked = v, true
 	}
 	if current, rerr := resolve(); rerr == nil && current != nil {
-		if !trackedReply {
+		if !baseline.Tracked {
 			baseline.FinishedAt = current.CompileFinishedAt
 		}
 		baseline.PID = current.PID
 	}
 
-	outcome, err := waitForCompileTo(resolve, logw, "editor refresh --compile", baseline)
+	outcome, err := waitForCompileTo(ctx, resolve, logw, "editor refresh --compile", baseline)
 	if err != nil {
 		return nil, err
 	}
+	noteSkippedCompile(&outcome, resp.Data)
 
-	findings, err := compileReportDiagnostics(send, outcome.HasErrors)
-	if err != nil {
-		return nil, fmt.Errorf("compile: %w", err)
-	}
+	findings, diagErr := compileReportDiagnostics(send, outcome.HasErrors, compileDiagnosticsWait(outcome))
+	diagLabel := "compile"
 
 	// A compile can finish clean while a DLL is still older than its sources: Unity's Bee cache
 	// believed the assembly was unchanged. Ask once for a clean-cache rebuild, then report the
 	// result as-is; repeating it would only burn another full compile.
 	cleanRetry := false
-	if reportFieldBool(resp.Data, "clean_compile_supported") && staleAssemblies(findings) > 0 &&
+	if diagErr == nil && reportFieldBool(resp.Data, "clean_compile_supported") && staleAssemblies(findings) > 0 &&
 		!outcome.TimedOut && !outcome.HasErrors && findings.Total == 0 {
 		cleanRetry = true
 		retryParams := map[string]interface{}{}
@@ -151,24 +153,25 @@ func editorRefreshCompile(send sendFn, resolve instanceResolver, params map[stri
 		resp = retryResp
 		baseline = compileBaseline{}
 		if v, ok := reportFieldInt(resp.Data, "compile_finished_at"); ok {
-			baseline.FinishedAt = v
+			baseline.FinishedAt, baseline.Tracked = v, true
 		}
 		if current, rerr := resolve(); rerr == nil && current != nil {
 			baseline.PID = current.PID
 		}
-		outcome, err = waitForCompileTo(resolve, logw, "editor refresh --compile (clean retry)", baseline)
+		outcome, err = waitForCompileTo(ctx, resolve, logw, "editor refresh --compile (clean retry)", baseline)
 		if err != nil {
 			return nil, err
 		}
-		findings, err = compileReportDiagnostics(send, outcome.HasErrors)
-		if err != nil {
-			return nil, fmt.Errorf("clean retry: %w", err)
-		}
+		findings, diagErr = compileReportDiagnostics(send, outcome.HasErrors, compileDiagnosticsWait(outcome))
+		diagLabel = "clean retry"
 	}
 
 	total := findings.Total
-	succeeded := !outcome.TimedOut && !outcome.HasErrors && total == 0
+	succeeded := diagErr == nil && !outcome.TimedOut && !outcome.HasErrors && total == 0
 	notes := compileReportNotes(outcome, findings.Source, findings.Provenance)
+	if diagErr != nil {
+		notes = append(notes, "this compile's diagnostics could not be read: "+firstLine(diagErr.Error()))
+	}
 	if cleanRetry {
 		if staleAssemblies(findings) > 0 {
 			notes = append(notes, "assemblies were still stale after one CleanBuildCache rebuild; the DLLs on disk do not match the sources")
@@ -184,6 +187,9 @@ func editorRefreshCompile(send sendFn, resolve instanceResolver, params map[stri
 	case outcome.TimedOut:
 		resp.Message = fmt.Sprintf("Refresh done; compilation did not finish within %s.", compileWaitTimeout)
 		return resp, fmt.Errorf("compilation did not finish within %s (still compiling, or the connector never reported it)", compileWaitTimeout)
+	case diagErr != nil:
+		resp.Message = "Refresh done; this compile's diagnostics could not be read."
+		return resp, fmt.Errorf("%s: %w", diagLabel, diagErr)
 	case !succeeded:
 		if total > 0 {
 			resp.Message = fmt.Sprintf("Refresh done; compilation failed with %d error(s).", total)
@@ -220,6 +226,10 @@ type playModeReport struct {
 // the heartbeat is read back instead, and reaching the wanted state is what decides the exit code.
 func editorPlayModeCmd(ctx context.Context, action string, flags map[string]string, send sendFn,
 	resolve instanceResolver) (*client.CommandResponse, error) {
+
+	if err := rejectContradictoryFlags("editor "+action, flags); err != nil {
+		return nil, err
+	}
 
 	params := map[string]interface{}{"action": action}
 	if _, wait := flags["wait"]; wait {
@@ -315,16 +325,24 @@ func cappedBudget(ctx context.Context, budget time.Duration) time.Duration {
 
 // compileReportDiagnostics reads this compile's errors, retrying while the editor is still back
 // from the domain reload the compile triggered: its HTTP connection drops across the reload, so a
-// single failed call proves nothing.
-func compileReportDiagnostics(send sendFn, hasErrors bool) (compileFindings, error) {
+// single failed call proves nothing. wait bounds how long a still-compiling answer is polled; zero
+// reads once, because the compile wait itself already timed out.
+func compileReportDiagnostics(send sendFn, hasErrors bool, wait time.Duration) (compileFindings, error) {
 	deadline := time.Now().Add(30 * time.Second)
 	for {
-		findings, err := verifyDiagnostics(send, compileReportMaxDiags, hasErrors)
-		if err == nil || !isConnectionFailure(err) || time.Now().After(deadline) {
+		findings, err := verifyDiagnostics(send, compileReportMaxDiags, hasErrors, wait)
+		if err == nil || !isConnectionFailure(err) || wait <= 0 || time.Now().After(deadline) {
 			return findings, err
 		}
 		time.Sleep(statusPollInterval)
 	}
+}
+
+func compileDiagnosticsWait(outcome compileOutcome) time.Duration {
+	if outcome.TimedOut {
+		return 0
+	}
+	return verifyDiagnosticsWait
 }
 
 // isConnectionFailure reports an editor that was momentarily unreachable (mid-reload) rather than
@@ -339,8 +357,9 @@ func isConnectionFailure(err error) bool {
 		return false
 	}
 	msg := err.Error()
+	eof := msg == "EOF" || strings.HasSuffix(msg, ": EOF") || strings.Contains(msg, "unexpected EOF")
 	return strings.Contains(msg, "cannot connect to Unity") || strings.Contains(msg, "connection refused") ||
-		strings.Contains(msg, "EOF") || strings.Contains(msg, "connection reset")
+		eof || strings.Contains(msg, "connection reset")
 }
 
 // compileReportNotes explains any part of the result the numbers alone cannot: a compile that was
@@ -350,6 +369,8 @@ func compileReportNotes(outcome compileOutcome, diagSource string, prov *compile
 	switch {
 	case outcome.TimedOut:
 		notes = append(notes, fmt.Sprintf("compilation did not finish within %s; the reported errors are the state at timeout", compileWaitTimeout))
+	case outcome.SkipProven:
+		notes = append(notes, "nothing was out of date (sources, assembly definitions and DLLs match the last compile), so the connector skipped the compile; compile_succeeded is that compile's state")
 	case outcome.NothingToCompile:
 		notes = append(notes, "no script compilation was observed after the request; compile_succeeded is the editor's current compile state")
 	case outcome.Restarted:
@@ -423,6 +444,11 @@ func attachCompileReport(resp *client.CommandResponse, outcome compileOutcome, s
 				data["stale_line"] = findings.Provenance.StaleLine
 			}
 		}
+	}
+	// error_count is the untruncated total while errors[] stops at compileReportMaxDiags; say so,
+	// or a report with 40 errors and 20 lines reads as an incomplete list with no reason.
+	if findings.Total > len(findings.Diags) {
+		notes = append(notes, fmt.Sprintf("%d error(s) in total; errors[] lists the first %d", findings.Total, len(findings.Diags)))
 	}
 	if len(notes) > 0 {
 		data["notes"] = notes

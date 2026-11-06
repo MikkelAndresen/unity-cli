@@ -63,11 +63,16 @@ namespace UnityCliConnector.Tools
 
             var resolution = Resolve(query, assemblyFilter, maxTypes, scanBudget);
             if (resolution.types.Count == 0)
-                return new SuccessResponse($"Nothing named '{query}' is in the loaded assemblies.", new
+                return new SuccessResponse(resolution.note ?? $"Nothing named '{query}' is in the loaded assemblies.", new
                 {
                     query,
                     member = resolution.member,
                     matched_by = resolution.matchedBy,
+                    // No type matched: the caller asked for something that does not exist, which is an
+                    // answer the CLI reports as a failure rather than as a lookup result.
+                    exact = false,
+                    note = resolution.note,
+                    closest_types = resolution.closest,
                     matches = 0,
                     types = Array.Empty<object>(),
                     index = IndexPayload(stats),
@@ -78,13 +83,27 @@ namespace UnityCliConnector.Tools
                 .Where(d => d != null)
                 .ToList();
 
+            // A short type name often matches several types (UnityEngine.Vector3, System.Numerics.Vector3,
+            // an Odin shim). The member query is answered by the ones that declare it; the rest would
+            // otherwise turn an exact answer into "no member named".
+            if (!string.IsNullOrEmpty(resolution.member) && described.Any(d => d.memberExact))
+                described = described.Where(d => d.memberExact).ToList();
+
+            var memberExact = resolution.exact && described.All(d => d.memberExact);
+            var exact = resolution.exact && memberExact;
+            var note = exact ? null : MemberNote(query, resolution, described);
             var listedMembers = described.Sum(d => d.listed);
-            var summary = SummaryLine(query, described, resolution.member, resolution.matchedBy, listedMembers);
+            var summary = note ?? SummaryLine(query, described, resolution.member, resolution.matchedBy, listedMembers);
             return new SuccessResponse(summary, new
             {
                 query,
                 member = resolution.member,
                 matched_by = resolution.matchedBy,
+                // False marks a nearest-match answer: the members or types listed are suggestions, not
+                // what the query named, and a caller must not treat them as the API it asked for.
+                exact,
+                note,
+                closest_types = resolution.closest,
                 matches = described.Count,
                 summary,
                 types = described.Select(d => d.payload).ToList(),
@@ -92,13 +111,29 @@ namespace UnityCliConnector.Tools
             });
         }
 
+        /// The sentence for a fuzzy answer: which name did not exist, and what is closest. Built from
+        /// the described types' own fuzzy matches so the suggestion is the one actually listed.
+        private static string MemberNote(string query, Resolution resolution, List<DescribeResult> described)
+        {
+            if (!resolution.exact) return resolution.note ?? $"no exact match for '{query}'";
+
+            var owners = string.Join(", ", described.Select(d => d.name));
+            var closest = described.SelectMany(d => d.closestMembers)
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .Take(6)
+                .ToList();
+            var tail = closest.Count > 0 ? "; closest: " + string.Join(", ", closest) : "";
+            return $"no member named '{resolution.member}' on {owners}{tail}";
+        }
+
         /// <summary>Which types to describe, and whether a member filter applies: the exact type the
         /// query names, else the type left of the last dot with the member on the right, else the
         /// types declaring that member, else the closest types to the whole query.</summary>
         private static Resolution Resolve(string query, List<string> assemblyFilter, int maxTypes, Deadline scanBudget)
         {
-            var whole = InAssemblies(ApiIndex.FindTypes(query, maxTypes, 0), assemblyFilter);
-            if (whole.Count > 0) return new Resolution { types = whole, matchedBy = "type" };
+            var accept = AssemblyPredicate(assemblyFilter);
+            var whole = ApiIndex.FindTypes(query, maxTypes, 0, accept);
+            if (whole.Count > 0) return new Resolution { types = whole.ToList(), matchedBy = "type" };
 
             var lastDot = query.LastIndexOf('.');
             if (lastDot > 0)
@@ -107,10 +142,11 @@ namespace UnityCliConnector.Tools
                 var typeQuery = query.Substring(0, lastDot).Trim();
                 if (memberQuery.Length > 0)
                 {
-                    var owner = InAssemblies(ApiIndex.FindTypes(typeQuery, maxTypes, 0), assemblyFilter);
-                    if (owner.Count > 0) return new Resolution { types = owner, member = memberQuery, matchedBy = "type.member" };
+                    var owner = ApiIndex.FindTypes(typeQuery, maxTypes, 0, accept);
+                    if (owner.Count > 0)
+                        return new Resolution { types = owner.ToList(), member = memberQuery, matchedBy = "type.member" };
 
-                    var declaring = InAssemblies(ApiIndex.TypesWithMember(memberQuery, maxTypes, scanBudget), assemblyFilter);
+                    var declaring = ApiIndex.TypesWithMember(memberQuery, maxTypes, scanBudget, accept);
                     if (declaring.Count > 0)
                         return new Resolution { types = declaring, member = memberQuery, matchedBy = "member" };
                 }
@@ -118,40 +154,59 @@ namespace UnityCliConnector.Tools
             else if (query.Length > 2)
             {
                 // A bare name that is no type is most likely a member: "api GetSingletonBuffer".
-                var declaring = InAssemblies(ApiIndex.TypesWithMember(query, maxTypes, scanBudget), assemblyFilter);
+                var declaring = ApiIndex.TypesWithMember(query, maxTypes, scanBudget, accept);
                 if (declaring.Count > 0) return new Resolution { types = declaring, member = query, matchedBy = "member" };
             }
 
-            var closest = InAssemblies(ApiIndex.FindTypes(query, maxTypes), assemblyFilter);
-            return new Resolution { types = closest, matchedBy = "closest_types" };
+            // Nothing names this query: name the closest types as suggestions only. Describing them
+            // would present a list of unrelated types as if it were the answer.
+            var closest = ApiIndex.FindTypes(query, 3, int.MaxValue, accept)
+                .Select(ApiReflection.QualifiedName)
+                .ToList();
+            return new Resolution
+            {
+                matchedBy = "closest_types",
+                exact = false,
+                closest = closest,
+                note = $"no type or member named '{query}' in the loaded assemblies" +
+                       (closest.Count > 0 ? "; closest: " + string.Join(", ", closest) : ""),
+            };
         }
 
-        private static List<Type> InAssemblies(IReadOnlyList<Type> types, List<string> assemblyFilter)
-        {
-            if (assemblyFilter.Count == 0) return types.ToList();
-            return types.Where(t => AssemblyMatches(t.Assembly, assemblyFilter)).ToList();
-        }
+        private static Func<Type, bool> AssemblyPredicate(List<string> assemblyFilter) =>
+            assemblyFilter.Count == 0 ? null : t => AssemblyMatches(t.Assembly, assemblyFilter);
 
         private sealed class Resolution
         {
             public List<Type> types { get; set; } = new List<Type>();
             public string member { get; set; }
             public string matchedBy { get; set; }
+            // False when the answer is a nearest-match fallback rather than what the query named.
+            public bool exact = true;
+            // The closest names when the query resolved to nothing at all.
+            public List<string> closest = new List<string>();
+            public string note { get; set; }
         }
 
         private static DescribeResult Describe(Type type, string memberQuery, bool docs, int memberLimit)
         {
             var all = ApiIndex.PublicApi(type);
 
-            var matching = string.IsNullOrEmpty(memberQuery)
+            var exactMatches = string.IsNullOrEmpty(memberQuery)
                 ? all
                 : all.Where(m => NameMatches(m.Name, memberQuery)).ToList();
+            var memberExact = exactMatches.Count > 0;
             // A member filter that matches nothing is a typo worth answering, not an empty result.
-            if (string.IsNullOrEmpty(memberQuery) && matching.Count == 0) return null;
-            if (!string.IsNullOrEmpty(memberQuery) && matching.Count == 0)
+            if (string.IsNullOrEmpty(memberQuery) && exactMatches.Count == 0) return null;
+            var matching = exactMatches;
+            List<string> closestMembers = new();
+            if (!string.IsNullOrEmpty(memberQuery) && !memberExact)
+            {
                 matching = all.Where(m => ApiReflection.NameScore(m.Name, memberQuery) > 0)
                     .OrderByDescending(m => ApiReflection.NameScore(m.Name, memberQuery))
                     .ToList();
+                closestMembers = matching.Select(m => m.Name).Distinct(StringComparer.OrdinalIgnoreCase).Take(6).ToList();
+            }
             if (matching.Count == 0 && all.Count == 0) return null;
 
             var ordered = matching
@@ -190,6 +245,8 @@ namespace UnityCliConnector.Tools
                 kind = ApiReflection.TypeKind(type),
                 name = ApiReflection.QualifiedName(type),
                 assembly = type.Assembly.GetName().Name,
+                memberExact = memberExact,
+                closestMembers = closestMembers,
             };
         }
 
@@ -290,6 +347,8 @@ namespace UnityCliConnector.Tools
             public string kind { get; set; }
             public string name { get; set; }
             public string assembly { get; set; }
+            public bool memberExact { get; set; } = true;
+            public List<string> closestMembers { get; set; } = new List<string>();
         }
     }
 }

@@ -124,7 +124,7 @@ func TestWaitForExit_StaleHeartbeat(t *testing.T) {
 		PID:       4242,
 		Timestamp: 1000,
 	})
-	stubProcessAlive(t, true)
+	stubProcessAlive(t, false)
 
 	const staleAfter = 80 * time.Millisecond
 	start := time.Now()
@@ -144,6 +144,28 @@ func TestWaitForExit_StaleHeartbeat(t *testing.T) {
 	}
 	if elapsed > time.Second {
 		t.Fatalf("stale detection took too long: %s", elapsed)
+	}
+}
+
+func TestWaitForExit_StaleHeartbeatWithLivePIDKeepsWaiting(t *testing.T) {
+	setTestHome(t)
+	project := "/work/FoW"
+	writeHeartbeat(t, project, client.Instance{
+		State:     "ready",
+		PID:       4242,
+		Timestamp: 1000,
+	})
+	stubProcessAlive(t, true)
+
+	err := WaitForExit(WaitForExitOptions{
+		PID:          4242,
+		ProjectPath:  project,
+		Timeout:      120 * time.Millisecond,
+		PollInterval: 10 * time.Millisecond,
+		StaleAfter:   20 * time.Millisecond,
+	})
+	if err == nil || !strings.Contains(err.Error(), "timed out") {
+		t.Fatalf("a stale heartbeat with a live PID must not end the wait, got %v", err)
 	}
 }
 
@@ -184,7 +206,7 @@ func TestWaitForExit_AdvancingHeartbeatTimesOut(t *testing.T) {
 	var counter atomic.Int64
 	stubProcessAlive(t, true)
 	stubReadHeartbeat(t, func(string) (*client.Instance, error) {
-		return &client.Instance{State: "ready", Timestamp: counter.Add(1)}, nil
+		return &client.Instance{State: "ready", PID: 4242, Timestamp: counter.Add(1)}, nil
 	})
 
 	err := WaitForExit(WaitForExitOptions{
@@ -328,7 +350,7 @@ func TestWaitForExit_IgnoreModalWaitsForStaleHeartbeat(t *testing.T) {
 		PID:       4242,
 		Timestamp: 1000,
 	})
-	stubProcessAlive(t, true)
+	stubProcessAlive(t, false)
 
 	err := WaitForExit(WaitForExitOptions{
 		PID:          4242,

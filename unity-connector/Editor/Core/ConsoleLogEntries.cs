@@ -34,6 +34,13 @@ namespace UnityCliConnector
 		// What the console fallback treats as a compile-blocking error.
 		public const int CompileBlockingMask = ScriptCompileErrorMask | StickyErrorMask;
 
+		// StickyError is one bit for every failure the console pins there: a failed player build, a
+		// runtime error from an earlier play session, and the play-mode "compiler errors have to be
+		// fixed" banner. Only the last one is evidence that the project does not compile, and the
+		// mode word cannot tell them apart, so the message text decides.
+		private static readonly Regex CompileFailurePattern = new(
+			@"\bcompiler errors?\b", RegexOptions.Compiled | RegexOptions.IgnoreCase);
+
 		// Internal seam for unit tests: when set, bypasses reflection entirely and
 		// returns the supplied diagnostics. Production code must not set this.
 		internal static Func<bool, List<CompileDiag>> TestOverride;
@@ -61,11 +68,25 @@ namespace UnityCliConnector
 			var result = new List<CompileDiag>();
 			diagnostics = result;
 
-			return ReadConsole.TryForEachEntry((mode, message, file, line, timestamp) =>
+			return ReadConsole.TryForEachEntry((mode, message, file, line, timestamp, index) =>
 			{
-				if (TryConvertEntry(mode, message, file, line, includeWarnings, out var diag, timestamp))
+				if (TryConvertEntry(mode, message, file, line, includeWarnings, out var diag, timestamp, index))
 					result.Add(diag);
 			});
+		}
+
+		/// The console's ordinal range (oldest and newest globalLineIndex), or false when this Unity
+		/// version does not expose the field — and for a test that replaced the console with
+		/// <see cref="TestOverride"/>, whose entries carry whatever ordinals it seeded.
+		public static bool TryGetConsoleIndexRange(out int firstIndex, out int lastIndex)
+		{
+			if (TestOverride != null)
+			{
+				firstIndex = -1;
+				lastIndex = -1;
+				return false;
+			}
+			return ReadConsole.TryGetConsoleIndexRange(out firstIndex, out lastIndex);
 		}
 
 		/// Every in-memory console entry, unfiltered, with the full message including its stack
@@ -81,7 +102,7 @@ namespace UnityCliConnector
 		/// an empty message. Extracted so tests can exercise the mode-bit filtering
 		/// without faking out the LogEntries API.
 		internal static bool TryConvertEntry(int mode, string message, string file, int line,
-			bool includeWarnings, out CompileDiag diag, string timestamp = null)
+			bool includeWarnings, out CompileDiag diag, string timestamp = null, int consoleIndex = -1)
 		{
 			diag = default;
 			var isError = (mode & CompileBlockingMask) != 0;
@@ -90,8 +111,10 @@ namespace UnityCliConnector
 			if (string.IsNullOrEmpty(message)) return false;
 			diag = Parse(message, file, line, isError);
 			diag.Sticky = (mode & StickyErrorMask) != 0;
+			diag.StickyCompileFailure = diag.Sticky && CompileFailurePattern.IsMatch(diag.Message);
 			diag.TimeOfDaySeconds = ParseTimestampSeconds(timestamp);
 			diag.HasTimestamp = diag.TimeOfDaySeconds >= 0;
+			diag.ConsoleIndex = consoleIndex;
 			return true;
 		}
 
@@ -163,9 +186,16 @@ namespace UnityCliConnector
 			public string Hint;
 			/// <summary>Sticky console entry (build/runtime failure banner), not a compiler diagnostic.</summary>
 			public bool Sticky;
+			/// <summary>Sticky entry whose text says compilation is broken (the play-mode or build
+			/// "compiler errors" banner). The only sticky entries the gate may block on.</summary>
+			public bool StickyCompileFailure;
+			/// <summary>Console-wide ordinal of the entry (LogEntry.globalLineIndex); -1 is unknown.</summary>
+			public int ConsoleIndex;
 			/// <summary>Local time of day from LogEntries.GetEntryTimestampInternal; -1 is unknown.</summary>
 			public long TimeOfDaySeconds;
 			public bool HasTimestamp;
+
+			public bool HasConsoleIndex => ConsoleIndex >= 0;
 		}
 	}
 }

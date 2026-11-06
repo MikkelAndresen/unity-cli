@@ -26,24 +26,24 @@ func freePort(t *testing.T) int {
 
 // stubProcessTable replaces the OS process table for one test, the way isProcessDead is replaced.
 // A nil table means "this CLI cannot read one at all".
-func stubProcessTable(t *testing.T, table map[int]string) {
+func stubProcessTable(t *testing.T, table map[int]ProcessEntry) {
 	t.Helper()
-	orig := processTable
-	processTable = func() map[int]string { return table }
-	t.Cleanup(func() { processTable = orig })
+	orig := ProcessTable
+	ProcessTable = func() map[int]ProcessEntry { return table }
+	t.Cleanup(func() { ProcessTable = orig })
 }
 
 // containerTable is the process table an agent-sandbox container sees when the editor runs on another
 // machine: plenty of processes, none of them Unity, and the connector's pid missing.
-func containerTable() map[int]string {
-	return map[int]string{1: "init", 42: "node", os.Getpid(): "go"}
+func containerTable() map[int]ProcessEntry {
+	return map[int]ProcessEntry{1: {Name: "init"}, 42: {Name: "node"}, os.Getpid(): {Name: "go"}}
 }
 
 func TestJudgePID(t *testing.T) {
 	tests := []struct {
 		name        string
 		pid         int
-		table       map[int]string
+		table       map[int]ProcessEntry
 		want        pidProof
 		wantNoteHas string
 	}{
@@ -64,35 +64,35 @@ func TestJudgePID(t *testing.T) {
 		{
 			name:        "pid runs Unity here",
 			pid:         4321,
-			table:       map[int]string{4321: "/Applications/Unity/Hub/Editor/6000.4.4f1/Unity.app/Contents/MacOS/Unity"},
+			table:       map[int]ProcessEntry{4321: {Name: "/Applications/Unity/Hub/Editor/6000.4.4f1/Unity.app/Contents/MacOS/Unity"}},
 			want:        pidAlive,
 			wantNoteHas: "is running",
 		},
 		{
 			name:        "windows spelling",
 			pid:         4321,
-			table:       map[int]string{4321: `C:\Program Files\Unity\Hub\Editor\Editor\Unity.exe`},
+			table:       map[int]ProcessEntry{4321: {Name: `C:\Program Files\Unity\Hub\Editor\Editor\Unity.exe`}},
 			want:        pidAlive,
 			wantNoteHas: "",
 		},
 		{
 			name:        "pid taken over by another program",
 			pid:         4321,
-			table:       map[int]string{4321: "nginx", 5555: "Unity"},
+			table:       map[int]ProcessEntry{4321: {Name: "nginx"}, 5555: {Name: "Unity"}},
 			want:        pidUnproven,
 			wantNoteHas: "not Unity",
 		},
 		{
 			name:        "row exists but the name is unreadable",
 			pid:         4321,
-			table:       map[int]string{4321: "", 5555: "Unity"},
+			table:       map[int]ProcessEntry{4321: {}, 5555: {Name: "Unity"}},
 			want:        pidUnproven,
 			wantNoteHas: "unreadable",
 		},
 		{
 			name:        "pid gone while other Unity processes are listed",
 			pid:         4321,
-			table:       map[int]string{5555: "Unity", 5556: "Unity"},
+			table:       map[int]ProcessEntry{5555: {Name: "Unity"}, 5556: {Name: "Unity"}},
 			want:        pidGone,
 			wantNoteHas: "still lists Unity as pid",
 		},
@@ -106,9 +106,25 @@ func TestJudgePID(t *testing.T) {
 		{
 			name:        "Unity Hub alone does not prove visibility",
 			pid:         4321,
-			table:       map[int]string{777: "Unity Hub", 778: "UnityShaderCompiler"},
+			table:       map[int]ProcessEntry{777: {Name: "Unity Hub"}, 778: {Name: "UnityShaderCompiler"}},
 			want:        pidUnproven,
 			wantNoteHas: "no Unity process is visible",
+		},
+		{
+			// A crashed editor's child stays in the table as state Z. That row is not a running
+			// editor, so the heartbeat it wrote names a process that is over.
+			name:        "heartbeat pid is a zombie Unity process",
+			pid:         4321,
+			table:       map[int]ProcessEntry{4321: {Name: "Unity", Zombie: true}, 5555: {Name: "Unity"}},
+			want:        pidGone,
+			wantNoteHas: "zombie",
+		},
+		{
+			name:        "a zombie Unity row does not prove the table is the editor's",
+			pid:         4321,
+			table:       map[int]ProcessEntry{5555: {Name: "Unity", Zombie: true}},
+			want:        pidUnproven,
+			wantNoteHas: "proves nothing",
 		},
 	}
 
@@ -137,10 +153,12 @@ func TestAssessSilence(t *testing.T) {
 		pid         int
 		artifactAge time.Duration // >0 writes a mono_crash that old
 		advanced    bool          // the connector beat again after the baseline
-		table       map[int]string
-		wantCrashed bool
-		wantClean   bool
-		wantStale   bool
+		// lockfileAfterBeat writes Temp/UnityLockfile after the heartbeat, as an editor restart does.
+		lockfileAfterBeat bool
+		table             map[int]ProcessEntry
+		wantCrashed       bool
+		wantClean         bool
+		wantStale         bool
 	}{
 		{
 			name:        "clean shutdown is never a crash, artifact or not",
@@ -148,7 +166,7 @@ func TestAssessSilence(t *testing.T) {
 			beatAge:     beatAge,
 			pid:         65279,
 			artifactAge: 5 * time.Second,
-			table:       map[int]string{5555: "Unity"},
+			table:       map[int]ProcessEntry{5555: {Name: "Unity"}},
 			wantClean:   true,
 			wantStale:   true,
 		},
@@ -182,9 +200,27 @@ func TestAssessSilence(t *testing.T) {
 			state:       "ready",
 			beatAge:     4 * time.Second,
 			pid:         65279,
-			table:       map[int]string{5555: "Unity"},
+			table:       map[int]ProcessEntry{5555: {Name: "Unity"}},
 			wantCrashed: true,
 			wantStale:   true,
+		},
+		{
+			name:              "pid gone but a newer lockfile is a restart in progress",
+			state:             "ready",
+			beatAge:           beatAge,
+			pid:               65279,
+			lockfileAfterBeat: true,
+			table:             map[int]ProcessEntry{5555: {Name: "Unity"}},
+			wantStale:         true,
+		},
+		{
+			name:        "heartbeat advanced past the baseline: alive even with an old dump",
+			state:       "ready",
+			beatAge:     1 * time.Second,
+			pid:         65279,
+			artifactAge: 500 * time.Millisecond,
+			advanced:    true,
+			table:       map[int]ProcessEntry{65279: {Name: "Unity"}},
 		},
 		{
 			name:        "artifact from before the last beat belongs to an earlier crash",
@@ -212,6 +248,15 @@ func TestAssessSilence(t *testing.T) {
 			beat := time.Now().Add(-tc.beatAge)
 			if tc.artifactAge > 0 {
 				writeCrashFile(t, project, "mono_crash.1b6a4e0a.0.json", tc.artifactAge, monoCrashFixture)
+			}
+			if tc.lockfileAfterBeat {
+				temp := filepath.Join(project, "Temp")
+				if err := os.MkdirAll(temp, 0755); err != nil {
+					t.Fatalf("failed to create Temp: %v", err)
+				}
+				if err := os.WriteFile(filepath.Join(temp, unityLockfileName), nil, 0644); err != nil {
+					t.Fatalf("failed to write lockfile: %v", err)
+				}
 			}
 			baseline := beat
 			if tc.advanced {
@@ -246,7 +291,7 @@ func TestExplainDroppedConnection_Crash(t *testing.T) {
 	})
 
 	inst := NewestHeartbeat(project, 0)
-	err := explainDroppedConnection("exec", inst, time.Now().Add(-25*time.Second), io.EOF)
+	err := explainDroppedConnection(inst, time.Now().Add(-25*time.Second), io.EOF)
 
 	var failure *ConnectionFailure
 	if !errors.As(err, &failure) {
@@ -281,7 +326,7 @@ func TestExplainDroppedConnection_Reload(t *testing.T) {
 	})
 
 	inst := &Instance{State: "ready", ProjectPath: project, Port: 8090, PID: 65279, Timestamp: time.Now().Add(-10 * time.Second).UnixMilli()}
-	err := explainDroppedConnection("test", inst, time.Now().Add(-5*time.Second), io.EOF)
+	err := explainDroppedConnection(inst, time.Now().Add(-5*time.Second), io.EOF)
 
 	var failure *ConnectionFailure
 	if !errors.As(err, &failure) {
@@ -324,7 +369,7 @@ func TestExplainDroppedConnection_DumpArrivesLate(t *testing.T) {
 		dump <- path
 	}()
 
-	err := explainDroppedConnection("exec", inst, time.Now().Add(-time.Second), io.EOF)
+	err := explainDroppedConnection(inst, time.Now().Add(-time.Second), io.EOF)
 	dumpPath := <-dump
 	if dumpPath == "" {
 		t.Fatal("the goroutine failed to write the dump fixture")
@@ -341,7 +386,7 @@ func TestExplainDroppedConnection_DumpArrivesLate(t *testing.T) {
 // TestExplainDroppedConnection_LiveEditorPaysNoGrace: a pid this machine proves alive means the editor
 // is up, so the second reading is skipped and the answer comes back immediately.
 func TestExplainDroppedConnection_LiveEditorPaysNoGrace(t *testing.T) {
-	stubProcessTable(t, map[int]string{65279: "/Applications/Unity/Hub/Editor/6000.4.4f1/Unity.app/Contents/MacOS/Unity"})
+	stubProcessTable(t, map[int]ProcessEntry{65279: {Name: "/Applications/Unity/Hub/Editor/6000.4.4f1/Unity.app/Contents/MacOS/Unity"}})
 	origGrace := crashArtifactGrace
 	crashArtifactGrace = 2 * time.Second
 	t.Cleanup(func() { crashArtifactGrace = origGrace })
@@ -352,7 +397,7 @@ func TestExplainDroppedConnection_LiveEditorPaysNoGrace(t *testing.T) {
 	})
 
 	start := time.Now()
-	err := explainDroppedConnection("exec", NewestHeartbeat(project, 0), start, io.EOF)
+	err := explainDroppedConnection(NewestHeartbeat(project, 0), start, io.EOF)
 	if elapsed := time.Since(start); elapsed > time.Second {
 		t.Errorf("a live editor must not pay the crash-dump grace, took %v", elapsed)
 	}
@@ -371,7 +416,7 @@ func TestExplainDroppedConnection_UnexplainedSilenceKeepsTheOldText(t *testing.T
 	})
 
 	inst := NewestHeartbeat(project, 0)
-	err := explainDroppedConnection("exec", inst, time.Now().Add(-25*time.Second), io.EOF)
+	err := explainDroppedConnection(inst, time.Now().Add(-25*time.Second), io.EOF)
 
 	var failure *ConnectionFailure
 	if errors.As(err, &failure) {
@@ -385,7 +430,7 @@ func TestExplainDroppedConnection_UnexplainedSilenceKeepsTheOldText(t *testing.T
 
 // TestExplainDroppedConnection_TimeoutIsNotACrash: a slow editor must never be called dead.
 func TestExplainDroppedConnection_TimeoutIsNotACrash(t *testing.T) {
-	stubProcessTable(t, map[int]string{5555: "Unity"})
+	stubProcessTable(t, map[int]ProcessEntry{5555: {Name: "Unity"}})
 	project := t.TempDir()
 	writeCrashFile(t, project, "mono_crash.1b6a4e0a.0.json", 5*time.Second, monoCrashFixture)
 	writeInstanceFiles(t, map[string]Instance{
@@ -393,7 +438,7 @@ func TestExplainDroppedConnection_TimeoutIsNotACrash(t *testing.T) {
 	})
 
 	inst := NewestHeartbeat(project, 0)
-	err := explainDroppedConnection("exec", inst, time.Now().Add(-time.Minute),
+	err := explainDroppedConnection(inst, time.Now().Add(-time.Minute),
 		&timeoutLikeError{msg: "Post \"http://127.0.0.1:8090/command\": context deadline exceeded"})
 	if strings.Contains(err.Error(), "crash") {
 		t.Errorf("a timeout must not be reported as a crash: %s", err)

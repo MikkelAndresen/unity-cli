@@ -31,7 +31,7 @@ namespace UnityCliConnector.Tools
             public bool Discard { get; set; }
         }
 
-        class SceneState
+        internal class SceneState
         {
             public readonly List<Scene> DirtySaved = new List<Scene>();
             public readonly List<string> DirtyNames = new List<string>();
@@ -47,31 +47,50 @@ namespace UnityCliConnector.Tools
                 return new ErrorResponse("save and discard are mutually exclusive.");
 
             var scenes = InspectScenes();
+            // Unity refuses scene saves in (or while entering) play mode; the request must not claim
+            // those saves happened. Asset saves still run.
+            var playMode = EditorApplication.isPlayingOrWillChangePlaymode;
             if (save)
             {
-                var error = SaveBeforeQuit(scenes);
+                var error = SaveBeforeQuit(scenes, playMode);
                 if (error != null)
                     return error;
             }
 
             var subscribers = WantsToQuitSubscribers();
-            var response = new
+            var response = BuildReport(save, discard, playMode, scenes, subscribers);
+
+            ScheduleExit(subscribers);
+            var skipped = save && playMode;
+            var message = !save
+                ? "Quitting Unity editor."
+                : skipped
+                    ? "Saving assets (scene saves are skipped in play mode), then quitting Unity editor."
+                    : "Saving open scenes and assets, then quitting Unity editor.";
+            return new SuccessResponse(message, response);
+        }
+
+        internal static object BuildReport(bool save, bool discard, bool playMode, SceneState scenes,
+            string[] subscribers)
+        {
+            var saveScenes = save && !playMode;
+            return new
             {
                 pid = Process.GetCurrentProcess().Id,
-                projectPath = Application.dataPath.Replace("/Assets", ""),
-                save,
+                projectPath = Heartbeat.ProjectRootFromDataPath(Application.dataPath),
+                save = saveScenes,
+                saveSkipped = save && playMode ? "playmode" : null,
+                savedScenes = saveScenes ? scenes.DirtySaved.ConvertAll(s => s.path).ToArray() : new string[0],
+                savedAssets = save,
                 discard = discard || !save,
                 dirtyScenes = scenes.DirtyNames.ToArray(),
-                discardedScenes = save ? new string[0] : scenes.DirtyNames.ToArray(),
+                discardedScenes = saveScenes ? new string[0] : scenes.DirtyNames.ToArray(),
                 untitledScenes = scenes.Untitled.ToArray(),
                 wantsToQuitSubscribers = subscribers,
                 warning = subscribers.Length == 0
                     ? null
                     : "EditorApplication.wantsToQuit has subscriber(s); a handler that returns false will veto the exit.",
             };
-
-            ScheduleExit(subscribers);
-            return new SuccessResponse(save ? "Saving open scenes and assets, then quitting Unity editor." : "Quitting Unity editor.", response);
         }
 
         static SceneState InspectScenes()
@@ -100,11 +119,11 @@ namespace UnityCliConnector.Tools
         // Saves synchronously so a failure is reported and the editor stays up.
         // SaveOpenScenes is not used: for an untitled scene it opens a "Save Scene"
         // file panel, which parks the editor and cannot be answered from the CLI.
-        static ErrorResponse SaveBeforeQuit(SceneState state)
+        static ErrorResponse SaveBeforeQuit(SceneState state, bool playMode)
         {
             // Scene saves are invalid in or while entering play mode, and play-mode
             // scene state is reverted anyway. Assets are still saved.
-            if (!EditorApplication.isPlayingOrWillChangePlaymode)
+            if (!playMode)
             {
                 if (state.Untitled.Count > 0)
                 {
@@ -169,7 +188,8 @@ namespace UnityCliConnector.Tools
                 EditorApplication.Exit(0);
 
                 // Execution reaches here only if Exit returned without ending the process.
-                // A wantsToQuit handler returning false is the documented cause.
+                // Whether Exit consults wantsToQuit at all is not documented, so name it as a
+                // possible cause instead of the cause.
                 ScheduleVetoReport(subscribers);
             }
 
@@ -190,7 +210,7 @@ namespace UnityCliConnector.Tools
                     ? "none were visible"
                     : string.Join(", ", subscribers);
                 UnityEngine.Debug.LogError("[UnityCliConnector] quit_editor: Unity is still running after EditorApplication.Exit(0). " +
-                               "An EditorApplication.wantsToQuit handler probably returned false (subscribers: " +
+                               "An EditorApplication.wantsToQuit handler may have returned false (subscribers: " +
                                names + "). Use `unity-cli editor quit --force` on the host or fix the handler.");
             }
 

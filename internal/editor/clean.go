@@ -47,26 +47,6 @@ func CleanProject(projectPath string) ([]string, error) {
 	return removed, nil
 }
 
-// LockfileHeld reports whether Temp/UnityLockfile exists. Unity keeps the file
-// mapped while an editor has the project open, and a held lock on Windows also
-// makes deletion fail. Existence alone is not proof that an editor is running,
-// so callers must establish that separately before cleaning.
-func LockfileHeld(projectPath string) (bool, error) {
-	if projectPath == "" {
-		return false, errors.New("project path is empty")
-	}
-	path := filepath.Join(projectPath, "Temp", "UnityLockfile")
-	_, err := os.Stat(path)
-	switch {
-	case err == nil:
-		return true, nil
-	case errors.Is(err, fs.ErrNotExist):
-		return false, nil
-	default:
-		return false, fmt.Errorf("cannot check Unity lockfile %s: %w", path, err)
-	}
-}
-
 // ValidateProject checks that projectPath is an absolute Unity project root.
 // It is the same guard CleanProject uses, exposed so a launch path can reject a
 // non-project directory without deleting anything.

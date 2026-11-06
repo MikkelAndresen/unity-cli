@@ -24,7 +24,7 @@ func verifyUnityProcess(pid int) error {
 	if err != nil || comm == "" {
 		return fmt.Errorf("pid %d is not visible from this process; if the CLI runs in a container, stop Unity from the host", pid)
 	}
-	if !strings.Contains(strings.ToLower(comm), "unity") {
+	if !isUnityProcessName(comm) {
 		return fmt.Errorf("pid %d is %q, not a Unity editor; refusing to terminate it", pid, comm)
 	}
 	return nil

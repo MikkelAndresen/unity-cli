@@ -3,6 +3,9 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.Globalization;
 using System.IO;
+using System.Security.Cryptography;
+using System.Text;
+using Newtonsoft.Json;
 using UnityEditor;
 using UnityEditor.Compilation;
 using UnityEngine;
@@ -21,6 +24,7 @@ namespace UnityCliConnector
         public const int MaxListed = 5;
 
         const int DeadlineCheckEvery = 64;
+        const string ContentRecordFileName = "assembly-sources.json";
 
         public sealed class AssemblyInput
         {
@@ -38,6 +42,17 @@ namespace UnityCliConnector
             public string NewestSource;
             public long NewestSourceMtimeMs;
             public bool Missing;
+            // True when the source moved but no content record exists to prove its contents are what
+            // the compile read; the compile clock is then the only evidence, so the line says so.
+            public bool Unverified;
+        }
+
+        /// One assembly's source contents as the compile that produced its DLL saw them. The DLL path
+        /// is part of the key so a reused assembly name in another output cannot borrow the record.
+        public sealed class AssemblyContentRecord
+        {
+            public string Dll;
+            public Dictionary<string, string> Sources = new();
         }
 
         public sealed class ScanResult
@@ -57,6 +72,9 @@ namespace UnityCliConnector
             // Echo of the compile clock Evaluate judged the sources against, so the report can name the
             // compile that decided a DLL was already current.
             public long CoveredSinceMs;
+            // The clock above is the finish when this domain never saw the start; the line must not
+            // call a finish time a start.
+            public bool CoveredClockIsFinish;
         }
 
         /// The assemblies Unity would run tests against and build the player from. Registry and git
@@ -65,40 +83,58 @@ namespace UnityCliConnector
         {
             var roots = CompileProvenance.SourceRoots();
             var projectRoot = ProjectRoot();
+            // Materialise the pipeline lists before the budget starts: GetAssemblies is one Unity
+            // call costing the same whether or not this scan runs, while the per-source path work
+            // below is what the deadline has to bound.
+            var pipeline = new List<Assembly>();
+            pipeline.AddRange(CompilationPipeline.GetAssemblies(AssembliesType.Editor));
+            pipeline.AddRange(CompilationPipeline.GetAssemblies(AssembliesType.Player));
+            var watch = Stopwatch.StartNew();
             var inputs = new List<AssemblyInput>();
             var seen = new HashSet<string>();
+            var packageRoots = new Dictionary<string, string>(StringComparer.Ordinal);
+            Func<string, string> resolveVirtual = path => ResolveVirtualPath(path, packageRoots);
+            var truncated = false;
 
-            foreach (var type in new[] { AssembliesType.Editor, AssembliesType.Player })
+            foreach (var assembly in pipeline)
             {
-                foreach (var assembly in CompilationPipeline.GetAssemblies(type))
+                if (watch.ElapsedMilliseconds >= budgetMs)
                 {
-                    if (onlyAssemblies != null && !onlyAssemblies.Contains(assembly.name))
-                        continue;
-                    if (string.IsNullOrEmpty(assembly.outputPath))
-                        continue;
-                    var key = assembly.name + "|" + assembly.outputPath;
-                    if (!seen.Add(key))
-                        continue;
-
-                    var sources = new List<string>();
-                    if (assembly.sourceFiles != null)
-                        foreach (var source in assembly.sourceFiles)
-                            AddSource(sources, ResolvePath(source, projectRoot, ResolveVirtualPath));
-                    var definition = CompilationPipeline.GetAssemblyDefinitionFilePathFromAssemblyName(assembly.name);
-                    AddSource(sources, ResolvePath(definition, projectRoot, ResolveVirtualPath));
-                    if (!IsProjectAssembly(sources, roots))
-                        continue;
-
-                    inputs.Add(new AssemblyInput
-                    {
-                        Name = assembly.name,
-                        OutputPath = ResolvePath(assembly.outputPath, projectRoot, null),
-                        Sources = sources.ToArray(),
-                    });
+                    truncated = true;
+                    break;
                 }
+                if (onlyAssemblies != null && !onlyAssemblies.Contains(assembly.name))
+                    continue;
+                if (string.IsNullOrEmpty(assembly.outputPath))
+                    continue;
+                var key = assembly.name + "|" + assembly.outputPath;
+                if (!seen.Add(key))
+                    continue;
+
+                var sources = ResolveSources(assembly, projectRoot, resolveVirtual, watch, budgetMs,
+                    out truncated);
+                if (truncated)
+                    break;
+                if (!IsProjectAssembly(sources, roots))
+                    continue;
+
+                inputs.Add(new AssemblyInput
+                {
+                    Name = assembly.name,
+                    OutputPath = ResolvePath(assembly.outputPath, projectRoot, null),
+                    Sources = sources.ToArray(),
+                });
             }
 
-            return Evaluate(inputs, projectRoot, budgetMs, CompileProvenance.LastCompileStartedAtMs());
+            var collectionMs = (int)watch.ElapsedMilliseconds;
+            var remaining = Math.Max(0, budgetMs - collectionMs);
+            var result = Evaluate(inputs, projectRoot, remaining,
+                CompileProvenance.LastCompileStartedAtMs(), LoadContentRecords(), null,
+                CompileProvenance.LastCompileClockFromFinish(), SaveContentRecords);
+            if (truncated)
+                result.Complete = false;
+            result.ScanMs += collectionMs;
+            return result;
         }
 
         /// Pure file-stat helper: no Unity API, so EditMode tests can point it at a temp directory.
@@ -110,11 +146,27 @@ namespace UnityCliConnector
         /// current — measured on 6000.6.5f1: a touched file produced an 11 s compile with
         /// rebuilt_assemblies empty and the DLL mtime unchanged, and a CleanBuildCache request (65 s)
         /// left those mtimes alone too, because Bee restores its cached node output with the timestamps
-        /// it recorded. No rebuild settles an mtime-only change, so the compile clock is what decides.</param>
+        /// it recorded. No rebuild settles an mtime-only change, so the compile clock is what decides.
+        /// <param name="contentRecords">Source hashes recorded when each assembly last compiled
+        /// successfully. A candidate whose content matches its record is a touch, not an edit; one
+        /// that differs is stale even when a compile has run since — the #29 case where the compile
+        /// did not rewrite the DLL. Null means "no record", which falls back to the compile clock.</param>
+        /// <param name="hashFile">Test seam; production hashes the file on disk.</param>
+        /// <param name="coveredClockIsFinish">True when coveredSinceMs fell back to a compile finish.</param>
+        /// <param name="saveRecords">Persists <paramref name="contentRecords"/> after this scan filled
+        /// in a missing one. Without that, a project whose DLL was already current when the connector
+        /// first saw it never gets a record, and every later touch is reported as unverified.</param>
         public static ScanResult Evaluate(IReadOnlyList<AssemblyInput> assemblies, string projectRoot, int budgetMs,
-            long coveredSinceMs = 0)
+            long coveredSinceMs = 0, IReadOnlyDictionary<string, AssemblyContentRecord> contentRecords = null,
+            Func<string, string> hashFile = null, bool coveredClockIsFinish = false,
+            Action saveRecords = null)
         {
-            var result = new ScanResult { ProjectRoot = projectRoot, CoveredSinceMs = coveredSinceMs };
+            var result = new ScanResult
+            {
+                ProjectRoot = projectRoot,
+                CoveredSinceMs = coveredSinceMs,
+                CoveredClockIsFinish = coveredClockIsFinish,
+            };
             var watch = Stopwatch.StartNew();
 
             foreach (var assembly in assemblies)
@@ -132,7 +184,9 @@ namespace UnityCliConnector
 
                 long newestMs = long.MinValue;
                 string newestSource = null;
+                var newerThanDll = new List<string>();
                 var checkedFiles = 0;
+                var stopped = false;
                 if (assembly.Sources != null)
                 {
                     foreach (var source in assembly.Sources)
@@ -142,9 +196,12 @@ namespace UnityCliConnector
                         if (++checkedFiles % DeadlineCheckEvery == 0 && watch.ElapsedMilliseconds >= budgetMs)
                         {
                             result.Complete = false;
+                            stopped = true;
                             break;
                         }
                         var wroteMs = ToMs(File.GetLastWriteTimeUtc(source));
+                        if (dllMs.HasValue && wroteMs > dllMs.Value)
+                            newerThanDll.Add(source);
                         if (wroteMs <= newestMs)
                             continue;
                         newestMs = wroteMs;
@@ -152,10 +209,15 @@ namespace UnityCliConnector
                     }
                 }
 
+                if (stopped)
+                    break;
                 if (newestSource == null)
                     continue;
                 if (dllMs.HasValue && dllMs.Value >= newestMs)
+                {
+                    RecordContentsWhenMissing(assembly, contentRecords, hashFile, watch, budgetMs, saveRecords);
                     continue;
+                }
 
                 var sample = new StaleAssembly
                 {
@@ -166,11 +228,30 @@ namespace UnityCliConnector
                     NewestSourceMtimeMs = newestMs,
                     Missing = !dllMs.HasValue,
                 };
-                if (dllMs.HasValue && coveredSinceMs > newestMs)
+                if (dllMs.HasValue)
                 {
-                    result.CoveredCount++;
-                    result.CoveredSample ??= sample;
-                    continue;
+                    var sameContent = ContentMatches(assembly, newerThanDll, contentRecords, hashFile,
+                        watch, budgetMs, ref result, out stopped);
+                    if (stopped)
+                        break;
+                    if (sameContent == true)
+                    {
+                        result.CoveredCount++;
+                        result.CoveredSample ??= sample;
+                        continue;
+                    }
+                    if (sameContent == false)
+                    {
+                        // The content differs from what the last successful compile recorded: the
+                        // compile clock cannot cover it even if it started after the edit (#29).
+                    }
+                    else if (coveredSinceMs > newestMs)
+                    {
+                        sample.Unverified = true;
+                        result.CoveredCount++;
+                        result.CoveredSample ??= sample;
+                        continue;
+                    }
                 }
 
                 result.StaleCount++;
@@ -184,6 +265,69 @@ namespace UnityCliConnector
 
             result.ScanMs = (int)watch.ElapsedMilliseconds;
             return result;
+        }
+
+        /// Fills in the content record for an assembly the DLL already covers. This is the one moment
+        /// the record is provably right: the DLL is newer than every source, so its contents are what
+        /// the successful compile read. Recording it here is what lets a later `touch` be answered with
+        /// "content matches" instead of "unverified, no content record".
+        static void RecordContentsWhenMissing(AssemblyInput assembly,
+            IReadOnlyDictionary<string, AssemblyContentRecord> contentRecords, Func<string, string> hashFile,
+            Stopwatch watch, int budgetMs, Action saveRecords)
+        {
+            if (contentRecords == null || saveRecords == null || assembly.Sources == null) return;
+            var key = ContentRecordKey(assembly.Name, assembly.OutputPath);
+            if (contentRecords.ContainsKey(key)) return;
+
+            var hashes = new Dictionary<string, string>(StringComparer.Ordinal);
+            foreach (var source in assembly.Sources)
+            {
+                if (string.IsNullOrEmpty(source) || !File.Exists(source)) continue;
+                // Past the budget the scan stops recording rather than answering slower; the cost of
+                // a missing record is the noisy unverified line, not a wrong verdict.
+                if (watch.ElapsedMilliseconds >= budgetMs) return;
+                var hash = hashFile != null ? hashFile(source) : ComputeFileHash(source);
+                if (hash == null) return;
+                hashes[source] = hash;
+            }
+            if (hashes.Count == 0) return;
+
+            if (contentRecords is IDictionary<string, AssemblyContentRecord> writable)
+                writable[key] = new AssemblyContentRecord { Dll = assembly.OutputPath, Sources = hashes };
+            else return;
+            saveRecords();
+        }
+
+        /// True/False when the record proves the candidate contents do or do not match; null when no
+        /// record exists or a hash could not be read, which leaves the compile-clock rule to decide.
+        static bool? ContentMatches(AssemblyInput assembly, List<string> candidates,
+            IReadOnlyDictionary<string, AssemblyContentRecord> records, Func<string, string> hashFile,
+            Stopwatch watch, int budgetMs, ref ScanResult result, out bool stopped)
+        {
+            stopped = false;
+            if (records == null || candidates.Count == 0 ||
+                !records.TryGetValue(ContentRecordKey(assembly.Name, assembly.OutputPath), out var record) ||
+                record?.Sources == null)
+                return null;
+
+            var hashed = 0;
+            foreach (var candidate in candidates)
+            {
+                if (++hashed % DeadlineCheckEvery == 0 && watch.ElapsedMilliseconds >= budgetMs)
+                {
+                    result.Complete = false;
+                    stopped = true;
+                    return null;
+                }
+                if (!record.Sources.TryGetValue(candidate, out var expected))
+                    return false;
+                var actual = hashFile != null ? hashFile(candidate) : ComputeFileHash(candidate);
+                if (string.IsNullOrEmpty(actual))
+                    return null;
+                if (!string.Equals(actual, expected, StringComparison.OrdinalIgnoreCase))
+                    return false;
+            }
+            return true;
         }
 
         public static List<object> ToPayload(ScanResult result)
@@ -219,10 +363,53 @@ namespace UnityCliConnector
             var first = result.CoveredSample;
             var dll = first.Name.EndsWith(".dll", StringComparison.OrdinalIgnoreCase) ? first.Name : first.Name + ".dll";
             var more = result.CoveredCount > 1 ? $" (+{result.CoveredCount - 1} more)" : "";
-            return $"not stale: {dll} (built {Clock(first.DllMtimeMs ?? 0)}) is older than {first.NewestSource} " +
-                   $"({Clock(first.NewestSourceMtimeMs)}){more}, but the compile that started " +
-                   $"{Clock(result.CoveredSinceMs)} read that source and kept the DLL; a moved " +
-                   "mtime alone does not mean the DLL is out of date";
+            if (!first.Unverified)
+            {
+                return $"not stale: {dll} (built {Clock(first.DllMtimeMs ?? 0)}) is older than {first.NewestSource} " +
+                       $"({Clock(first.NewestSourceMtimeMs)}){more}, but its content matches what the compile " +
+                       "recorded for it; a moved mtime alone does not mean the DLL is out of date";
+            }
+
+            var compile = result.CoveredClockIsFinish ? "finished" : "starting";
+            return $"not stale, no content record yet: {dll} (built {Clock(first.DllMtimeMs ?? 0)}) " +
+                   $"is older than {first.NewestSource} ({Clock(first.NewestSourceMtimeMs)}){more}, but the compile " +
+                   $"{compile} {Clock(result.CoveredSinceMs)} read it, so a moved mtime alone is not an edit";
+        }
+
+        /// The runner's refusal: a stale DLL runs old code, and an incomplete scan cannot prove the
+        /// DLLs are current either. Null means it is safe to run. `--allow-stale` is the caller's
+        /// escape hatch for a deliberately old assembly (e.g. bisecting a test runner change).
+        public static object BlockIfStaleOrIncomplete(ScanResult scan)
+        {
+            if (scan == null || (scan.StaleCount == 0 && scan.Complete))
+                return null;
+            if (scan.StaleCount > 0)
+            {
+                var line = FormatLine(scan);
+                var staleMessage = line + ". Tests were not run; pass --allow-stale to run them anyway.";
+                return new ErrorResponse(staleMessage, new
+                {
+                    blocked = "stale-assembly",
+                    message = staleMessage,
+                    stale_assembly_count = scan.StaleCount,
+                    stale_assemblies = ToPayload(scan),
+                    stale_assembly_line = line,
+                    stale_assembly_scan_complete = scan.Complete,
+                });
+            }
+
+            var message = $"Assembly staleness scan stopped after {scan.ScanMs} ms before checking every assembly; " +
+                          "tests were not run because the DLLs under test could not be proved current. " +
+                          "Pass --allow-stale to run them anyway.";
+            return new ErrorResponse(message, new
+            {
+                blocked = "stale-assembly-scan-incomplete",
+                message,
+                stale_assembly_count = scan.StaleCount,
+                stale_assemblies = ToPayload(scan),
+                stale_assembly_scan_complete = scan.Complete,
+                scan_ms = scan.ScanMs,
+            });
         }
 
         /// One sentence naming the first stale assembly, in the wording agents act on. It points at the
@@ -243,9 +430,37 @@ namespace UnityCliConnector
             return $"stale assembly: {dll} ({built}) is older than {source}{more} — run unity-cli editor refresh --compile";
         }
 
-        static void AddSource(List<string> sources, string path)
+        static List<string> ResolveSources(Assembly assembly, string projectRoot, Func<string, string> resolveVirtual,
+            Stopwatch watch, int budgetMs, out bool truncated)
         {
-            if (!string.IsNullOrEmpty(path) && !sources.Contains(path))
+            truncated = false;
+            var sources = new List<string>();
+            var seenSources = new HashSet<string>(StringComparer.Ordinal);
+            var checkedPaths = 0;
+            if (assembly.sourceFiles != null)
+            {
+                foreach (var source in assembly.sourceFiles)
+                {
+                    if (watch != null && ++checkedPaths % DeadlineCheckEvery == 0 &&
+                        watch.ElapsedMilliseconds >= budgetMs)
+                    {
+                        truncated = true;
+                        break;
+                    }
+                    AddSource(sources, seenSources, ResolvePath(source, projectRoot, resolveVirtual));
+                }
+            }
+            if (!truncated)
+            {
+                var definition = CompilationPipeline.GetAssemblyDefinitionFilePathFromAssemblyName(assembly.name);
+                AddSource(sources, seenSources, ResolvePath(definition, projectRoot, resolveVirtual));
+            }
+            return sources;
+        }
+
+        static void AddSource(List<string> sources, HashSet<string> seen, string path)
+        {
+            if (!string.IsNullOrEmpty(path) && seen.Add(path))
                 sources.Add(path);
         }
 
@@ -272,16 +487,34 @@ namespace UnityCliConnector
             return Combine(projectRoot, normalized);
         }
 
-        static string ResolveVirtualPath(string assetPath)
+        static string ResolveVirtualPath(string assetPath, Dictionary<string, string> cache)
         {
+            var packageRoot = PackageAssetRoot(assetPath);
+            if (cache != null && cache.TryGetValue(packageRoot, out var cached))
+                return cached.Length == 0 ? null : Combine(cached, assetPath.Substring(packageRoot.Length));
+
             var package = UnityEditor.PackageManager.PackageInfo.FindForAssetPath(assetPath);
-            if (package == null || string.IsNullOrEmpty(package.assetPath) || string.IsNullOrEmpty(package.resolvedPath))
+            var resolved = package == null || string.IsNullOrEmpty(package.assetPath) ||
+                           string.IsNullOrEmpty(package.resolvedPath)
+                ? ""
+                : package.resolvedPath;
+            if (cache != null)
+                cache[packageRoot] = resolved;
+            if (resolved.Length == 0)
                 return null;
 
             var rest = assetPath.Length > package.assetPath.Length
                 ? assetPath.Substring(package.assetPath.Length)
                 : "";
-            return Combine(package.resolvedPath, rest);
+            return Combine(resolved, rest);
+        }
+
+        /// "Packages/<name>" — the package mount, not the file, so one lookup serves every source in it.
+        static string PackageAssetRoot(string assetPath)
+        {
+            const string prefix = "Packages/";
+            var slash = assetPath.IndexOf('/', prefix.Length);
+            return slash >= 0 ? assetPath.Substring(0, slash) : assetPath;
         }
 
         internal static bool IsProjectAssembly(List<string> sources, IReadOnlyList<string> roots)
@@ -297,6 +530,134 @@ namespace UnityCliConnector
                 }
             }
             return false;
+        }
+
+        // ─── Content records: what the last successful compile of each assembly read ─────
+
+        internal static string ContentRecordKey(string name, string outputPath) =>
+            (name ?? "") + "|" + Normalize(outputPath);
+
+        /// Called from CompilationGate's assemblyCompilationFinished when that assembly had no errors.
+        /// Records the hashes now so a later edit can be told apart from a touched mtime even when the
+        /// compile that follows does not rewrite the DLL.
+        internal static void NoteAssemblyCompiled(string assemblyPath)
+        {
+            try
+            {
+                var projectRoot = ProjectRoot();
+                var packageRoots = new Dictionary<string, string>(StringComparer.Ordinal);
+                Func<string, string> resolveVirtual = path => ResolveVirtualPath(path, packageRoots);
+                var target = ResolvePath(assemblyPath, projectRoot, resolveVirtual);
+                var roots = CompileProvenance.SourceRoots();
+
+                foreach (var type in new[] { AssembliesType.Editor, AssembliesType.Player })
+                {
+                    foreach (var assembly in CompilationPipeline.GetAssemblies(type))
+                    {
+                        if (string.IsNullOrEmpty(assembly.outputPath))
+                            continue;
+                        var output = ResolvePath(assembly.outputPath, projectRoot, resolveVirtual);
+                        if (!string.Equals(output, target, StringComparison.Ordinal))
+                            continue;
+
+                        var sources = ResolveSources(assembly, projectRoot, resolveVirtual, null, 0, out _);
+                        if (!IsProjectAssembly(sources, roots))
+                            return;
+
+                        var hashes = new Dictionary<string, string>(StringComparer.Ordinal);
+                        foreach (var source in sources)
+                        {
+                            if (!File.Exists(source))
+                                continue;
+                            var hash = ComputeFileHash(source);
+                            if (hash == null)
+                                return;
+                            hashes[source] = hash;
+                        }
+
+                        var records = LoadContentRecords();
+                        records[ContentRecordKey(assembly.name, output)] = new AssemblyContentRecord
+                        {
+                            Dll = output,
+                            Sources = hashes,
+                        };
+                        SaveContentRecords();
+                        return;
+                    }
+                }
+            }
+            catch (Exception)
+            {
+                // Recording is an optimisation for the staleness check; losing it must not break the
+                // compile event it rides on.
+            }
+        }
+
+        sealed class ContentRecordFile
+        {
+            public int version = 1;
+            public Dictionary<string, AssemblyContentRecord> assemblies = new();
+        }
+
+        static Dictionary<string, AssemblyContentRecord> s_ContentRecords;
+
+        internal static Dictionary<string, AssemblyContentRecord> LoadContentRecords()
+        {
+            if (s_ContentRecords != null)
+                return s_ContentRecords;
+            s_ContentRecords = new Dictionary<string, AssemblyContentRecord>(StringComparer.Ordinal);
+            try
+            {
+                var path = ContentRecordPath();
+                if (File.Exists(path))
+                {
+                    var file = JsonConvert.DeserializeObject<ContentRecordFile>(File.ReadAllText(path));
+                    if (file?.assemblies != null)
+                        s_ContentRecords = file.assemblies;
+                }
+            }
+            catch (Exception)
+            {
+                // A corrupt record costs the content proof only; the compile-clock fallback remains.
+            }
+            return s_ContentRecords;
+        }
+
+        static void SaveContentRecords()
+        {
+            try
+            {
+                var path = ContentRecordPath();
+                Directory.CreateDirectory(Path.GetDirectoryName(path));
+                File.WriteAllText(path, JsonConvert.SerializeObject(new ContentRecordFile
+                {
+                    assemblies = s_ContentRecords,
+                }));
+            }
+            catch (Exception)
+            {
+            }
+        }
+
+        static string ContentRecordPath() =>
+            Combine(ProjectRoot(), "Library/unity-cli/" + ContentRecordFileName);
+
+        internal static string ComputeFileHash(string path)
+        {
+            try
+            {
+                using var stream = File.OpenRead(path);
+                using var sha = SHA256.Create();
+                var hash = sha.ComputeHash(stream);
+                var sb = new StringBuilder(hash.Length * 2);
+                foreach (var b in hash)
+                    sb.Append(b.ToString("x2", CultureInfo.InvariantCulture));
+                return sb.ToString();
+            }
+            catch (Exception)
+            {
+                return null;
+            }
         }
 
         static string ProjectRoot()

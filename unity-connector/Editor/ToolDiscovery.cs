@@ -7,52 +7,116 @@ using Newtonsoft.Json.Linq;
 namespace UnityCliConnector
 {
     /// <summary>
-    /// Finds [UnityCliTool] handlers on demand via reflection.
-    /// No caching, no registration — every call scans live.
+    /// Finds [UnityCliTool] handlers via reflection.
+    ///
+    /// The scan is cached per domain: walking every loaded assembly's types with attribute lookups
+    /// costs ~0.6-0.9 s on this project's domain, which was paid on the main thread for every
+    /// command (and made a single tool call feel like a second of latency). A domain reload is the
+    /// only way the tool set can change, and it resets the statics that hold the cache.
     /// </summary>
     public static class ToolDiscovery
     {
-        public static MethodInfo FindHandler(string command)
+        internal sealed class ToolEntry
         {
-            MethodInfo found = null;
-            Type foundType = null;
+            public string Name;
+            public MethodInfo Handler;
+            public Type Type;
+            public UnityCliToolAttribute Attribute;
+            // The nested Parameters class, or null for a tool that declares no schema.
+            public Type ParametersType;
+        }
 
-            foreach (var assembly in AppDomain.CurrentDomain.GetAssemblies())
+        static readonly object s_ToolLock = new();
+        static Dictionary<string, ToolEntry> s_Tools;
+
+        /// Every tool in the domain by command name, built once per domain. Duplicates keep the
+        /// first one found and log, so a broken installation still answers.
+        internal static Dictionary<string, ToolEntry> Tools()
+        {
+            lock (s_ToolLock)
             {
-                Type[] types;
-                try { types = assembly.GetTypes(); }
-                catch (ReflectionTypeLoadException) { continue; }
+                if (s_Tools != null) return s_Tools;
 
-                foreach (var type in types)
+                var tools = new Dictionary<string, ToolEntry>(StringComparer.Ordinal);
+                foreach (var type in ToolTypes())
                 {
-                    if (type.IsClass == false) continue;
                     var attr = type.GetCustomAttribute<UnityCliToolAttribute>();
-                    if (attr == null) continue;
-
                     var name = attr.Name ?? StringCaseUtility.ToSnakeCase(type.Name);
-                    if (name != command) continue;
 
                     var method = type.GetMethod("HandleCommand",
                         BindingFlags.Public | BindingFlags.Static, null,
                         new[] { typeof(JObject) }, null);
-
                     if (method == null) continue;
 
-                    if (found != null)
+                    if (tools.TryGetValue(name, out var existing))
                     {
                         UnityEngine.Debug.LogError(
-                            $"[UnityCliConnector] Duplicate tool '{command}': " +
-                            $"{foundType.FullName} and {type.FullName}. Using first found.");
+                            $"[UnityCliConnector] Duplicate tool '{name}': " +
+                            $"{existing.Type.FullName} and {type.FullName}. Using first found.");
                         continue;
                     }
 
-                    found = method;
-                    foundType = type;
+                    tools[name] = new ToolEntry
+                    {
+                        Name = name,
+                        Handler = method,
+                        Type = type,
+                        Attribute = attr,
+                        ParametersType = type.GetNestedType("Parameters"),
+                    };
                 }
-            }
 
-            return found;
+                s_Tools = tools;
+                return tools;
+            }
         }
+
+        static List<Type> ToolTypes()
+        {
+            var types = new List<Type>();
+            foreach (var assembly in AppDomain.CurrentDomain.GetAssemblies())
+            {
+                Type[] loaded;
+                try { loaded = assembly.GetTypes(); }
+                catch (ReflectionTypeLoadException) { continue; }
+
+                foreach (var type in loaded)
+                    if (type.IsClass && type.GetCustomAttribute<UnityCliToolAttribute>() != null)
+                        types.Add(type);
+            }
+            return types;
+        }
+
+        internal static ToolEntry FindTool(string command)
+            => command != null && Tools().TryGetValue(command, out var entry) ? entry : null;
+
+        public static MethodInfo FindHandler(string command) => FindTool(command)?.Handler;
+
+        /// <summary>
+        /// The parameter names a tool's schema declares, in the spellings a caller may send: the
+        /// snake_case form the CLI derives from the property, its camelCase variant (the older
+        /// spelling every tool still accepts), the attribute's own name when it sets one, and any
+        /// legacy aliases. Used to reject a misspelled flag instead of silently ignoring it.
+        /// </summary>
+        internal static HashSet<string> DeclaredParameterNames(Type paramsType)
+        {
+            var names = new HashSet<string>(StringComparer.Ordinal);
+            if (paramsType == null) return names;
+
+            foreach (var property in paramsType.GetProperties())
+            {
+                var attr = property.GetCustomAttribute<ToolParameterAttribute>();
+                if (attr?.Name != null) names.Add(attr.Name);
+                names.Add(StringCaseUtility.ToSnakeCase(property.Name));
+                names.Add(LowerFirst(property.Name));
+                if (attr?.Aliases == null) continue;
+                foreach (var alias in attr.Aliases) names.Add(alias);
+            }
+            return names;
+        }
+
+        static string LowerFirst(string name)
+            => string.IsNullOrEmpty(name) ? name : char.ToLowerInvariant(name[0]) + name.Substring(1);
 
         static readonly object s_OffMainThreadLock = new();
         static HashSet<string> s_OffMainThreadTools;
@@ -67,70 +131,29 @@ namespace UnityCliConnector
         {
             lock (s_OffMainThreadLock)
             {
-                s_OffMainThreadTools ??= ScanOffMainThreadTools();
+                if (s_OffMainThreadTools == null)
+                {
+                    s_OffMainThreadTools = new HashSet<string>(StringComparer.Ordinal);
+                    foreach (var entry in Tools().Values)
+                        if (entry.Attribute is { RunOffMainThread: true })
+                            s_OffMainThreadTools.Add(entry.Name);
+                }
                 return s_OffMainThreadTools.Contains(command);
             }
-        }
-
-        static HashSet<string> ScanOffMainThreadTools()
-        {
-            var names = new HashSet<string>();
-            foreach (var assembly in AppDomain.CurrentDomain.GetAssemblies())
-            {
-                Type[] types;
-                try { types = assembly.GetTypes(); }
-                catch (ReflectionTypeLoadException) { continue; }
-
-                foreach (var type in types)
-                {
-                    if (type.IsClass == false) continue;
-                    var attr = type.GetCustomAttribute<UnityCliToolAttribute>();
-                    if (attr is not { RunOffMainThread: true }) continue;
-                    names.Add(attr.Name ?? StringCaseUtility.ToSnakeCase(type.Name));
-                }
-            }
-            return names;
         }
 
         public static List<object> GetToolSchemas()
         {
             var tools = new List<object>();
-            var nameToType = new Dictionary<string, Type>();
-
-            foreach (var assembly in AppDomain.CurrentDomain.GetAssemblies())
+            foreach (var entry in Tools().Values)
             {
-                Type[] types;
-                try { types = assembly.GetTypes(); }
-                catch (ReflectionTypeLoadException) { continue; }
-
-                foreach (var type in types)
+                tools.Add(new
                 {
-                    if (type.IsClass == false) continue;
-                    var attr = type.GetCustomAttribute<UnityCliToolAttribute>();
-                    if (attr == null) continue;
-
-                    var name = attr.Name ?? StringCaseUtility.ToSnakeCase(type.Name);
-
-                    if (nameToType.TryGetValue(name, out var existing))
-                    {
-                        UnityEngine.Debug.LogError(
-                            $"[UnityCliConnector] Duplicate tool name '{name}': " +
-                            $"{existing.FullName} and {type.FullName}. " +
-                            $"Rename one or remove the duplicate.");
-                        continue;
-                    }
-                    nameToType[name] = type;
-
-                    var paramsType = type.GetNestedType("Parameters");
-
-                    tools.Add(new
-                    {
-                        name,
-                        description = attr.Description ?? "",
-                        group = attr.Group ?? "",
-                        parameters = GetParameterSchema(paramsType),
-                    });
-                }
+                    name = entry.Name,
+                    description = entry.Attribute.Description ?? "",
+                    group = entry.Attribute.Group ?? "",
+                    parameters = GetParameterSchema(entry.ParametersType),
+                });
             }
 
             return tools;
@@ -153,7 +176,6 @@ namespace UnityCliConnector
                     };
                 })
                 .Cast<object>()
-                .ToList();
-        }
+                .ToList();        }
     }
 }

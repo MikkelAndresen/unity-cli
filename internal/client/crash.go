@@ -25,12 +25,11 @@ const (
 // Crash artifact bounds. A project that has collected dumps from many crashes, or a mono report of
 // a few hundred KB, must not turn one failed request into a wall of text.
 const (
-	crashArtifactLimit   = 3
-	crashDetailChars     = 200
-	crashJSONReadLimit   = 512 << 10
-	crashLogTailLimit    = 16 << 10
-	crashScanLineLimit   = 200
-	crashProjectScanDirs = 2
+	crashArtifactLimit = 3
+	crashDetailChars   = 200
+	crashJSONReadLimit = 512 << 10
+	crashLogTailLimit  = 16 << 10
+	crashScanLineLimit = 200
 )
 
 // MonoCrashGlob matches Mono's crash dump. Unity writes it into the process' working directory,
@@ -124,9 +123,6 @@ func projectCrashDirs(project string) []string {
 	dirs := []string{project}
 	if logs := filepath.Join(project, "Logs"); dirExists(logs) {
 		dirs = append(dirs, logs)
-	}
-	if len(dirs) > crashProjectScanDirs {
-		dirs = dirs[:crashProjectScanDirs]
 	}
 	return dirs
 }
@@ -383,10 +379,14 @@ func firstKeywordLine(text string) string {
 
 // lastKeywordLine scans from the end: for a log, the line nearest the death is the one to print.
 func lastKeywordLine(text string) string {
+	return lastLineMatching(text, crashKeywords)
+}
+
+func lastLineMatching(text string, keywords []string) string {
 	lines := strings.Split(text, "\n")
 	for i := len(lines) - 1; i >= 0; i-- {
 		line := strings.TrimSpace(lines[i])
-		if line != "" && lineHasCrashKeyword(line) {
+		if line != "" && lineHasKeyword(line, keywords) {
 			return line
 		}
 	}
@@ -394,13 +394,25 @@ func lastKeywordLine(text string) string {
 }
 
 func lineHasCrashKeyword(line string) bool {
+	return lineHasKeyword(line, crashKeywords)
+}
+
+func lineHasKeyword(line string, keywords []string) bool {
 	lower := strings.ToLower(line)
-	for _, kw := range crashKeywords {
+	for _, kw := range keywords {
 		if strings.Contains(lower, kw) {
 			return true
 		}
 	}
 	return false
+}
+
+// prevLogCrashWording is narrower than crashKeywords on purpose: Editor-prev.log holds a whole normal
+// session, so a caught exception ("NullReferenceException handled") or the word "abort" in unrelated
+// text must not make a clean previous run read as the crash being judged.
+var prevLogCrashWording = []string{
+	"native crash", "crashed", "crash!!!", "segmentation fault", "sigsegv", "sigabrt", "sigbus",
+	"sigill", "received signal", "abort trap", "fatal error",
 }
 
 // crashReportDetail reads an macOS DiagnosticReports .ips file. Its first line is a one-line JSON
@@ -457,7 +469,7 @@ func prevLogDetail(path string) string {
 	if err != nil || len(tail) == 0 {
 		return ""
 	}
-	return clampLine(lastKeywordLine(string(tail)), crashDetailChars)
+	return clampLine(lastLineMatching(string(tail), prevLogCrashWording), crashDetailChars)
 }
 
 func readHead(path string, limit int64) ([]byte, error) {
@@ -548,7 +560,7 @@ func AssessSilence(inst *Instance, since time.Time, baselineBeat int64) SilenceV
 	}
 
 	v.Clean = inst.State == "stopped"
-	v.BeatAge = heartbeatAgeOf(inst)
+	v.BeatAge = HeartbeatAge(inst)
 	v.Stale = v.BeatAge >= BeatSilenceAge
 	v.NotAdvanced = baselineBeat > 0 && inst.Timestamp <= baselineBeat
 	v.Silent = v.Stale || v.NotAdvanced
@@ -556,6 +568,12 @@ func AssessSilence(inst *Instance, since time.Time, baselineBeat int64) SilenceV
 	v.ProjectPath = inst.ProjectPath
 	v.PIDProof, v.PIDNote = judgePID(inst.PID)
 	if v.Clean {
+		return v
+	}
+	if sessionStartedAfterBeat(inst) {
+		// The editor was restarted after this heartbeat was written, so this record describes the
+		// previous process. Its vanished pid and any dump it left behind say nothing about the editor
+		// that is starting now; the caller falls back to the lockfile's startup evidence.
 		return v
 	}
 
@@ -683,7 +701,7 @@ func (f *ConnectionFailure) reloadText() string {
 // explainDroppedConnection classifies a failed request before it is reported, so that a hard crash,
 // a domain reload and a dropped socket do not all come back as the same bare EOF. It reads only files
 // the connector already wrote, so it costs nothing when the editor is fine.
-func explainDroppedConnection(command string, inst *Instance, start time.Time, transport error) error {
+func explainDroppedConnection(inst *Instance, start time.Time, transport error) error {
 	base := fmt.Errorf("cannot connect to Unity at port %d: %w", inst.Port, transport)
 	if !droppedConnection(transport) {
 		return base
@@ -703,7 +721,7 @@ func explainDroppedConnection(command string, inst *Instance, start time.Time, t
 		since = beatTime
 	}
 	verdict := AssessSilence(beat, since, inst.Timestamp)
-	if !verdict.Crashed && verdict.PIDProof == pidUnproven {
+	if !verdict.Crashed && verdict.PIDProof == pidUnproven && verdict.BeatAge <= crashDumpGraceWindow {
 		// The crash handler writes its dump a moment after the socket dies, and from a container the pid
 		// proves nothing, so a verdict that is one artifact short of "crashed" gets one more look before
 		// the caller is sent away with a bare EOF. A pid this machine can see is already decided: pidAlive
@@ -731,6 +749,13 @@ func explainDroppedConnection(command string, inst *Instance, start time.Time, t
 // finished writing. A variable so tests can shrink it.
 var crashArtifactGrace = 500 * time.Millisecond
 
+// crashDumpGraceWindow is how recently the heartbeat must have been written for that extra reading to
+// be worth taking. Mono writes its dump moments after the socket dies, so a beat this old means the
+// editor has been gone for minutes and no dump is coming; the second reading would only delay the
+// answer. The window is deliberately well above BeatSilenceAge: a wedged editor can write its dump
+// long after its last beat, and missing that dump would hide a crash.
+const crashDumpGraceWindow = 10 * time.Minute
+
 // waitForCrashDump takes the one extra reading, after the grace.
 func waitForCrashDump(beat *Instance, since time.Time, baselineBeat int64) SilenceVerdict {
 	time.Sleep(crashArtifactGrace)
@@ -748,7 +773,7 @@ func portScope(inst *Instance) int {
 // reloadNote describes a heartbeat that proves the editor is merely busy, or "" when the silence
 // looks like nothing of the kind.
 func reloadNote(beat *Instance, requestedPort int) string {
-	age := heartbeatAgeOf(beat)
+	age := HeartbeatAge(beat)
 	if beat.Port != requestedPort && age < BeatSilenceAge {
 		return fmt.Sprintf("%s (state %q, pid %d) is answering on port %d now",
 			beat.SourceFile, beat.State, beat.PID, beat.Port)
@@ -788,9 +813,9 @@ func droppedConnection(err error) bool {
 // gone; the margin covers the couple of seconds a domain reload pauses the writes.
 const BeatSilenceAge = 3 * time.Second
 
-// heartbeatAgeOf is how old an instance file's last beat is. A file with no timestamp is treated as
+// HeartbeatAge is how old an instance file's last beat is. A file with no timestamp is treated as
 // ancient rather than fresh, so a connector that never wrote one is never mistaken for a live editor.
-func heartbeatAgeOf(inst *Instance) time.Duration {
+func HeartbeatAge(inst *Instance) time.Duration {
 	if inst == nil || inst.Timestamp <= 0 {
 		return 24 * time.Hour
 	}

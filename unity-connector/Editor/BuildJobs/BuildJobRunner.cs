@@ -49,6 +49,9 @@ namespace UnityCliConnector.BuildJobs
 
         static BuildJobRunner()
         {
+            // A reload abandons Run without running its finally, so the beater that keeps rewriting
+            // the heartbeat from another thread must be stopped here, as ModalWatchdog does.
+            AssemblyReloadEvents.beforeAssemblyReload += StopBeater;
             EditorApplication.quitting += StopBeater;
         }
 

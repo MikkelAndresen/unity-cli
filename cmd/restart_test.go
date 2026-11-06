@@ -266,6 +266,8 @@ func TestRestartCmd_ModalBlocksQuit(t *testing.T) {
 		t.Fatal("must not wait for exit while a modal blocks the editor")
 		return nil
 	}
+	deps.readVersion = func(string) (string, error) { return "6000.1.0f1", nil }
+	deps.findExecutable = func(string, string) (string, error) { return "/Unity", nil }
 
 	_, err := restartCmd(nil, deps)
 	if err == nil {
@@ -297,6 +299,8 @@ func TestRestartCmd_ModalDuringQuitFails(t *testing.T) {
 			Modal:       &client.ModalDialog{ID: 9, Kind: "dialog", Texts: []string{"Restore backup?"}},
 		}, nil
 	}
+	deps.readVersion = func(string) (string, error) { return "6000.1.0f1", nil }
+	deps.findExecutable = func(string, string) (string, error) { return "/Unity", nil }
 	deps.cleanProject = func(string) ([]string, error) {
 		t.Fatal("clean must not run when the editor did not exit")
 		return nil, nil
@@ -394,5 +398,66 @@ func TestRestartCmd_ContainerCannotManagePIDRefusesBeforeQuitting(t *testing.T) 
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("error missing %q:\n%v", want, err)
 		}
+	}
+}
+
+func TestRestartCmd_MissingExecutableRefusesBeforeQuittingOrCleaning(t *testing.T) {
+	var stderr bytes.Buffer
+	deps := restartTestDeps(t, &stderr)
+	project := t.TempDir()
+	deps.discover = func(string, int) (*client.Instance, error) {
+		return &client.Instance{State: "ready", ProjectPath: project, PID: 100, UnityVersion: "6000.1.0f1"}, nil
+	}
+	deps.readVersion = func(string) (string, error) { return "6000.1.0f1", nil }
+	deps.findExecutable = func(string, string) (string, error) {
+		return "", errors.New("unity editor executable not found")
+	}
+	deps.send = func(*client.Instance, string, interface{}, int) (*client.CommandResponse, error) {
+		t.Fatal("quit must not be sent when the executable cannot be resolved")
+		return nil, nil
+	}
+	deps.waitForExit = func(editor.WaitForExitOptions) error {
+		t.Fatal("must not wait when the executable cannot be resolved")
+		return nil
+	}
+	deps.cleanProject = func(string) ([]string, error) {
+		t.Fatal("--clean must not delete Library/ when the executable cannot be resolved")
+		return nil, nil
+	}
+	deps.terminate = func(int) error {
+		t.Fatal("restart must not terminate when the executable cannot be resolved")
+		return nil
+	}
+	deps.launch = func(string, string) (int, error) {
+		t.Fatal("launch must not run when the executable cannot be resolved")
+		return 0, nil
+	}
+
+	_, err := restartCmd([]string{"--clean"}, deps)
+	if err == nil || !strings.Contains(err.Error(), "executable not found") {
+		t.Fatalf("expected executable-not-found error, got %v", err)
+	}
+}
+
+// TestRestartCmd_ContradictoryFlagsStopNothing: restart quits the editor before it relaunches, so a
+// refused flag combination has to be caught before the executable lookup and the quit (F9).
+func TestRestartCmd_ContradictoryFlagsStopNothing(t *testing.T) {
+	var stderr bytes.Buffer
+	deps := restartTestDeps(t, &stderr)
+	deps.discover = func(string, int) (*client.Instance, error) {
+		t.Fatal("discover must not run for a refused flag combination")
+		return nil, nil
+	}
+	deps.findExecutable = func(string, string) (string, error) {
+		t.Fatal("the executable lookup must not run for a refused flag combination")
+		return "", nil
+	}
+
+	_, err := restartCmd([]string{"--save", "--discard"}, deps)
+	if err == nil || !strings.Contains(err.Error(), "--save and --discard are mutually exclusive") {
+		t.Fatalf("error = %v, want the local contradiction check", err)
+	}
+	if stderr.Len() != 0 {
+		t.Errorf("stderr = %q, want nothing printed before the refusal", stderr.String())
 	}
 }

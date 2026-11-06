@@ -7,6 +7,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"strconv"
 	"strings"
@@ -26,6 +27,8 @@ var (
 )
 
 func Execute() error {
+	silenceStdlibLogger()
+
 	flag.IntVar(&flagPort, "port", 0, "Select Unity instance by active heartbeat port")
 	flag.StringVar(&flagProject, "project", "", "Select Unity instance by project path")
 	flag.IntVar(&flagTimeout, "timeout", defaultRequestTimeoutMs, "Request timeout in milliseconds")
@@ -55,6 +58,12 @@ func Execute() error {
 			printTopicHelp(category)
 			return nil
 		}
+	}
+
+	// Before any discovery, any "Stopping Unity" line or any request: a flag this command does not
+	// take is a typo, and ignoring it silently changes what the command does.
+	if err := validateCommandFlags(category, subArgs); err != nil {
+		return err
 	}
 
 	signalCtx, stopSignals := installSignalCancellation()
@@ -98,10 +107,12 @@ func Execute() error {
 				return err
 			}
 			printResponse(resp)
-			if !resp.Success {
-				os.Exit(1)
+			if resp == nil || resp.Success {
+				return nil
 			}
-			return nil
+			// Not reached by today's lifecycle commands (they return an error instead), but a refused
+			// quit must never exit 0. Normal return so the deferred signal handler teardown runs.
+			return fmt.Errorf("%s", resp.Message)
 		}
 	}
 
@@ -116,16 +127,24 @@ func Execute() error {
 	explicitTimeout := flagWasSet("timeout")
 	effectiveTimeout := effectiveInvocationTimeout(category, subArgs, explicitTimeout)
 
+	// Discovery comes before reading a piped snippet: a project with no editor must answer at once
+	// instead of waiting for a producer that may never close.
+	inst, beat, err := discoverInstanceKeepingEvidence(flagProject, flagPort)
+	if err != nil {
+		return noEditor(annotateNoEditorWith(beat, err, flagProject, flagPort))
+	}
+
 	// exec's --await_timeout deliberately outlives the normal request budget, so it must be known
-	// before the one invocation deadline is set. Reading stdin here is safe: this branch is the
-	// only one that consumes it.
+	// before the one invocation deadline is set, and stdin is where it can come from.
 	var execParams map[string]interface{}
 	if category == "exec" {
-		subArgs = readStdinIfPiped(subArgs)
-		var parseErr error
-		execParams, parseErr = buildParams(subArgs, nil)
-		if parseErr != nil {
-			return parseErr
+		subArgs, err = execSnippetArgs(subArgs, effectiveTimeout)
+		if err != nil {
+			return err
+		}
+		execParams, err = buildParams(subArgs, nil)
+		if err != nil {
+			return err
 		}
 		effectiveTimeout = execRequestTimeout(effectiveTimeout, execParams)
 	}
@@ -135,11 +154,6 @@ func Execute() error {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, time.Duration(effectiveTimeout)*time.Millisecond)
 		defer cancel()
-	}
-
-	inst, err := client.DiscoverInstance(flagProject, flagPort)
-	if err != nil {
-		return noEditor(annotateNoEditor(err, flagProject, flagPort))
 	}
 	if err := ctx.Err(); err != nil {
 		return noEditor(invocationDeadlineError(category, effectiveTimeout, err))
@@ -157,14 +171,19 @@ func Execute() error {
 		return client.DiscoverInstance(targetProject, 0)
 	}
 
+	// Wait loops must keep the heartbeat the scan deletes: that file is how a crash during the wait
+	// reaches crashedWhileWaiting instead of looking like an editor that simply has not answered yet.
+	guardProject := targetProject
+	if flagPort > 0 {
+		guardProject = ""
+	}
+	resolveForWait := resolveKeepingEvidence(guardProject, flagPort)
+
 	var alive *client.Instance
-	if category == waitCategory && isStartingState(inst.State) {
-		// wait's own --timeout is the budget for startup, and waitCmd polls "starting" itself.
-		// Holding it in waitForAlive here would spend the global request deadline instead, so
-		// `wait --timeout 2` could sit for two minutes before its own clock even started.
+	if waitOwnsStartup(category, inst.State) {
 		alive = inst
 	} else {
-		alive, err = waitForAliveContext(ctx, resolve, remainingTimeoutMs(ctx, effectiveTimeout))
+		alive, err = waitForAliveContext(ctx, resolveForWait, remainingTimeoutMs(ctx, effectiveTimeout))
 		if err != nil {
 			return noEditor(annotateNoEditor(err, targetProject, flagPort))
 		}
@@ -195,6 +214,15 @@ func Execute() error {
 			return sendAfterReload(ctx, resolve, gate, command, params, 0)
 		}, resolve)
 		resp, err = testCmd(ctx, subArgs, testSend, currentInst.Port)
+		if err == nil && resp != nil {
+			flags, _ := parseSubFlags(subArgs)
+			applyTestVerdict(resp, flags)
+			if resp.Success {
+				if note := staleOutsideSelectionNote(testSend, flags["assembly"]); note != "" {
+					fmt.Fprintf(os.Stderr, "  (%s)\n", note)
+				}
+			}
+		}
 	case "build":
 		// Polling a build must survive the build itself: the main thread is inside BuildPlayer for
 		// the whole run, so the wait runs on build_status (served off the main thread) with its own
@@ -215,13 +243,15 @@ func Execute() error {
 		testSend := sendWatchingModal(func(command string, params interface{}) (*client.CommandResponse, error) {
 			return sendAfterReload(ctx, resolve, gate, command, params, 0)
 		}, resolve)
-		exitNow(verifyCmd(ctx, subArgs, send, testSend, resolve, currentInst.Port, os.Stdout))
+		exitNow(verifyCmd(ctx, subArgs, send, testSend, resolve, currentInst.Port, countedWriter{os.Stdout}))
 	case waitCategory:
-		exitNow(waitCmd(ctx, subArgs, send, resolve, os.Stdout))
+		exitNow(waitCmd(ctx, subArgs, send, resolveForWait, countedWriter{os.Stdout}))
 	case "exec":
 		// --await_timeout already widened the one invocation budget above, so the client never
 		// gives up before the connector's own timed_out marker.
 		resp, err = send("exec", execParams)
+	case "api":
+		resp, err = apiCmd(subArgs, send, os.Stdout)
 	default:
 		var params map[string]interface{}
 		params, err = buildParams(subArgs, nil)
@@ -233,7 +263,7 @@ func Execute() error {
 	// A call whose answer was lost to a reload ended with the editor mid-change and no verdict, so the
 	// heartbeat is read back: whether the change landed is the caller's next question. Commands that
 	// already report the state in their own words (editor play/stop, verify, test, build, wait) are out.
-	lostToReload := answerLostToReload(resp, err) && stateNoteApplies(category)
+	lostToReload := answerLostToReload(resp, err) && stateNoteApplies(category, subArgs)
 
 	// A call that never got a response object has its report carried by the returned error, so the
 	// state line goes into that error rather than onto stderr before it.
@@ -254,12 +284,7 @@ func Execute() error {
 	}
 
 	if err != nil {
-		// A command may answer with a report and still fail (editor refresh --compile prints its
-		// compile report, then exits non-zero), so a failing exit code must not hide the JSON.
-		if resp != nil {
-			printResponse(resp)
-			printStateAfterReload()
-		}
+		printFailureReport(resp, err, printStateAfterReload)
 		return err
 	}
 
@@ -273,15 +298,51 @@ func Execute() error {
 	return nil
 }
 
-// stateNoteApplies excludes the commands that own their own reload wait: they would print the state
-// twice, with different budgets, for the same reload.
-func stateNoteApplies(category string) bool {
-	switch category {
-	case "editor", "test", "verify", "build", waitCategory:
-		return false
-	default:
-		return true
+// silenceStdlibLogger sends the standard logger's output nowhere. net/http reports a leftover
+// response on an idle connection with a bare log.Printf (see client.connectorHTTP, which stops the
+// connections being reused), and that line lands in the middle of a caller's `2>&1 | jq`. Nothing in
+// this CLI logs through the standard logger, so there is no output here worth keeping.
+func silenceStdlibLogger() {
+	log.SetOutput(io.Discard)
+}
+
+// printFailureReport prints a report a command built before failing (editor refresh --compile
+// answers with its compile report and then exits non-zero), so the failing exit code does not hide
+// the JSON the command already produced.
+func printFailureReport(resp *client.CommandResponse, err error, note func()) {
+	if err == nil || resp == nil {
+		return
 	}
+	printResponse(resp)
+	if note != nil {
+		note()
+	}
+}
+
+// stateNoteApplies excludes the commands that own their own reload wait: they would print the state
+// twice, with different budgets, for the same reload. Only `editor play/stop` and
+// `editor refresh --compile` wait for the state; the other editor subcommands do not, so they need
+// the note like any other command.
+func stateNoteApplies(category string, subArgs []string) bool {
+	switch category {
+	case "test", "verify", "build", waitCategory:
+		return false
+	case "editor":
+		if len(subArgs) == 0 {
+			return true
+		}
+		switch subArgs[0] {
+		case "play", "stop":
+			return false
+		case "refresh":
+			for _, arg := range subArgs[1:] {
+				if arg == "--compile" {
+					return false
+				}
+			}
+		}
+	}
+	return true
 }
 
 // sendFn is the function signature for sending a command to Unity.
@@ -291,15 +352,14 @@ type sendFn func(command string, params interface{}) (*client.CommandResponse, e
 // retrySafeCommands may be sent again after an answer was lost: they are reads or idempotent
 // diagnostics, so a second delivery cannot apply an effect twice. State-changing commands are not
 // here; those are retried only when the connection never carried the request (RequestNotDelivered).
+// The key is the command alone, so a tool with any mutating action stays out: `console --clear`
+// and `modal --action answer` apply their effect again on a resend.
 var retrySafeCommands = map[string]struct{}{
+	"api":                 {},
+	"burst_status":        {},
 	"compile_diagnostics": {},
 	"compile_status":      {},
-	"console":             {},
 	"list":                {},
-	"modal":               {},
-	"status":              {},
-	"tool_describe":       {},
-	"tools":               {},
 }
 
 // sendAfterReload makes one request against the freshest heartbeat and, when the connection died to a
@@ -359,6 +419,11 @@ func sendAfterReload(ctx context.Context, resolve instanceResolver, gate *versio
 	if fresh == nil || (fresh.Port == inst.Port && fresh.Timestamp <= inst.Timestamp) {
 		return resp, err
 	}
+	// An explicit --port pins the target. Following the editor to another port would silently
+	// retry against an instance the caller did not select.
+	if flagPort > 0 && fresh.Port != flagPort {
+		return resp, err
+	}
 
 	if !client.RequestNotDelivered(err) {
 		return resp, fmt.Errorf("%w\n  retry:      the editor reloaded and now listens on port %d; the %s may have run — check before retrying", err, fresh.Port, command)
@@ -366,7 +431,17 @@ func sendAfterReload(ctx context.Context, resolve instanceResolver, gate *versio
 	if err := gate.check(fresh); err != nil {
 		return resp, err
 	}
-	return client.SendContext(ctx, fresh, command, params, remainingTimeoutMs(ctx, timeoutMs))
+	return retryOnFresh(ctx, fresh, command, params, timeoutMs, err)
+}
+
+// retryOnFresh sends the retry but keeps the first failure reachable: when both attempts fail, the
+// operator needs the original reload diagnosis, not only the second refusal.
+func retryOnFresh(ctx context.Context, inst *client.Instance, command string, params interface{}, timeoutMs int, first error) (*client.CommandResponse, error) {
+	resp, err := client.SendContext(ctx, inst, command, params, remainingTimeoutMs(ctx, timeoutMs))
+	if err != nil {
+		return resp, fmt.Errorf("%w\n  retry:      the reloaded editor did not answer the retry either: %v", first, err)
+	}
+	return resp, nil
 }
 
 // answerSaysNeverRan reports the connector's own guarantee that the tool handler was never entered:
@@ -398,7 +473,7 @@ func waitForEditorAnswering(ctx context.Context, resolve instanceResolver, budge
 
 	for {
 		inst, err := resolve()
-		if err == nil && isIdleState(inst.State) && heartbeatAge(inst) <= staleHeartbeatAge {
+		if err == nil && isIdleState(inst.State) && client.HeartbeatAge(inst) <= staleHeartbeatAge {
 			return inst, true
 		}
 
@@ -419,13 +494,17 @@ func waitForEditorAnswering(ctx context.Context, resolve instanceResolver, budge
 }
 
 func printResponse(resp *client.CommandResponse) {
-	printResponseTo(os.Stdout, resp)
+	beginStdoutWrite()
+	defer endStdoutWrite()
+	printResponseTo(os.Stdout, os.Stderr, resp)
 }
 
-func printResponseTo(w io.Writer, resp *client.CommandResponse) {
+// printResponseTo writes the result to out and the error/meta lines to errw. Both are parameters so
+// a test can assert the ordering a '2>&1 | tail -1' pipeline sees (#32).
+func printResponseTo(out, errw io.Writer, resp *client.CommandResponse) {
 	defer func() {
 		if line := metaLine(resp.Meta, flagMeta); line != "" {
-			fmt.Fprint(os.Stderr, line)
+			fmt.Fprint(errw, line)
 		}
 	}()
 
@@ -435,12 +514,12 @@ func printResponseTo(w io.Writer, resp *client.CommandResponse) {
 			msg = "unknown error"
 		}
 		if len(resp.Data) > 0 && string(resp.Data) != "null" {
-			fmt.Fprintf(os.Stderr, "Error: %s\nDetails: %s\n", msg, string(resp.Data))
+			fmt.Fprintf(errw, "Error: %s\nDetails: %s\n", msg, string(resp.Data))
 		} else {
-			fmt.Fprintf(os.Stderr, "Error: %s\n", msg)
+			fmt.Fprintf(errw, "Error: %s\n", msg)
 		}
 		if hint := connectorErrorHint(resp); hint != "" {
-			fmt.Fprintf(os.Stderr, "  next:      %s\n", hint)
+			fmt.Fprintf(errw, "  next:      %s\n", hint)
 		}
 		return
 	}
@@ -452,16 +531,16 @@ func printResponseTo(w io.Writer, resp *client.CommandResponse) {
 			if s, ok := pretty.(string); ok {
 				// A result that already ends in a newline must not gain a second one: a
 				// caller using '2>&1 | tail -1' would otherwise get a blank final line (#32).
-				fmt.Fprint(w, oneTrailingNewline(s))
+				fmt.Fprint(out, oneTrailingNewline(s))
 			} else {
 				b, _ := json.MarshalIndent(pretty, "", "  ")
-				fmt.Fprint(w, oneTrailingNewline(string(b)))
+				fmt.Fprint(out, oneTrailingNewline(string(b)))
 			}
 		} else {
-			fmt.Fprint(w, oneTrailingNewline(string(resp.Data)))
+			fmt.Fprint(out, oneTrailingNewline(string(resp.Data)))
 		}
 	} else if resp.Message != "" {
-		fmt.Fprint(w, oneTrailingNewline(resp.Message))
+		fmt.Fprint(out, oneTrailingNewline(resp.Message))
 	}
 }
 
@@ -492,28 +571,17 @@ func parseSubFlags(args []string) (map[string]string, error) {
 // Only --params may repeat (its objects are merged by buildParams); every other flag names one
 // value, so a second occurrence is an error rather than a silent overwrite.
 func parseFlagArgs(args []string) (flags map[string]string, paramsJSON, positional []string, err error) {
+	tokens, positional := scanArgs(args)
 	flags = map[string]string{}
-	for i := 0; i < len(args); i++ {
-		a := args[i]
-		if !strings.HasPrefix(a, "--") {
-			positional = append(positional, a)
+	for _, token := range tokens {
+		if token.name == "params" {
+			paramsJSON = append(paramsJSON, token.value)
 			continue
 		}
-
-		key := a[2:]
-		value := "true"
-		if i+1 < len(args) && !strings.HasPrefix(args[i+1], "--") {
-			value = args[i+1]
-			i++
+		if previous, exists := flags[token.name]; exists {
+			return nil, nil, nil, fmt.Errorf("duplicate flag --%s (first %q, then %q); only --params may be repeated", token.name, previous, token.value)
 		}
-		if key == "params" {
-			paramsJSON = append(paramsJSON, value)
-			continue
-		}
-		if previous, exists := flags[key]; exists {
-			return nil, nil, nil, fmt.Errorf("duplicate flag --%s (first %q, then %q); only --params may be repeated", key, previous, value)
-		}
-		flags[key] = value
+		flags[token.name] = token.value
 	}
 	return flags, paramsJSON, positional, nil
 }
@@ -543,10 +611,35 @@ func effectiveInvocationTimeout(category string, subArgs []string, explicit bool
 	if explicit {
 		return flagTimeout
 	}
+	if category == "burst_status" {
+		return burstWaitRequestMs(flagTimeout, subArgs)
+	}
 	if commandRunsLong(category, subArgs) {
 		return longCommandTimeoutMs
 	}
 	return flagTimeout
+}
+
+// burstWaitRequestMs widens a burst_status invocation's budget so the client does not give up while
+// the connector is still inside its own bounded wait (--wait is in seconds).
+func burstWaitRequestMs(flagTimeoutMs int, subArgs []string) int {
+	flags, err := parseSubFlags(subArgs)
+	if err != nil {
+		return flagTimeoutMs
+	}
+	raw, ok := flags["wait"]
+	if !ok || flagTimeoutMs <= 0 {
+		return flagTimeoutMs
+	}
+	seconds, convErr := strconv.ParseFloat(raw, 64)
+	if convErr != nil || seconds <= 0 {
+		return flagTimeoutMs
+	}
+	const waitSlackMs = 30000
+	if want := int(seconds*1000) + waitSlackMs; want > flagTimeoutMs {
+		return want
+	}
+	return flagTimeoutMs
 }
 
 func commandRunsLong(category string, subArgs []string) bool {
@@ -590,7 +683,7 @@ func remainingTimeoutMs(ctx context.Context, fallback int) int {
 func invocationDeadlineError(category string, timeoutMs int, cause error) error {
 	if cause == context.DeadlineExceeded {
 		return fmt.Errorf("timed out after %s waiting for Unity to answer %s (the editor may still be running it)",
-			(time.Duration(timeoutMs) * time.Millisecond).String(), category)
+			client.FormatBudget(time.Duration(timeoutMs)*time.Millisecond), category)
 	}
 	return fmt.Errorf("request cancelled: %w", cause)
 }
@@ -675,21 +768,57 @@ func buildParams(args []string, base map[string]interface{}) (map[string]interfa
 	return params, nil
 }
 
-// readStdinIfPiped reads stdin when piped and prepends it as the first positional arg.
-func readStdinIfPiped(args []string) []string {
+// execSnippetArgs takes exec's code from stdin only when no code argument was given. Agent shells
+// often hand the CLI a stdin pipe that never closes, so reading it next to an argument stalled every
+// `exec "<code>"` for the whole --timeout.
+func execSnippetArgs(args []string, timeoutMs int) ([]string, error) {
+	if _, positional := scanArgs(args); len(positional) > 0 {
+		return args, nil
+	}
+	args, _, err := readStdinIfPiped(args, timeoutMs)
+	return args, err
+}
+
+// readStdinIfPiped reads stdin when piped and prepends it as the first positional arg. The read is
+// bounded by timeoutMs (0 = no bound): a producer that never closes must not outlast --timeout.
+// read reports whether a snippet actually came in, which is what tells a piped call from a terminal
+// one when the caller also passed a code argument.
+func readStdinIfPiped(args []string, timeoutMs int) ([]string, bool, error) {
 	info, err := os.Stdin.Stat()
 	if err != nil {
-		return args
+		return args, false, nil
 	}
 	if info.Mode()&os.ModeCharDevice != 0 {
-		return args // interactive terminal, not piped
+		return args, false, nil // interactive terminal, not piped
 	}
-	data, err := io.ReadAll(os.Stdin)
-	if err != nil || len(data) == 0 {
-		return args
+
+	type readResult struct {
+		data []byte
+		err  error
 	}
-	code := strings.TrimRight(string(data), "\n\r")
-	return append([]string{code}, args...)
+	done := make(chan readResult, 1)
+	go func() {
+		data, err := io.ReadAll(os.Stdin)
+		done <- readResult{data, err}
+	}()
+
+	var res readResult
+	if timeoutMs > 0 {
+		budget := time.Duration(timeoutMs) * time.Millisecond
+		select {
+		case res = <-done:
+		case <-time.After(budget):
+			return args, false, fmt.Errorf("timed out after %s reading piped stdin (--timeout); close the producer or pass the snippet as an argument",
+				client.FormatBudget(budget))
+		}
+	} else {
+		res = <-done
+	}
+	if res.err != nil || len(res.data) == 0 {
+		return args, false, nil
+	}
+	code := strings.TrimRight(string(res.data), "\n\r")
+	return append([]string{code}, args...), true, nil
 }
 
 // splitArgs separates global flags from subcommand args.
@@ -736,7 +865,11 @@ func splitArgs(args []string) (flags, commands []string) {
 }
 
 func printHelp() {
-	fmt.Print(`unity-cli ` + Version + ` — Control Unity Editor from the command line
+	printHelpTo(os.Stdout)
+}
+
+func printHelpTo(w io.Writer) {
+	fmt.Fprint(w, `unity-cli `+Version+` — Control Unity Editor from the command line
 
 Usage: unity-cli <command> [subcommand] [options]
 
@@ -754,24 +887,17 @@ Editor Control:
   editor restart [--clean] [--save|--discard] [--force] [--editor-path <exe>]
                                 Quit, optionally clean Library/Temp, relaunch, wait until ready
 
-Input Injection (Play mode, new Input System only):
-  input key <name> [press|release|tap]   e.g. input key Space press
-  input mouse --x 100 --y 200            Game view pixels; --button left --mode click
-  input gamepad|axis --control leftStick --x 1 --y 0
-  input touch --x 64 --y 128 --mode tap
-  input state                     Keys/mouse/gamepads as the Input System currently sees them
-  input reset                     Release injected state, drop virtual devices, restore settings
-
 Console:
   console                       Newest 50 entries, capped stack traces (default)
   console --lines 20            Newest N entries
   console --type error,warning,log   Filter by log types (comma-separated)
   console --stacktrace full     Stack trace: none, user (default), full
-  console --full                No caps: every entry, frame and character
+  console --full                No size caps (the stacktrace mode still filters frames)
   console --clear               Clear console
 
 Execute C#:
-  exec "<code>"                 Run C# code in Unity (return required for output)
+  exec "<code>"                 Run C# code in Unity (a single expression is returned as-is;
+                                statements need 'return' to produce output)
   echo '<code>' | exec          Pipe code via stdin (avoids shell escaping)
   exec "<code>" --usings x,y    Add extra using directives
   exec "<code>" --no_default_usings     Drop the default usings and aliases
@@ -823,7 +949,8 @@ Burst:
 Tests:
   test                            Run EditMode tests (default)
   test --mode PlayMode            Run PlayMode tests
-  test --filter <name>            Filter by namespace, class, or full test name
+  test --filter <name>            A class, test or namespace, by whole name segments (BowTests,
+                                  Ns.BowTests, BowTests.Fires); a regex is used as one
   test --allow-dirty-scenes       Run even when open scenes have unsaved changes
   test --auto-save-scenes         Save dirty open scenes before running tests
   test --assembly <a,b>           Only tests in these assemblies
@@ -895,8 +1022,10 @@ Profiler:
 Input Injection (Play mode):
   input key <name> [press|release|tap]   Keyboard key by Key enum name (Space, W, LeftShift)
   input mouse [--x --y | --dx --dy] [--button left|right|middle|forward|back] [--mode ...]
+                                Game view pixels (0,0 = top-left); --dx/--dy grow right/down
   input gamepad|axis --control <name> [--x --y | --value] [--mode set|press|release|tap]
   input touch [--x --y] [--mode began|moved|stationary|ended|tap] [--index N]
+                                Same top-left Game view pixels as mouse
   input state                      Report pressed keys, mouse position, gamepads, focus, settings
   input reset                      Release everything, remove virtual devices, restore settings
 
@@ -924,8 +1053,9 @@ Status:
                                 editor_starting_or_blocked means Unity is open but the connector
                                 has not loaded; editor_unresponsive means it loaded this session and
                                 stopped answering; see "unity-cli dialogs --help"
-                                crashed means the editor process died instead: the report names the
-                                crash log and its first exception line, and the command exits non-zero
+                                crashed means the editor process died instead: the report (on stderr,
+                                with stdout left empty) names the crash log and its first exception
+                                line, and the command exits non-zero
 
 Update:
   update                        Update to the latest version
@@ -946,7 +1076,13 @@ Global Options:
                       Per call, --params '{"queue_deadline_ms":300000}' overrides that wait.
   --ignore-version-mismatch
                       Run even when CLI and connector versions differ
-  --meta              Print the response's meta (how the call was served) to stderr
+  --meta              Print the response's meta (how the call was served) to stderr. exec reports
+                      compile (compiled|cached), compile_ms (the csc subprocess only) and
+                      reference_assemblies. A queued command that waited >= 1 s for the main thread
+                      also carries queue_wait_ms (accept to handler start), total_ms (accept to
+                      result, so it contains queue_wait_ms and compile_ms) and queue_depth. The HTTP
+                      round trip and the CLI's discovery are outside total_ms, so no field is a
+                      wall-clock total.
 
 Use "unity-cli <command> --help" for more information about a command.
 
@@ -955,6 +1091,11 @@ Notes:
   - Multiple Unity instances: use --port or --project to select
   - Custom tools: any [UnityCliTool] class is auto-discovered
   - A subcommand flag other than --params may be given once; repeating it is an error, not a silent overwrite
+  - A subcommand flag must be one the command takes; an unknown flag is an error (exit 1) instead of
+    being ignored, so a typo cannot quietly change what runs
+  - Only exec, build and custom tools read --params; test, verify, editor and wait take their own flags
+  - Custom tools are the exception: their parameters belong to the connector, which refuses one it
+    does not know with data.code "unknown_parameter"
   - Run 'list' to see all available tools
   - Every accepted command gets one answer: a queued command that the main thread never starts is
     answered as main_thread_busy, one still queued when Unity reloads as domain_reload (retry it),
@@ -964,24 +1105,30 @@ Notes:
 }
 
 func printTopicHelp(topic string) {
+	printTopicHelpTo(os.Stdout, topic)
+}
+
+func printTopicHelpTo(w io.Writer, topic string) {
 	switch topic {
 	case "input":
-		fmt.Print(`Usage: unity-cli input <key|mouse|gamepad|axis|touch|state|reset> [options]
+		fmt.Fprint(w, `Usage: unity-cli input <key|mouse|gamepad|axis|touch|state|reset> [options]
 
 Injects device state into the new Input System (com.unity.inputsystem) and pumps the player loop
-so the events are consumed inside the same call. No OS keystrokes are involved.
+so the player update consumes the events inside the same call — game Update() sees fresh press/release
+edges. No OS keystrokes are involved.
 
 Actions:
   key <name> [press|release|tap]   Key enum name: Space, W, A, LeftShift, Enter, Digit1 …
                                    Aliases: ctrl, alt, shift, cmd, esc, return, up, down.
                                    Default mode: press. --hold_ms / --hold_frames tune a tap.
-  mouse                            --x/--y (Game view pixels, 0,0 = top-left), --dx/--dy,
-                                   --button left|right|middle|forward|back, --scroll_x/--scroll_y,
-                                   --mode press|release|tap|click|move|set.
+  mouse                            --x/--y (Game view pixels, 0,0 = top-left; --dx/--dy grow
+                                   right/down), --button left|right|middle|forward|back,
+                                   --scroll_x/--scroll_y, --mode press|release|tap|click|move|set.
   gamepad / axis                   --control leftStick|rightStick|dpad|leftTrigger|buttonSouth|…
                                    --x/--y for sticks, --value for buttons/triggers (default 1),
                                    --mode set|press|release|tap. Adds a virtual Gamepad on demand.
-  touch                            --x/--y, --mode began|moved|stationary|ended|tap, --index N.
+  touch                            --x/--y in the same top-left Game view pixels as mouse,
+                                   --mode began|moved|stationary|ended|tap, --index N.
                                    Adds a virtual Touchscreen on demand.
   state                            Read-only: pressed keys, mouse position/buttons/scroll,
                                    gamepad axes, touch phase, focus flags and InputSettings.
@@ -990,16 +1137,23 @@ Actions:
 
 Response fields:
   consumed                The device state now matches the request (isPressed / value read back).
-  fresh_press_frames      Input updates that saw the control as freshly pressed — what game code
-                          in Update() sees through wasPressedThisFrame. The was_pressed_this_frame
-                          field of 'state' is read after the tool's own input update, so it is
-                          usually false.
+  fresh_press_frames      Player-loop input updates that saw the control as freshly pressed — what
+                          game Update() sees through wasPressedThisFrame. The tool's own readback
+                          updates are not counted, and was_pressed_this_frame is read after them, so
+                          it is usually false.
   held_state / state      The control read back while held and after the final pump.
+  position / space        Mouse/touch position echoed in the caller's space, top_left_px (Game view
+                          pixels, 0,0 at the top-left). 'state' reports mouse/touch positions in the
+                          same space under position_space.
   focus.*                game_view_focused (a Game View window has editor focus),
                           application_is_focused (what the Input System's own focus gating uses),
                           editor_focused (Unity is the frontmost application).
   settings.*              InputSettings in effect, the values saved before the override, and
                           held_controls — what is still keeping the override in place.
+
+Mouse/touch Y is converted to the Input System's bottom-left screen space with the Game view render
+height (the value Screen.height reports once the player loop has rendered); replies keep the top-left
+coordinates the caller used.
 
 Injected events are visible to the new Input System only. Code reading UnityEngine.Input or
 IMGUI Event sees nothing; every injection response repeats this in legacy_input_note.
@@ -1022,10 +1176,10 @@ Examples:
   unity-cli editor stop
 `)
 	case "editor":
-		fmt.Print(`Usage: unity-cli editor <play|stop|pause|refresh|quit|restart> [options]
+		fmt.Fprint(w, `Usage: unity-cli editor <play|stop|pause|refresh|quit|restart> [options]
 
 Subcommands:
-  play [--wait]       Enter play mode.
+  play [--wait|--no-wait]  Enter play mode.
                       Answers once the heartbeat reports the editor is in Play mode, which is
                       how a change that reloads the domain is confirmed: the connector that
                       asked for the reload cannot report its own result across it.
@@ -1034,7 +1188,7 @@ Subcommands:
   stop [--no-wait]    Exit play mode. No effect if not playing.
                       Confirmed from the heartbeat like play.
     --no-wait         Return as soon as the change is requested, without reading the
-                      resulting state back.
+                      resulting state back. --wait and --no-wait are mutually exclusive.
   pause               Toggle pause. Only works during play mode.
   refresh             Refresh AssetDatabase (reimport changed assets).
                       Blocked in play mode unless --force is set.
@@ -1049,14 +1203,19 @@ Subcommands:
                       source file was written after the compile), so it says which edit it covers.
                       If an assembly is still older than its sources, one CleanBuildCache rebuild
                       is requested and stale_after_compile reports whether that fixed it.
-                      Exit 1 when the compile failed or timed out; the report is still printed.
+                      error_count is the true total; errors[] is capped at 20 entries and the
+                      report says when it was cut. Exit 1 when the compile failed or timed out; the
+                      report is still printed. "clean" is refused on a connector that does not
+                      advertise support, instead of silently doing a plain compile.
     --keep-console    With --compile, don't clear the console first (the default clear keeps
                       stale errors from a previous compile out of the report).
     --force           Allow refresh during play mode and force asset update.
-  quit                Quit Unity and wait until the heartbeat or process confirms
-                      the exit. Unsaved scene changes are discarded unless --save.
+  quit                Quit Unity and wait until its heartbeat reports stopped or
+                      stops advancing. Unsaved scene changes are discarded unless --save.
     --save            Save open scenes and assets before quitting.
     --discard         Discard unsaved scene changes explicitly (the default).
+                      --save and --discard are mutually exclusive, and the CLI refuses the pair
+                      before it announces or asks for anything.
     --force           If Unity ignores the quit or a modal dialog blocks it,
                       terminate the process (SIGTERM on unix).
   restart             Quit Unity, relaunch the same project, and wait until ready.
@@ -1083,7 +1242,7 @@ Examples:
   unity-cli editor restart --clean
 `)
 	case "console":
-		fmt.Print(`Usage: unity-cli console [options]
+		fmt.Fprint(w, `Usage: unity-cli console [options]
 
 Read Unity console log entries.
 
@@ -1100,7 +1259,7 @@ Options:
   --frames <N>         Stack frames kept per entry (default 6; 0 = none, -1 = all)
   --entry_chars <N>    Max characters per entry (default 1000; 0 = no limit)
   --max_bytes <N>      Max total bytes of entry text (default 15360; 0 = no limit)
-  --full               Remove every cap
+  --full               Remove every size cap (stacktrace mode still filters frames)
   --clear              Clear console
 
 Examples:
@@ -1112,12 +1271,15 @@ Examples:
   unity-cli console --clear
 `)
 	case "exec":
-		fmt.Print(`Usage: unity-cli exec "<code>" [options]
+		fmt.Fprint(w, `Usage: unity-cli exec "<code>" [options]
 
 Execute C# code inside Unity Editor. Full access to UnityEngine,
 UnityEditor, and all loaded assemblies.
 
-Use 'return' to get output. Add --usings for types outside default namespaces.
+A snippet that is a single expression returns that expression's value, so exec "Time.time" answers
+with a number. Anything past one expression is a statement body: use 'return' to get output
+(a body without one runs and answers null).
+Add --usings for types outside default namespaces.
 Using directives at the top of the snippet are moved above the generated method,
 and an alias there overrides the matching default alias.
 
@@ -1180,10 +1342,11 @@ Stdin:
   echo '<code>' | unity-cli exec [--usings ns1,ns2]
 
 Notes:
-  - Use 'return' for output, 'return null;' for void operations
+  - One bare expression is returned for you; a body of statements needs 'return' for output
+    ('return null;' for a void operation)
 `)
 	case "menu":
-		fmt.Print(`Usage: unity-cli menu "<path>"
+		fmt.Fprint(w, `Usage: unity-cli menu "<path>"
 
 Execute a Unity menu item by its path.
 
@@ -1195,7 +1358,7 @@ Examples:
 Note: File/Quit is blocked for safety.
 `)
 	case "screenshot":
-		fmt.Print(`Usage: unity-cli screenshot [options]
+		fmt.Fprint(w, `Usage: unity-cli screenshot [options]
 
 Capture a PNG of what Unity is rendering. No mode reads screen pixels of an
 editor window, so a window moved off every display cannot break a capture.
@@ -1230,7 +1393,7 @@ Note: --view is the older spelling of --mode: --view scene is --mode scene, but
 --view game is --mode camera (the offscreen render), not the Game view.
 `)
 	case "reserialize":
-		fmt.Print(`Usage: unity-cli reserialize [path...]
+		fmt.Fprint(w, `Usage: unity-cli reserialize [path...]
 
 Force Unity to reserialize assets through its own YAML serializer.
 Run after editing .prefab, .unity, .asset, or .mat files as text.
@@ -1242,7 +1405,7 @@ Examples:
   unity-cli reserialize Assets/Scenes/Main.unity Assets/Scenes/Lobby.unity
 `)
 	case "clear_burst_cache":
-		fmt.Print(`Usage: unity-cli clear_burst_cache [options]
+		fmt.Fprint(w, `Usage: unity-cli clear_burst_cache [options]
 
 Delete the project's Burst compilation cache (<project>/Library/BurstCache) and
 report how many files and bytes were removed.
@@ -1265,14 +1428,15 @@ Examples:
   unity-cli clear_burst_cache --scope jit
 `)
 	case "burst_status":
-		fmt.Print(`Usage: unity-cli burst_status [options]
+		fmt.Fprint(w, `Usage: unity-cli burst_status [options]
 
 Ask Burst what it has compiled. Burst compiles outside Unity's script compilation,
 so a clean C# compile and a quiet console do not prove a [BurstCompile] job was
 compiled — and a Burst (BCxxxx) error can appear after the compile finished.
 
 Reports whether Burst's own queue is idle, and the [BurstCompile] targets in the
-project's own assemblies (package assemblies are left out unless --include_packages)
+project's own assemblies: Assets/ plus embedded and file: packages (registry, git and built-in
+package assemblies are left out unless --include_packages)
 with status compiled / failed / not-compiled-yet / unknown. Default output is short:
 counts plus the Burst errors, each as file:line:col CODE message.
 
@@ -1306,7 +1470,7 @@ Examples:
   unity-cli burst_status --compile --wait 120 --timeout 130000
 `)
 	case "profiler":
-		fmt.Print(`Usage: unity-cli profiler <subcommand> [options]
+		fmt.Fprint(w, `Usage: unity-cli profiler <subcommand> [options]
 
 Subcommands:
   hierarchy             Top-level profiler samples (last frame)
@@ -1333,14 +1497,18 @@ Examples:
   unity-cli profiler enable
 `)
 	case "test":
-		fmt.Print(`Usage: unity-cli test [options]
+		fmt.Fprint(w, `Usage: unity-cli test [options]
 
 Run Unity tests via the Test Runner API.
 
 Options:
   --mode <EditMode|PlayMode>    Test mode (default: EditMode)
-  --filter <name>               Filter by namespace, class, or full test name
-                                Must be the full path (e.g. MyNamespace.MyClass)
+  --filter <name>               Only the tests whose full name contains <name> as whole dot-separated
+                                segments: a class (MyTests or Namespace.MyTests), a test
+                                (MyTests.TestName) or a namespace prefix. Part of a segment matches
+                                nothing (My does not select MyTests). A filter with regex syntax
+                                (^ $ * + ? [ ] { } | \) is used as a regex on the full name. A filter
+                                that selects no test is reported as such, not as a passing run
   --assembly <a,b>              Only tests in these assemblies (comma-separated)
   --allow-dirty-scenes          Run even when open scenes have unsaved changes
   --auto-save-scenes            Save dirty open scenes before running tests
@@ -1351,9 +1519,14 @@ instead of the global 120 s. --timeout <ms> overrides it; --timeout 0 means no d
 
 EditMode tests hold the connection open and return results directly.
 PlayMode tests return immediately and poll a results file (domain reload safe).
-By default, tests are blocked when any open scene has unsaved changes, and when a project assembly
-is older than its sources (a stale DLL runs old code). Fix that with
+By default, tests are blocked when any open scene has unsaved changes, and when an assembly under
+test is older than its sources (a stale DLL runs old code). Fix that with
 'unity-cli editor refresh --compile', or pass --allow-stale deliberately.
+
+Exit codes:
+  0  at least one test ran and none failed
+  1  a test failed, the run was refused (dirty scenes, stale assemblies, compile gate), or no test
+     matched: "no tests matched (filter …, assembly …)"
 
 Requires the Unity Test Framework package (com.unity.test-framework).
 
@@ -1366,14 +1539,15 @@ Examples:
   unity-cli test --mode EditMode --filter MyNamespace.MyTests.SpecificTest
 `)
 	case "verify":
-		fmt.Print(`Usage: unity-cli verify [options]
+		fmt.Fprint(w, `Usage: unity-cli verify [options]
 
 Check that the project compiles and its tests pass, in one call, with output
 brief enough for an agent's context:
 
   1. Clears the console (a Burst error stays there after its code changes;
      Burst logs a live one again on the next compile). --keep-console skips it.
-  2. Refreshes assets, compiles, and waits for it to finish.
+  2. Refreshes assets, compiles, and waits for it to finish. If no compilation is observed
+     (the editor was already ready), verify says so and reports the editor's current state.
   3. Lists this compile's errors in your code as file:line:col CODE message. An error that names a
      member or type the compiler could not find, or an API that is obsolete (CS0117, CS1061, CS0246,
      CS0234, CS0619, CS0618), prints an indented 'hint:' line under it with the closest real
@@ -1382,9 +1556,10 @@ brief enough for an agent's context:
   4. Asks Burst (burst_status) whether it is still compiling, what compiled, and
      what failed, waiting up to --burst-wait seconds. Burst errors print the same
      way as compile errors and fail verify. --no-burst skips the step; projects
-     without Burst print nothing.
+     without Burst, or with nothing compiled and nothing wrong, print nothing.
   5. Unless --no-tests: saves dirty open scenes and runs the tests, then
-     prints passed/total and the first line of each failure.
+     prints passed/total and the first line of each failure, plus any exception
+     the failing test logged ("logged <Exception>: … (at file:line)").
 
 Every compile result says which compile it reflects, so a clean answer is told apart from a stale
 one. verify prints the connector's provenance line after the compile verdict:
@@ -1393,12 +1568,12 @@ one. verify prints the connector's provenance line after the compile verdict:
   compiled 14:02:11 (3 s ago, took 2.2 s) · 1 source file changed since previous compile · rebuilt: Game.Tests.Editor
   stale: Assets/Foo.cs modified after this compile — run verify again
   stale assembly: Game.Tests.dll (built 14:01:50) is older than Assets/Game/Tests.cs (14:04:02) — run unity-cli editor refresh --compile
-  not stale: Game.Tests.dll (built 14:01:50) is older than Assets/Game/Tests.cs (14:04:02), but the compile that started 14:05:10 read that source and kept the DLL; a moved mtime alone does not mean the DLL is out of date
 
 The stale line means a source file under Assets/ or a file:/embedded package was written after that
 compile: the edit is in the project but not in the result. A stale assembly means the DLL the tests
 would load is older than its sources; verify refuses to run tests until a clean refresh, unless
---allow-stale is passed. The "not stale" line is the opposite case: Unity does not rewrite a DLL whose
+--allow-stale is passed. The "not stale" case (printed by 'unity-cli wait'; verify keeps it to
+--json, since it changes nothing verify does) is the opposite: Unity does not rewrite a DLL whose
 contents it considers current, so a source whose timestamp merely moved (touch, re-checkout) stays
 older than its DLL even though a compile read it — it is reported, and the tests run. --json carries
 the same fields under compile.provenance (unix ms and ISO timestamps). See 'unity-cli wait --help' to
@@ -1408,10 +1583,13 @@ Options:
   --no-tests                    Stop after the compile
   --no-burst                    Skip the Burst step
   --burst-wait <seconds>        How long to wait for Burst to go idle (default 60)
-  --assembly <a,b>              Only tests in these assemblies (comma-separated)
-  --filter <name>               Filter by namespace, class, or full test name
+  --assembly <a,b>              Only tests in these assemblies (comma-separated). A stale
+                                assembly outside this list is reported but does not refuse.
+  --filter <name>               Only tests whose full name contains <name> as whole segments (a
+                                class, Class.Test, or a namespace prefix); see 'unity-cli test --help'
   --mode <EditMode|PlayMode>    Test mode (default: EditMode)
-  --max <n>                     List at most n errors and n failures (default 20)
+  --max <n>                     List at most n errors and n failures (default 20); the error
+                                count is still the true total
   --keep-console                Don't clear the console first
   --allow-stale                 Run tests even when an assembly is older than its sources
   --json                        One JSON object instead of text
@@ -1441,7 +1619,7 @@ Examples:
   unity-cli verify --json
 `)
 	case "modal":
-		fmt.Print(`Usage: unity-cli modal [list|answer] [options]
+		fmt.Fprint(w, `Usage: unity-cli modal [list|answer] [options]
 
 Inspect or answer a modal dialog that blocks the Unity Editor (macOS only).
 
@@ -1467,28 +1645,33 @@ Examples:
   unity-cli modal answer --index 0 --id 27186
 `)
 	case "dialogs":
-		fmt.Print(`Usage: unity-cli dialogs [--click "<button title>"] [--window "<window title>"]
+		fmt.Fprint(w, `Usage: unity-cli dialogs [--click "<button title>"] [--window "<window title>"]
 
 List — and optionally answer — the windows of the Unity processes on this machine,
 read from OUTSIDE the editor with AppleScript + System Events (Accessibility).
 
 This is the only way to see a dialog that appears before the connector assembly loads:
 license / sign-in prompts, safe mode, "project already open", package resolution.
-status reports that window as "editor_starting_or_blocked".
+status reports that window as "editor_starting_or_blocked" (or, once a heartbeat has stopped
+answering, "editor_unresponsive").
 
 macOS only: on other systems the command explains that it must run on the macOS host.
 The agent sandbox is granted no Accessibility permission, so run it in a Terminal on
 the host.
 
 Options:
-  --click "<title>"  Press the button. Exact title first, then a case-insensitive
-                     substring match against the titles just listed.
+  --click "<title>"  Press the button. Exact title first, then a case- and
+                     apostrophe-insensitive match from the start of the title
+                     ("Continue" also matches "Continue Anyway", but "Save" does
+                     not match "Don't Save").
   --window "<title>" Only click in a window whose title contains this. Also used to
                      break a tie when the same button title is on several windows.
 
 Windows are narrowed to the requested project (--project, or the running instance) by
 matching the project folder name in the window title; when nothing matches, every
 Unity window is listed instead, because startup dialogs rarely name the project.
+A click in that unfiltered listing needs --window unless all listed windows belong to
+one Unity process, so it cannot press a button in another project's editor.
 
 Output is JSON: pid, window title, role, button titles, and the window's static
 texts (capped at 12 per window; texts_total reports the real count).
@@ -1510,7 +1693,7 @@ Examples:
 See also: 'unity-cli modal' — the in-editor equivalent, available once the connector loads.
 `)
 	case "build":
-		fmt.Print(`Usage: unity-cli build [--profile <name> | --target <BuildTarget>] --output <path> [options]
+		fmt.Fprint(w, `Usage: unity-cli build [--profile <name> | --target <BuildTarget>] --output <path> [options]
        unity-cli build status [id]
 
 Starts a player build as a job. The connector validates the parameters, records the job, and returns
@@ -1574,7 +1757,7 @@ Examples:
   unity-cli status                 # shows: Unity (port 8090): building
 `)
 	case "wait":
-		fmt.Print(`Usage: unity-cli wait [--compile] [--timeout <seconds>] [--json]
+		fmt.Fprint(w, `Usage: unity-cli wait [--compile] [--timeout <seconds>] [--json]
 
 Blocks until the editor stops reporting work in progress, then prints its state and the compile
 provenance line. It replaces the 'sleep 45 && unity-cli compile_errors' loop: the answer says both
@@ -1589,6 +1772,8 @@ Options:
                      finished after wait started (connector compile clock, compared to the value at
                      wait start — no local clock involved), OR the source scan finds nothing newer
                      than that compile. Without it, wait only reports the state.
+                     A connector that cannot prove it answers exit 1: no compile clock on the
+                     heartbeat, or compile_status not answering, is "could not prove", never "in".
   --timeout <second> Give up after this many seconds (default 120) and exit 1. For wait this flag is
                      seconds and must come after the command name; the global --timeout (before it)
                      stays an HTTP request timeout in milliseconds.
@@ -1611,7 +1796,10 @@ the editor's main thread, saying so instead of stalling the editor.
 
 Exit codes:
   0  the editor is idle (and with --compile, the edit is provably in)
-  1  the editor was still working when --timeout ran out
+  1  the editor was still working when --timeout ran out, or --compile could not be proven: the
+     connector reports no compile clock, compile_status did not answer, or uncompiled sources
+     stayed uncompiled. The reason is printed, with the command that does prove it
+     (unity-cli verify, or unity-cli editor refresh --compile)
   2  the editor could not answer: not running, heartbeat silent, or blocked by a modal dialog
      (named, with the command that answers it)
 
@@ -1622,7 +1810,7 @@ Examples:
   unity-cli editor refresh --compile && unity-cli wait --compile
 `)
 	case "api":
-		fmt.Print(`Usage: unity-cli api <Type>[.<Member>] [options]
+		fmt.Fprint(w, `Usage: unity-cli api <Type>[.<Member>] [options]
 
 What the API actually is, read off the assemblies the editor has loaded — the same set
 the project's code compiles against. Text search over Library/PackageCache disagrees with
@@ -1634,9 +1822,21 @@ what compiled (hashed folders, stubs, #if branches); reflection cannot.
   api EditorApplication       a bounded member summary (all members are counted, not listed)
   api List.Add                the member reading: last '.' splits type from member
 
+The answer is text: a header per type (full name, kind, assembly; for a type query also its
+base type, interfaces and member counts), then one C# signature per member:
+
+  Unity.Entities.SystemAPI (static class, Unity.Entities)
+    public static bool TryGetSingletonBuffer<T>(out DynamicBuffer<T> value, bool isReadOnly = false) where T : unmanaged, IBufferElementData
+
+--json prints the connector's full reply instead.
+
 Type queries accept the simple name, the full name, and either spelling of a generic
 (BufferLookup, BufferLookup<T>, or the reflection spelling with its arity suffix). When
 several types match, all of them are described, best match first, up to --max_types.
+
+A query that names nothing real is not a successful lookup: when no type or member matches
+exactly, a query the connector can only approximate prints "no exact match; closest: …" first
+and still answers (exit 0), and a query with nothing close exits 1.
 
 [Obsolete] members report the message, whether it is an error, and the replacement when the
 notice names one ("Use X instead", "(UnityUpgradable) -> X").
@@ -1649,8 +1849,9 @@ Options:
   --limit <n>        Max members listed per type (default 20)
   --max_types <n>    Max types to describe when several match (default 5)
   --budget <ms>      How long the assembly scan may take (default 1500)
+  --json             Print the connector's JSON reply instead of text
 
-The index is built lazily and cached per domain; 'index.complete: false' means the budget ran
+The index is built lazily and cached per domain; 'index.complete: false' (--json) means the budget ran
 out and some assemblies are not searchable yet — raise --budget or ask again.
 
 Examples:
@@ -1660,7 +1861,7 @@ Examples:
   unity-cli api GetSingletonBuffer --assembly Entities
 `)
 	case "compile_status":
-		fmt.Print(`Usage: unity-cli compile_status [--scan false] [--scan_budget <ms>]
+		fmt.Fprint(w, `Usage: unity-cli compile_status [--scan false] [--scan_budget <ms>]
 
 What the last script compilation covers, without waiting or compiling:
 when it finished (unix ms, ISO and a printed line), how long it took, which assemblies it rebuilt,
@@ -1690,7 +1891,7 @@ Examples:
   unity-cli compile_status --scan_budget 1000
 `)
 	case "list":
-		fmt.Print(`Usage: unity-cli list
+		fmt.Fprint(w, `Usage: unity-cli list
 
 List all registered tools (built-in + custom) with parameter schemas.
 
@@ -1698,7 +1899,7 @@ Example:
   unity-cli list
 `)
 	case "status":
-		fmt.Print(`Usage: unity-cli status
+		fmt.Fprint(w, `Usage: unity-cli status
 
 Show the current Unity Editor state: port, project path, version, PID.
 Reports "not responding" if heartbeat is older than 3 seconds.
@@ -1706,11 +1907,13 @@ State "modal" means a dialog blocks the editor; its text and buttons are
 printed (see "unity-cli modal --help"). State "building" means a player build job holds the main
 thread; the job id, phase and elapsed time are printed with it (see "unity-cli build --help").
 
-When no heartbeat answers but the project's Temp/UnityLockfile says an editor is open,
-status reports "editor_starting_or_blocked" if the connector has not loaded this session,
-and "editor_unresponsive" if a heartbeat from this session stopped answering. In the first
-case a startup dialog may be waiting; in the second the main thread is blocked or hung.
-Either way the connector cannot see it — read it with "unity-cli dialogs" on the macOS host.
+When no heartbeat answers, status reports "editor_starting_or_blocked" if the project's
+Temp/UnityLockfile is held but the connector has not loaded this session, and
+"editor_unresponsive" if a heartbeat from this session stopped answering (with or without a
+lockfile). In the first case a startup dialog may be waiting, or the lockfile is hours old and
+the editor probably crashed; in the second the main thread is blocked, a dialog is open, or the
+editor exited. When the editor is still open the connector cannot see it — read it with
+"unity-cli dialogs" on the macOS host.
 
 A silent heartbeat is told apart from a dead editor. The state becomes "crashed", and the command
 exits non-zero, when either:
@@ -1736,7 +1939,7 @@ Example:
   unity-cli status
 `)
 	case "update":
-		fmt.Print(`Usage: unity-cli update [options]
+		fmt.Fprint(w, `Usage: unity-cli update [options]
 
 Update the CLI binary to the latest release from GitHub.
 
@@ -1748,7 +1951,7 @@ Examples:
   unity-cli update --check
 `)
 	case "custom-tools", "custom", "tools":
-		fmt.Print(`How to write custom tools for unity-cli
+		fmt.Fprint(w, `How to write custom tools for unity-cli
 
 Custom tools are C# classes that run inside Unity Editor. The CLI
 discovers them automatically via reflection.
@@ -1787,7 +1990,7 @@ Rules:
   - Duplicate tool names are detected and logged as errors (first wins)
 `)
 	case "setup", "install":
-		fmt.Print(`Installation and Unity setup
+		fmt.Fprint(w, `Installation and Unity setup
 
 CLI Installation:
   # Linux / macOS
@@ -1808,6 +2011,13 @@ Verify:
   unity-cli list
 `)
 	default:
-		fmt.Printf("Unknown help topic: %s\n\nUse \"unity-cli --help\" for available commands.\n", topic)
+		fmt.Fprintf(w, "Unknown help topic: %s\n\nUse \"unity-cli --help\" for available commands.\n", topic)
 	}
+}
+
+// waitOwnsStartup: wait's own --timeout is the budget for startup, and waitCmd polls "starting"
+// itself. Holding it in waitForAlive would spend the global request deadline instead, so
+// `wait --timeout 2` could sit for two minutes before its own clock even started.
+func waitOwnsStartup(category, state string) bool {
+	return category == waitCategory && isStartingState(state)
 }

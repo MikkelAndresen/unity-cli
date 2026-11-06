@@ -15,32 +15,38 @@ import (
 
 // fakeEditor answers the tools verify uses and records every call.
 type fakeEditor struct {
-	t              *testing.T
-	compileErrors  bool                     // heartbeat flag after the compile
-	connector      string                   // heartbeat connectorVersion
-	finishedAt     int64                    // heartbeat compileFinishedAt seen while polling
-	echoFinished   *int64                   // refresh_unity echoes compile_finished_at; nil: connector without the clock
-	pid            int                      // heartbeat pid (0: no restart, no restart detection)
-	stuckState     string                   // heartbeat state while polling (default "ready")
-	diagnostics    map[bool][]interface{}   // compile_diagnostics by source_tree_only; nil: tool unknown (old connector)
-	console        []string                 // console error entries (old-connector fallback)
-	consoleCapped  bool                     // console reply wraps the entries in the capped object
-	provenance     map[string]interface{}   // compile_diagnostics' provenance object; nil: connector predates it
-	provenanceSeq  []map[string]interface{} // per-call provenance; overrides provenance while non-empty
-	refreshReplies []map[string]interface{} // per-call refresh_unity extras; overrides reply while non-empty
-	tests          map[string]interface{}   // run_tests summary; nil: tests not expected
-	testsSuccess   bool
-	testsMessage   string
-	burst          map[string]interface{} // burst_status reply; nil: connector has no burst_status tool
-	burstSuccess   bool
-	burstMessage   string
-	refreshErr     error
-	calls          []string
-	params         map[string]map[string]interface{}
+	t                    *testing.T
+	compileErrors        bool                     // heartbeat flag after the compile
+	connector            string                   // heartbeat connectorVersion
+	finishedAt           int64                    // heartbeat compileFinishedAt seen while polling
+	echoFinished         *int64                   // refresh_unity echoes compile_finished_at; nil: connector without the clock
+	pid                  int                      // heartbeat pid (0: no restart, no restart detection)
+	stuckState           string                   // heartbeat state while polling (default "ready")
+	diagnostics          map[bool][]interface{}   // compile_diagnostics by source_tree_only; nil: tool unknown (old connector)
+	diagnosticsCompiling bool                     // compile_diagnostics keeps answering compiling=true
+	console              []string                 // console error entries (old-connector fallback)
+	consoleCapped        bool                     // console reply wraps the entries in the capped object
+	consoleTotal         int                      // capped console entries_total; 0: len(console)
+	provenance           map[string]interface{}   // compile_diagnostics' provenance object; nil: connector predates it
+	provenanceSeq        []map[string]interface{} // per-call provenance; overrides provenance while non-empty
+	refreshReplies       []map[string]interface{} // per-call refresh_unity extras; overrides reply while non-empty
+	tests                map[string]interface{}   // run_tests summary; nil: tests not expected
+	testsSuccess         bool
+	testsMessage         string
+	burst                map[string]interface{} // burst_status reply; nil: connector has no burst_status tool
+	burstSuccess         bool
+	burstMessage         string
+	refreshErr           error
+	calls                []string
+	params               map[string]map[string]interface{}
 }
 
 func (f *fakeEditor) send(command string, params interface{}) (*client.CommandResponse, error) {
 	p, _ := params.(map[string]interface{})
+	if command == "verify" {
+		// A connector without the in-editor verify: the CLI runs the steps itself.
+		return &client.CommandResponse{Success: false, Message: "Unknown command: verify"}, nil
+	}
 	key := command
 	if command == "compile_diagnostics" {
 		key = fmt.Sprintf("compile_diagnostics(source_tree_only=%v)", p["source_tree_only"])
@@ -61,11 +67,15 @@ func (f *fakeEditor) send(command string, params interface{}) (*client.CommandRe
 			return &client.CommandResponse{Success: true, Message: "Console cleared."}, nil
 		}
 		if f.consoleCapped {
+			total := f.consoleTotal
+			if total == 0 {
+				total = len(f.console)
+			}
 			return &client.CommandResponse{Success: true, Data: data(map[string]interface{}{
 				"entries":          f.console,
-				"entries_total":    len(f.console),
+				"entries_total":    total,
 				"entries_returned": len(f.console),
-				"truncated":        false,
+				"truncated":        total > len(f.console),
 			})}, nil
 		}
 		return &client.CommandResponse{Success: true, Data: data(f.console)}, nil
@@ -92,8 +102,12 @@ func (f *fakeEditor) send(command string, params interface{}) (*client.CommandRe
 			return &client.CommandResponse{Success: false, Message: "Unknown command: compile_diagnostics"}, nil
 		}
 		list := f.diagnostics[p["source_tree_only"] == true]
+		total, listed := len(list), list
+		if limit, ok := p["limit"].(int); ok && limit > 0 && len(listed) > limit {
+			listed = listed[:limit]
+		}
 		reply := map[string]interface{}{
-			"compiling": false, "total": len(list), "diagnostics": list,
+			"compiling": f.diagnosticsCompiling, "total": total, "diagnostics": listed,
 		}
 		prov := f.provenance
 		if len(f.provenanceSeq) > 0 {
@@ -176,6 +190,20 @@ func TestVerify_CleanCompileAndPassingTests(t *testing.T) {
 	}
 	if f.params["run_tests"]["mode"] != "EditMode" || f.params["run_tests"]["autoSaveScenes"] != true {
 		t.Errorf("run_tests params = %v, want EditMode with autoSaveScenes", f.params["run_tests"])
+	}
+}
+
+func TestVerify_SkippedCompileIsReportedAsNotRepeated(t *testing.T) {
+	base := int64(1_000)
+	f := &fakeEditor{t: t, diagnostics: clean(), tests: passing(1), testsSuccess: true,
+		echoFinished: &base, finishedAt: base + 5,
+		refreshReplies: []map[string]interface{}{{"nothing_to_compile": true}}}
+	code, out := f.run()
+	if code != verifyOK {
+		t.Fatalf("exit = %d, want 0; output:\n%s", code, out)
+	}
+	if !strings.Contains(out, "compile: ok\n  (nothing changed since the last compile, so it was not repeated") {
+		t.Errorf("output = %q, want the not-repeated note under the compile line", out)
 	}
 }
 
@@ -270,6 +298,29 @@ func TestVerify_FailingTestsShowFirstLineOfEach(t *testing.T) {
 	}
 }
 
+func TestVerify_LoggedExceptionsAreShownUnderTheirFailure(t *testing.T) {
+	f := &fakeEditor{t: t, diagnostics: clean(), testsMessage: "2 test(s) failed.", tests: map[string]interface{}{
+		"total": 3, "passed": 1, "failed": 2, "skipped": 0,
+		"failures": []string{"Ns.T.Fires: Expected: 2\n  But was: 0", "Ns.T.Other: Expected: true"},
+		"logged_exceptions": []map[string]string{
+			{"test": "Ns.T.Fires", "exception": "InvalidOperationException: not played back", "at": "Runtime/BowSystem.cs:42"},
+			{"test": "Ns.T.Fires", "exception": "NullReferenceException"},
+		},
+	}}
+	code, out := f.run()
+	if code != verifyFailed {
+		t.Fatalf("exit = %d, want 1", code)
+	}
+	want := "compile: ok\ntests: 1/3 passed, 2 failed\n" +
+		"  Ns.T.Fires: Expected: 2\n" +
+		"    logged InvalidOperationException: not played back (at Runtime/BowSystem.cs:42)\n" +
+		"    logged NullReferenceException\n" +
+		"  Ns.T.Other: Expected: true\n"
+	if out != want {
+		t.Errorf("output = %q, want %q", out, want)
+	}
+}
+
 func TestVerify_ForwardsTestOptions(t *testing.T) {
 	f := &fakeEditor{t: t, diagnostics: clean(), tests: passing(1), testsSuccess: true}
 	if code, out := f.run("--assembly", "A.Tests,B.Tests", "--filter", "Ns.Class"); code != verifyOK {
@@ -341,6 +392,54 @@ func TestVerify_StaleAssemblyRefusesToRunTests(t *testing.T) {
 	}
 	if !strings.Contains(out, staleLine) || !strings.Contains(out, "tests: refused (1 stale assembly(s))") {
 		t.Errorf("output = %q, want the stale assembly and the refusal", out)
+	}
+}
+
+// TestVerify_StaleAssemblyOutsideTheAssemblyFilterDoesNotRefuse: verify must apply the same rule as
+// `test --assembly`, which only scans the requested assemblies.
+func TestVerify_StaleAssemblyOutsideTheAssemblyFilterDoesNotRefuse(t *testing.T) {
+	f := &fakeEditor{t: t, diagnostics: clean(), tests: passing(1), testsSuccess: true,
+		provenance: map[string]interface{}{
+			"provenance_line":      provLine,
+			"stale_assembly_count": 1,
+			"stale_assembly_line":  "stale assembly: Other.dll (built 12:01:00) is older than Assets/Other.cs (12:04:00)",
+			"stale_assemblies": []interface{}{map[string]interface{}{
+				"name": "Other", "newest_source": "Assets/Other.cs",
+			}},
+		}}
+	code, out := f.run("--assembly", "Foo.Tests")
+	if code != verifyOK {
+		t.Fatalf("exit = %d, want 0; output:\n%s", code, out)
+	}
+	if !f.called("run_tests") {
+		t.Errorf("tests did not run: %v", f.calls)
+	}
+	if !strings.Contains(out, "outside --assembly") {
+		t.Errorf("output = %q, want a note that the stale assembly is outside the filter", out)
+	}
+}
+
+// TestVerify_StaleAssemblyInsideTheAssemblyFilterRefuses is the other half: the assembly the tests
+// would load is stale, so verify still refuses.
+func TestVerify_StaleAssemblyInsideTheAssemblyFilterRefuses(t *testing.T) {
+	f := &fakeEditor{t: t, diagnostics: clean(),
+		provenance: map[string]interface{}{
+			"provenance_line":      provLine,
+			"stale_assembly_count": 1,
+			"stale_assembly_line":  "stale assembly: Foo.Tests.dll is older than its sources",
+			"stale_assemblies": []interface{}{map[string]interface{}{
+				"name": "Foo.Tests", "newest_source": "Assets/FooTests.cs",
+			}},
+		}}
+	code, out := f.run("--assembly", "Foo.Tests")
+	if code != verifyFailed {
+		t.Fatalf("exit = %d, want 1; output:\n%s", code, out)
+	}
+	if f.called("run_tests") {
+		t.Errorf("tests ran against a stale assembly: %v", f.calls)
+	}
+	if !strings.Contains(out, "tests: refused (1 stale assembly(s))") {
+		t.Errorf("output = %q, want the refusal", out)
 	}
 }
 
@@ -460,6 +559,21 @@ func TestVerify_CappedConnectorConsoleErrorsAreReadFromEntries(t *testing.T) {
 	}
 }
 
+func TestVerify_CappedConnectorConsoleErrorsUseThePreCapTotal(t *testing.T) {
+	f := &fakeEditor{t: t, compileErrors: true, consoleCapped: true, consoleTotal: 7,
+		console: []string{"Assets/Foo.cs(1,1): error CS0103: x", "Assets/Bar.cs(2,2): error CS0103: y"}}
+	code, out := f.run()
+	if code != verifyFailed {
+		t.Fatalf("exit = %d, want 1", code)
+	}
+	want := "compile: 7 error(s) (connector < 0.7.0: console errors shown)\n" +
+		"  Assets/Foo.cs(1,1): error CS0103: x\n" +
+		"  Assets/Bar.cs(2,2): error CS0103: y\n"
+	if out != want {
+		t.Errorf("output = %q, want %q", out, want)
+	}
+}
+
 func TestConsoleEntryMessages(t *testing.T) {
 	tests := []struct {
 		name string
@@ -547,6 +661,32 @@ func TestVerify_BurstLineFollowsTheCompile(t *testing.T) {
 	}
 	if f.params["burst_status"]["wait"] != defaultBurstWaitSeconds {
 		t.Errorf("burst_status wait = %v, want %d", f.params["burst_status"]["wait"], defaultBurstWaitSeconds)
+	}
+}
+
+func TestVerify_CleanBurstWithNothingCompiledPrintsNothing(t *testing.T) {
+	f := &fakeEditor{t: t, diagnostics: clean(), tests: passing(2), testsSuccess: true,
+		burstSuccess: true,
+		burst: map[string]interface{}{
+			"idle": true, "compiled": 0, "error_count": 0,
+			"notes": []string{"Burst has not scheduled an eager compile in this editor session"},
+		}}
+	code, out := f.run()
+	if code != verifyOK || out != "compile: ok\ntests: 2/2 passed\n" {
+		t.Errorf("exit = %d, output = %q; want no burst line when nothing is wrong", code, out)
+	}
+}
+
+func TestVerify_CleanBurstNamesItsTargetsWithoutCaveats(t *testing.T) {
+	f := &fakeEditor{t: t, diagnostics: clean(), tests: passing(1), testsSuccess: true,
+		burstSuccess: true,
+		burst: map[string]interface{}{
+			"idle": true, "compiled": 3, "error_count": 0,
+			"notes": []string{"a caveat that only matters when something is off"},
+		}}
+	_, out := f.run()
+	if out != "compile: ok\nburst: 3 targets compiled, 0 error(s)\ntests: 1/1 passed\n" {
+		t.Errorf("output = %q", out)
 	}
 }
 
@@ -669,5 +809,98 @@ func TestVersionBefore(t *testing.T) {
 		if got := versionBefore(v, 0, 7); got != want {
 			t.Errorf("versionBefore(%q, 0, 7) = %v, want %v", v, got, want)
 		}
+	}
+}
+
+func TestVerify_UsageErrorGoesToStderr(t *testing.T) {
+	var out bytes.Buffer
+	var code int
+	errOut := captureStderr(t, func() {
+		code = verifyCmd(context.Background(), []string{"--filter", "a", "--filter", "b"}, nil, nil, nil, 0, &out)
+	})
+	if code != verifyFailed {
+		t.Fatalf("exit = %d, want 1", code)
+	}
+	if out.Len() != 0 {
+		t.Errorf("stdout = %q, want empty so --json consumers keep a parseable stream", out.String())
+	}
+	if !strings.Contains(errOut, "duplicate flag --filter") {
+		t.Errorf("stderr = %q, want the usage error", errOut)
+	}
+}
+
+func TestVerify_ConnectorVersionRefusalIsExitOne(t *testing.T) {
+	refusal := &connectorRefusal{message: "connector 0.6.0 is older than the minimum 0.7.0"}
+	send := func(string, interface{}) (*client.CommandResponse, error) { return nil, refusal }
+	var out bytes.Buffer
+	code := verifyCmd(context.Background(), nil, send, send, nil, 0, &out)
+	if code != verifyFailed {
+		t.Fatalf("exit = %d, want 1", code)
+	}
+	if !strings.Contains(out.String(), "older than the minimum") {
+		t.Errorf("output = %q, want the refusal message", out.String())
+	}
+}
+
+func TestVerifyExit_ConnectorRefusalIsFailure(t *testing.T) {
+	var out bytes.Buffer
+	if code := verifyExit(&out, &connectorRefusal{message: "connector 0.6.0 is too old"}); code != verifyFailed {
+		t.Errorf("exit = %d, want 1", code)
+	}
+	if code := verifyExit(&out, fmt.Errorf("no Unity instances")); code != verifyNoReply {
+		t.Errorf("exit = %d, want 2 for a missing editor", code)
+	}
+}
+
+// TestVerify_NoCompileObservedIsSaidOutLoud: an editor that was already ready is not proof that the
+// requested compile ran, so verify reports that the verdict is the editor's current state instead of
+// silently treating "ready" as "compiled".
+func TestVerify_NoCompileObservedIsSaidOutLoud(t *testing.T) {
+	compileTestBudgets(t)
+	base := int64(1_000)
+	f := &fakeEditor{t: t, diagnostics: clean(), tests: passing(1), testsSuccess: true,
+		echoFinished: &base, finishedAt: base}
+
+	code, out := f.run()
+	if code != verifyOK {
+		t.Fatalf("exit = %d, want 0; output:\n%s", code, out)
+	}
+	if !strings.Contains(out, "no script compilation was observed") {
+		t.Errorf("output = %q, want the note that no compile was seen", out)
+	}
+}
+
+// TestVerify_TruncatedDiagnosticsSaySo: error_count is the true total while errors[] is capped, so
+// the report must not look like the complete list.
+func TestVerify_TruncatedDiagnosticsSaySo(t *testing.T) {
+	errs := []interface{}{
+		map[string]interface{}{"file": "Assets/A.cs", "line": 1, "col": 1, "message": "e1"},
+		map[string]interface{}{"file": "Assets/B.cs", "line": 1, "col": 1, "message": "e2"},
+		map[string]interface{}{"file": "Assets/C.cs", "line": 1, "col": 1, "message": "e3"},
+	}
+	f := &fakeEditor{t: t, compileErrors: true, diagnostics: map[bool][]interface{}{true: errs, false: errs}}
+	code, out := f.run("--max", "2")
+	if code != verifyFailed {
+		t.Fatalf("exit = %d, want 1", code)
+	}
+	if !strings.Contains(out, "compile: 3 error(s)") || strings.Count(out, "Assets/") != 2 {
+		t.Errorf("output = %q, want the true total and two listed errors", out)
+	}
+}
+
+// TestConsoleEntryInfo_LowerBound: a connector that stops scanning at --lines says so, and verify must
+// then print "at least N" rather than pass a partial count off as the whole error count.
+func TestConsoleEntryInfo_LowerBound(t *testing.T) {
+	msgs, total, atLeast := consoleEntryInfo([]byte(`{"entries":["a","b"],"entries_total":2,"entries_total_is_lower_bound":true}`))
+	if len(msgs) != 2 || total != 2 || !atLeast {
+		t.Fatalf("got %v %d %v", msgs, total, atLeast)
+	}
+	var out bytes.Buffer
+	printCompile(&out, false, total, atLeast, []verifyDiag{{Message: "a"}, {Message: "b"}}, "console", true)
+	if !strings.Contains(out.String(), "compile: at least 2 error(s)") {
+		t.Errorf("printCompile output:\n%s", out.String())
+	}
+	if _, _, atLeast := consoleEntryInfo([]byte(`["a"]`)); atLeast {
+		t.Error("a bare array is a complete list")
 	}
 }

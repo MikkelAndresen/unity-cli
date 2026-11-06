@@ -268,6 +268,27 @@ namespace UnityCliConnector.Tests
         }
 
         [Test]
+        public void ObjectWithoutMembers_ReportsTheToStringFallback()
+        {
+            string error;
+            var data = ExecuteCsharp.Serialize(new object(), out error);
+
+            Assert.IsInstanceOf<string>(data, "the value must still be readable");
+            Assert.IsNotNull(error, "a silent ToString fallback is what #23 reported");
+            StringAssert.Contains("no serializable members", error);
+        }
+
+        [Test]
+        public void JToken_SerializesAsItsJsonText()
+        {
+            var data = Ser(JObject.Parse("{\"a\":1,\"b\":[2,3]}"));
+
+            Assert.IsInstanceOf<string>(data, "JToken is IEnumerable<JToken>; enumerating it loses the payload");
+            StringAssert.Contains("\"a\"", (string)data);
+            StringAssert.Contains("[\n    2", (string)data);
+        }
+
+        [Test]
         public void SerializationFailure_FallsBackToStringAndReportsTheError()
         {
             string error;

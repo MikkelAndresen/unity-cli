@@ -31,6 +31,10 @@ type Instance struct {
 	// compilation. The CLI compares it before and after a compile request as evidence that a
 	// compile actually ran; 0 means the connector does not report it.
 	CompileFinishedAt int64 `json:"compileFinishedAt,omitempty"`
+	// StartingSince is the connector's wall-clock ms when its listener came up, published while State
+	// is "starting". The startup beater keeps Timestamp fresh through a long import, so this is the
+	// only way to see how long the editor has been stuck before its first update tick.
+	StartingSince int64 `json:"startingSince,omitempty"`
 	// Modal is set while State is "modal": the dialog blocking Unity's main thread.
 	Modal *ModalDialog `json:"modal,omitempty"`
 	// Build is set while State is "building": the player build job holding Unity's main thread.
@@ -271,6 +275,15 @@ func DiscoverInstance(project string, port int) (*Instance, error) {
 	return newestMatching(alive, func(Instance) bool { return true }), nil
 }
 
+// DiscoverInstanceKeepingEvidence is DiscoverInstance plus the newest heartbeat read before the
+// instance scan. ScanInstances deletes dead-pid files, which is exactly the record a crash verdict
+// needs, so callers that report a crash must read it first.
+func DiscoverInstanceKeepingEvidence(project string, port int) (*Instance, *Instance, error) {
+	beat := NewestHeartbeat(project, port)
+	inst, err := DiscoverInstance(project, port)
+	return inst, beat, err
+}
+
 // newestMatching returns the newest heartbeat matching keep, or nil when none does. Readiness is
 // decided by the caller; a stale file with a newer write must not hide the heartbeat that replaced it.
 func newestMatching(instances []Instance, keep func(Instance) bool) *Instance {
@@ -298,10 +311,6 @@ func RequestNotDelivered(err error) bool {
 	return errors.Is(err, syscall.ECONNREFUSED)
 }
 
-func Send(inst *Instance, command string, params interface{}, timeoutMs int) (*CommandResponse, error) {
-	return SendContext(context.Background(), inst, command, params, timeoutMs)
-}
-
 // RequestTimeoutError is a client-side deadline expiring. It is deliberately not a connection
 // failure: the editor is healthy and may still be running the command, so saying "cannot connect"
 // sends the caller into a reconnect loop instead of waiting for the result.
@@ -311,17 +320,18 @@ type RequestTimeoutError struct {
 }
 
 func (e *RequestTimeoutError) Error() string {
-	return fmt.Sprintf("timed out after %s waiting for Unity to answer %s (the editor may still be running it)", formatBudget(e.Budget), e.Command)
+	return fmt.Sprintf("timed out after %s waiting for Unity to answer %s (the editor may still be running it)", FormatBudget(e.Budget), e.Command)
 }
 
-// formatBudget keeps a context deadline's nanosecond remainder out of the message: callers passed
-// a whole number of milliseconds, and "1.947998375s" reads like a bug rather than a budget.
-func formatBudget(d time.Duration) string {
+// FormatBudget keeps a context deadline's nanosecond remainder out of the message: callers passed
+// a whole number of milliseconds, and "1.947998375s" reads like a bug rather than a budget. Below a
+// second the granularity stays at one millisecond, so `--timeout 1` is reported as the 1 ms it was.
+func FormatBudget(d time.Duration) string {
 	if d <= 0 {
 		return "0s"
 	}
 	if d < time.Second {
-		return ceilDuration(d, 10*time.Millisecond).String()
+		return ceilDuration(d, time.Millisecond).String()
 	}
 	return strconv.FormatFloat(ceilDuration(d, 100*time.Millisecond).Seconds(), 'f', -1, 64) + "s"
 }
@@ -331,8 +341,20 @@ func ceilDuration(d, step time.Duration) time.Duration {
 	return ((d + step - 1) / step) * step
 }
 
-// Timeout reports the deadline as a timeout for callers that type-assert net.Error.
-func (e *RequestTimeoutError) Timeout() bool { return true }
+// connectorHTTP is the client every connector request goes through. Its transport keeps no
+// connection alive: the editor tears its listener down across a domain reload, and a connection that
+// was pooled before the reload reads the old listener's leftover bytes as an unsolicited response.
+// Requests here are few and long-lived, so pooling buys nothing; one connection per request is what
+// makes a reload a plain new connection instead of a confused one.
+var connectorHTTP = &http.Client{
+	Transport: &http.Transport{DisableKeepAlives: true},
+}
+
+// Send is SendContext without a caller context, for callers that manage their own HTTP timeout
+// (the quit/restart path, whose request budget is not the invocation deadline).
+func Send(inst *Instance, command string, params interface{}, timeoutMs int) (*CommandResponse, error) {
+	return SendContext(context.Background(), inst, command, params, timeoutMs)
+}
 
 // SendContext posts one command, bounded by timeoutMs and by the caller's context. A context
 // deadline shared by discovery, wait-for-alive and this request is what keeps one invocation from
@@ -375,8 +397,7 @@ func SendContext(ctx context.Context, inst *Instance, command string, params int
 	if err != nil {
 		return nil, err
 	}
-	httpClient := &http.Client{}
-	resp, err := httpClient.Do(req)
+	resp, err := connectorHTTP.Do(req)
 	if err != nil {
 		if ctx.Err() == context.Canceled {
 			return nil, fmt.Errorf("request for %s cancelled: %w", command, ctx.Err())
@@ -384,7 +405,7 @@ func SendContext(ctx context.Context, inst *Instance, command string, params int
 		if ctx.Err() == context.DeadlineExceeded || isTimeoutError(err) {
 			return nil, &RequestTimeoutError{Command: command, Budget: budget}
 		}
-		return nil, explainDroppedConnection(command, inst, start, err)
+		return nil, explainDroppedConnection(inst, start, err)
 	}
 	defer resp.Body.Close()
 
@@ -426,4 +447,14 @@ func isTimeoutError(err error) bool {
 	}
 	var timeout interface{ Timeout() bool }
 	return errors.As(err, &timeout) && timeout.Timeout()
+}
+
+// StartingFor is how long the editor has been in its "starting" state, measured on the connector's
+// own clock (Timestamp - StartingSince) so a CLI on another machine needs no agreeing clock. ok is
+// false when the editor is not starting or its connector does not publish StartingSince.
+func (inst *Instance) StartingFor() (time.Duration, bool) {
+	if inst == nil || inst.State != "starting" || inst.StartingSince <= 0 || inst.Timestamp < inst.StartingSince {
+		return 0, false
+	}
+	return time.Duration(inst.Timestamp-inst.StartingSince) * time.Millisecond, true
 }

@@ -234,7 +234,9 @@ func TestButtonMatches(t *testing.T) {
 		{"continue", "Continue", true},
 		{"dont save", "Don\u2019t Save", true},
 		{"don't save", "Don\u2019t Save", true},
-		{"save", "Don\u2019t Save", true},
+		{"save", "Save Changes", true},
+		{"Save", "Don\u2019t Save", false},
+		{"quit", "Don't Quit", false},
 		{"cancel", "OK", false},
 		{"", "OK", false},
 	}
@@ -242,6 +244,45 @@ func TestButtonMatches(t *testing.T) {
 		if got := buttonMatches(tc.want, tc.have); got != tc.expect {
 			t.Errorf("buttonMatches(%q, %q): got %v, want %v", tc.want, tc.have, got, tc.expect)
 		}
+	}
+}
+
+// TestSelectButton_DoesNotPressNegatedTitle is the destructive case: a prompt whose only match is
+// "Don't Save" must not be clicked by "Save".
+func TestSelectButton_DoesNotPressNegatedTitle(t *testing.T) {
+	windows := []dialogWindow{{PID: 1, Title: "Save Changes?", Buttons: []string{"Don't Save", "Cancel"}}}
+	_, _, _, err := selectButton(windows, "Save", "")
+	if err == nil || !strings.Contains(err.Error(), "no button matching") {
+		t.Fatalf("got err %v, want no match for Save", err)
+	}
+}
+
+func TestClickScopeError(t *testing.T) {
+	one := []dialogWindow{{PID: 1, Title: "Unity"}, {PID: 1, Title: "Scene - Foo - Unity"}}
+	two := []dialogWindow{{PID: 1, Title: "Unity"}, {PID: 2, Title: "Scene - Bar - Unity"}}
+
+	tests := []struct {
+		name    string
+		filter  string
+		window  string
+		windows []dialogWindow
+		wantErr bool
+	}{
+		{name: "filtered listing is safe", filter: "Foo", windows: two},
+		{name: "named window is safe", windows: two, window: "Unity"},
+		{name: "fallback with one process is safe", windows: one},
+		{name: "fallback across two processes is refused", windows: two, wantErr: true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			err := clickScopeError(tc.filter, tc.window, tc.windows)
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("got err %v, want error %v", err, tc.wantErr)
+			}
+			if err != nil && !strings.Contains(err.Error(), "--window") {
+				t.Errorf("error should point at --window: %v", err)
+			}
+		})
 	}
 }
 
@@ -375,5 +416,124 @@ func TestDialogsCmd_OffHost(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "must be run on the macOS host") || !strings.Contains(err.Error(), runtime.GOOS) {
 		t.Errorf("got: %v", err)
+	}
+}
+
+// TestSelectButton_CountsWindowsNotButtonHits: one window with two loosely matching buttons is one
+// window, not a two-window tie, and the advice must not send the user to --window.
+func TestSelectButton_CountsWindowsNotButtonHits(t *testing.T) {
+	windows := []dialogWindow{{PID: 1, Title: "Save Changes?", Buttons: []string{"Save Draft", "Save Changes", "Cancel"}}}
+	_, _, _, err := selectButton(windows, "Save", "")
+	if err == nil {
+		t.Fatal("expected the loose title to be reported as ambiguous")
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "2 buttons on window") {
+		t.Errorf("message should count buttons on the one window:\n%s", msg)
+	}
+	if strings.Contains(msg, "2 windows") {
+		t.Errorf("message must not claim two windows:\n%s", msg)
+	}
+}
+
+// TestDialogScripts_Structure pins the parts of the AppleScript that no test on this machine can
+// execute: sheets belong to a window (not a process), a nameless element is addressed by its parent's
+// title just as the listing named it, and no `continue repeat` is used.
+func TestDialogScripts_Structure(t *testing.T) {
+	for name, script := range map[string]string{"list": dialogListScript, "click": dialogClickScript} {
+		t.Run(name, func(t *testing.T) {
+			if !strings.Contains(script, "every window of p") {
+				t.Error("every window of the process must be enumerated")
+			}
+			if strings.Contains(script, "every sheet of p") {
+				t.Error("sheets are elements of a window, not of the process")
+			}
+			if !strings.Contains(script, "every sheet of w") {
+				t.Error("sheets must be enumerated per window")
+			}
+			if !strings.Contains(script, "on elementName(el)") {
+				t.Error("the shared element-name helper is missing")
+			}
+			if !strings.Contains(script, `if elTitle is "" then set elTitle to parentTitle`) &&
+				!strings.Contains(script, `if sTitle is "" then set sTitle to wTitle`) {
+				t.Error("a nameless element must fall back to its parent's title, as the listing does")
+			}
+		})
+	}
+
+	if strings.Contains(dialogClickScript, "continue repeat") {
+		t.Error("`continue repeat` is not used anywhere else in these scripts; drop it")
+	}
+	if !strings.Contains(dialogClickScript, "repeat with w in wins") ||
+		strings.Index(dialogClickScript, "repeat with w in wins") > strings.Index(dialogClickScript, "repeat with s in shs") {
+		t.Error("the click script must walk windows first, then each window's sheets")
+	}
+}
+
+// TestDialogsListToClickHandoff records the pid/title/button handoff between the listing and the
+// click: the click script must be addressed with exactly what the listing returned.
+func TestDialogsListToClickHandoff(t *testing.T) {
+	orig := osascriptRunner
+	t.Cleanup(func() { osascriptRunner = orig })
+
+	var scripts []string
+	var calls [][]string
+	osascriptRunner = func(script string, argv ...string) (string, error) {
+		scripts = append(scripts, script)
+		calls = append(calls, append([]string(nil), argv...))
+		if len(scripts) == 1 {
+			return dialogRecord(65279, "Save Changes?", "sheet", []string{"Don't Save", "Cancel", "Save"},
+				[]string{"The scene has unsaved changes"}), nil
+		}
+		return "CLICKED" + fieldSep + argv[1] + fieldSep + argv[2], nil
+	}
+
+	windows, err := listDialogWindows("Foo")
+	if err != nil {
+		t.Fatalf("listDialogWindows: %v", err)
+	}
+	if len(windows) != 1 || windows[0].Title != "Save Changes?" || windows[0].PID != 65279 {
+		t.Fatalf("unexpected listing: %+v", windows)
+	}
+	if got := strings.Join(calls[0], "|"); got != "Foo" {
+		t.Errorf("list script argv = %q, want the window needle", got)
+	}
+
+	win, button, _, err := selectButton(windows, "Don't Save", "")
+	if err != nil {
+		t.Fatalf("selectButton: %v", err)
+	}
+	action, err := clickDialogButton(win, button)
+	if err != nil {
+		t.Fatalf("clickDialogButton: %v", err)
+	}
+	if action.PID != 65279 || action.Window != "Save Changes?" || action.Button != "Don't Save" {
+		t.Errorf("unexpected action: %+v", action)
+	}
+	if scripts[1] != dialogClickScript {
+		t.Error("the click must run the click script")
+	}
+	if got := strings.Join(calls[1], "|"); got != "65279|Save Changes?|Don't Save" {
+		t.Errorf("click argv = %q, want the pid, window title and button title from the listing", got)
+	}
+}
+
+// TestProjectNeedle_DoesNotPruneHeartbeats: listing windows is read-only, so the project lookup must
+// not go through the instance scan that deletes dead-pid files.
+func TestProjectNeedle_DoesNotPruneHeartbeats(t *testing.T) {
+	isolatedHome(t)
+	path := writeInstanceFile(t, client.Instance{
+		State:       "ready",
+		ProjectPath: "/Users/dev/Work/RunningProject",
+		Port:        8090,
+		PID:         999999999,
+		Timestamp:   time.Now().UnixMilli(),
+	})
+
+	if got := projectNeedle(""); got != "RunningProject" {
+		t.Fatalf("got %q, want RunningProject", got)
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Errorf("a read-only listing deleted the heartbeat file: %v", err)
 	}
 }

@@ -227,15 +227,64 @@ func TestQuitCmd_TerminateFailureIsReported(t *testing.T) {
 	}
 }
 
-func TestQuitCmd_RefusedByUnity(t *testing.T) {
+func TestQuitCmd_RefusedByUnityWithoutForceIsReported(t *testing.T) {
 	var stderr bytes.Buffer
 	deps := quitTestDeps(t, &stderr, &client.Instance{State: "ready", ProjectPath: "/work/Proj", PID: 100})
 	deps.send = func(*client.Instance, string, interface{}, int) (*client.CommandResponse, error) {
 		return &client.CommandResponse{Success: false, Message: "nope"}, nil
 	}
+	deps.waitForExit = func(editor.WaitForExitOptions) error {
+		t.Fatal("a refused quit without --force must not wait for an exit that was not requested")
+		return nil
+	}
 
-	_, err := quitCmd([]string{"--force"}, deps)
+	_, err := quitCmd(nil, deps)
 	if err == nil || !strings.Contains(err.Error(), "unity refused to quit: nope") {
+		t.Fatalf("expected refusal error, got %v", err)
+	}
+}
+
+func TestQuitCmd_RefusedByUnityWithForceTerminates(t *testing.T) {
+	var stderr bytes.Buffer
+	deps := quitTestDeps(t, &stderr, &client.Instance{State: "ready", ProjectPath: "/work/Proj", PID: 100})
+	deps.send = func(*client.Instance, string, interface{}, int) (*client.CommandResponse, error) {
+		return &client.CommandResponse{Success: false, Message: "Unknown command: quit_editor"}, nil
+	}
+	deps.waitForExit = func(editor.WaitForExitOptions) error { return nil }
+	terminated := 0
+	deps.terminate = func(pid int) error {
+		terminated = pid
+		return nil
+	}
+
+	resp, err := quitCmd([]string{"--force"}, deps)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result := decodeQuitResult(t, resp); result.Method != stopMethodTerminate {
+		t.Fatalf("expected terminate method, got %+v", result)
+	}
+	if terminated != 100 {
+		t.Fatalf("expected pid 100 terminated, got %d", terminated)
+	}
+	if !strings.Contains(stderr.String(), "Unity refused to quit") {
+		t.Fatalf("expected the refusal to be logged, got:\n%s", stderr.String())
+	}
+}
+
+func TestQuitCmd_RefusedSaveWithForceKeepsEditorRunning(t *testing.T) {
+	var stderr bytes.Buffer
+	deps := quitTestDeps(t, &stderr, &client.Instance{State: "ready", ProjectPath: "/work/Proj", PID: 100})
+	deps.send = func(*client.Instance, string, interface{}, int) (*client.CommandResponse, error) {
+		return &client.CommandResponse{Success: false, Message: "Untitled scenes have unsaved changes"}, nil
+	}
+	deps.terminate = func(int) error {
+		t.Fatal("a refused --save must not discard the work --force cannot save")
+		return nil
+	}
+
+	_, err := quitCmd([]string{"--save", "--force"}, deps)
+	if err == nil || !strings.Contains(err.Error(), "unity refused to quit") {
 		t.Fatalf("expected refusal error, got %v", err)
 	}
 }
@@ -272,5 +321,29 @@ func TestQuitCmd_DiscardIsSentAndEditorReportIsKept(t *testing.T) {
 	}
 	if !strings.Contains(string(result.Editor), "wantsToQuitSubscribers") {
 		t.Fatalf("editor report was dropped: %s", result.Editor)
+	}
+}
+
+// TestQuitCmd_ContradictoryFlagsFailBeforeAnythingHappens: `editor quit --save --discard` used to
+// print "Stopping Unity (pid ...)" and only then have the connector refuse (F9). The flags must be
+// judged before discovery, before the announcement, and before any request.
+func TestQuitCmd_ContradictoryFlagsFailBeforeAnythingHappens(t *testing.T) {
+	var stderr bytes.Buffer
+	deps := restartTestDeps(t, &stderr)
+	deps.discover = func(string, int) (*client.Instance, error) {
+		t.Fatal("discover must not run for a refused flag combination")
+		return nil, nil
+	}
+	deps.send = func(*client.Instance, string, interface{}, int) (*client.CommandResponse, error) {
+		t.Fatal("no request may be sent for a refused flag combination")
+		return nil, nil
+	}
+
+	_, err := quitCmd([]string{"--save", "--discard"}, deps)
+	if err == nil || !strings.Contains(err.Error(), "--save and --discard are mutually exclusive") {
+		t.Fatalf("error = %v, want the local contradiction check", err)
+	}
+	if stderr.Len() != 0 {
+		t.Errorf("stderr = %q, want nothing printed before the refusal", stderr.String())
 	}
 }

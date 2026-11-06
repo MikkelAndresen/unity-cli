@@ -15,8 +15,9 @@ namespace UnityCliConnector
     /// <summary>
     /// Lightweight HTTP server on localhost. Receives CLI commands as POST /command,
     /// dispatches via CommandRouter, returns JSON responses.
-    /// Uses ConcurrentQueue + EditorApplication.update for main-thread marshaling.
-    /// Background editor throttling can still delay command execution.
+    /// Uses ConcurrentQueue + EditorApplication.update for main-thread marshaling. A queued request
+    /// wakes the editor and keeps it updating until answered (EditorWake), so an unfocused editor's
+    /// background update rate does not delay it.
     /// Survives domain reloads via InitializeOnLoad.
     /// Every accepted request gets exactly one answer: the request thread answers it when the main
     /// thread does not pick it up within its queue deadline, and the reload/quit path answers
@@ -51,6 +52,7 @@ namespace UnityCliConnector
         // Set as soon as a reload or quit starts: the main-thread queue is going away, so a request
         // accepted after that point could never be answered. Read from the HTTP threads.
         static volatile bool s_RefusingWork;
+        static volatile bool s_Quitting;
 
         static readonly ConcurrentQueue<WorkItem> s_Queue = new();
 
@@ -222,6 +224,10 @@ namespace UnityCliConnector
         static void Stop()
         {
             var port = s_Port;
+            // Refuse new main-thread work before the snapshot: a request tracked after it would never
+            // be answered before the listener goes away.
+            s_Quitting = true;
+            s_RefusingWork = true;
             // No error code for a quit: the editor is gone, so "wait for it and retry" would be a lie.
             AnswerPending("the editor is quitting", quitting: true);
             RequestTracker.AwaitForAnswers(PENDING_ANSWER_WAIT_MS);
@@ -230,15 +236,12 @@ namespace UnityCliConnector
             Debug.Log($"[UnityCliConnector] HTTP server stopped (was port {port})");
         }
 
-        static void ForceEditorUpdate()
+        internal static void RequestEditorUpdate()
         {
-            s_MainContext?.Post(_ =>
-            {
-                try { EditorApplication.QueuePlayerLoopUpdate(); }
-                catch { }
-                try { UnityEditorInternal.InternalEditorUtility.RepaintAllViews(); }
-                catch { }
-            }, null);
+            try { EditorApplication.QueuePlayerLoopUpdate(); }
+            catch { }
+            try { UnityEditorInternal.InternalEditorUtility.RepaintAllViews(); }
+            catch { }
         }
 
         static void ProcessQueue()
@@ -335,6 +338,14 @@ namespace UnityCliConnector
             var response = context.Response;
 
             response.ContentType = "application/json";
+            // The client must not reuse this connection. Mono's HttpListener closes the connections it
+            // still holds when the listener stops for a domain reload by writing an empty 200 with
+            // `Connection: close`; on a connection the client had already returned to its idle pool
+            // that stray response is exactly what Go reports as "Unsolicited response received on idle
+            // HTTP channel". A CLI invocation opens a connection per command anyway, so asking for
+            // `Connection: close` costs a local TCP handshake and removes the idle connection the
+            // reload can write into.
+            response.KeepAlive = false;
 
             // Block browser cross-origin requests — CLI uses Go HTTP client (not subject to CORS)
             if (request.HttpMethod == "OPTIONS")
@@ -388,27 +399,45 @@ namespace UnityCliConnector
                     {
                         // Fail fast rather than queue into a domain that is on its way out; the
                         // caller gets the same code it would get for a dropped request.
-                        result = RequestTracker.BuildRefusedError(command, "a reload or quit is already under way");
+                        result = s_Quitting
+                            ? RequestTracker.BuildRefusedError(command, "the editor is quitting", quitting: true)
+                            : RequestTracker.BuildRefusedError(command, "a domain reload is under way");
                     }
                     else
                     {
                         ticket = RequestTracker.Track(new RequestTicket(command, QueueWaitMsFor(json, parameters)));
-                        s_Queue.Enqueue(new WorkItem
+                        // A reload or quit can flip the flag after the read above but before Track; without
+                        // this second read its "answer everything" snapshot would miss this ticket.
+                        if (s_RefusingWork)
                         {
-                            Command = command,
-                            Parameters = parameters,
-                            Ticket = ticket,
-                        });
-                        ForceEditorUpdate();
-                        result = await AwaitAnswer(ticket);
-                        ReportSlowQueue(ticket, ref result);
+                            result = s_Quitting
+                            ? RequestTracker.BuildRefusedError(command, "the editor is quitting", quitting: true)
+                            : RequestTracker.BuildRefusedError(command, "a domain reload is under way");
+                            ticket.TryAnswer(result);
+                        }
+                        else
+                        {
+                            s_Queue.Enqueue(new WorkItem
+                            {
+                                Command = command,
+                                Parameters = parameters,
+                                Ticket = ticket,
+                            });
+                            // After the enqueue: a wake that ran before it could find the queue empty.
+                            using (EditorWake.Hold())
+                            {
+                                EditorWake.Now();
+                                result = await AwaitAnswer(ticket);
+                            }
+                            ReportSlowQueue(ticket, ref result);
+                        }
                     }
                 }
             }
             catch (Exception ex)
             {
-                // A queued request that dies here (bad JSON, a crash while queueing) must still be
-                // answered, or its ticket would sit in the tracker until a reload names it.
+                // The ticket was already tracked, so nothing else would answer it before a reload
+                // names it.
                 result = new ErrorResponse($"Request error: {ex.Message}");
                 response.StatusCode = 500;
                 if (ticket != null) ticket.TryAnswer(result);
@@ -436,9 +465,12 @@ namespace UnityCliConnector
             // command that is still changing the editor, and the caller's client timeout already
             // bounds how long it watches. If the deadline passes while the handler is waiting on the
             // command lock, the request is answered as "did not run" and CommandRouter skips it.
-            var finished = await Task.WhenAny(ticket.Tcs.Task, Task.Delay(ticket.QueueWaitMs));
+            using var deadline = new CancellationTokenSource();
+            var finished = await Task.WhenAny(ticket.Tcs.Task, Task.Delay(ticket.QueueWaitMs, deadline.Token));
             if (finished != ticket.Tcs.Task)
                 RequestTracker.TryAnswerWaiting(ticket, Diagnostics());
+            else
+                deadline.Cancel();
 
             return await ticket.Tcs.Task;
         }
@@ -461,7 +493,10 @@ namespace UnityCliConnector
         {
             if (result is not SuccessResponse success) return;
 
-            var waited = ticket.WaitedMs;
+            // The queue wait stops when the handler starts; everything after that belongs to the
+            // tool's own timings (exec's compile_ms) and to total_ms, so the reported numbers never
+            // overlap. A request answered before its handler ran has no pick-up wait to report.
+            var waited = ticket.StartedAfterMs;
             if (waited < SLOW_QUEUE_WAIT_MS) return;
 
             // Merged into the tool's own meta (exec reports its compile cache there) so a slow pickup
@@ -471,6 +506,7 @@ namespace UnityCliConnector
             var meta = success.meta as JObject
                 ?? (success.meta == null ? new JObject() : JObject.FromObject(success.meta));
             meta["queue_wait_ms"] = waited;
+            meta["total_ms"] = ticket.WaitedMs;
             meta["queue_depth"] = RequestTracker.PendingCount;
             success.meta = meta;
         }

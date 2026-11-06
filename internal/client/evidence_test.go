@@ -264,3 +264,36 @@ func TestEditorEvidence_AnyHeartbeatThisSessionButNotSilent(t *testing.T) {
 		t.Error("a heartbeat from before the lockfile belongs to the previous session")
 	}
 }
+
+func TestEditorEvidence_UnresponsiveHeartbeat(t *testing.T) {
+	lockfileAt := time.Now().Add(-8 * time.Hour).Truncate(time.Millisecond)
+	project := "/project/Temp/UnityLockfile"
+	recent := &Instance{State: "ready", Timestamp: time.Now().Add(-5 * time.Second).UnixMilli()}
+	fresh := &Instance{State: "ready", Timestamp: time.Now().Truncate(time.Millisecond).UnixMilli()}
+	stopped := &Instance{State: "stopped", Timestamp: time.Now().Add(-5 * time.Second).UnixMilli()}
+	stale := &Instance{State: "ready", Timestamp: time.Now().Add(-2 * time.Minute).UnixMilli()}
+
+	tests := []struct {
+		name    string
+		ev      *EditorEvidence
+		want    *Instance
+		wantAny bool
+	}{
+		{name: "short silence after a session heartbeat", ev: &EditorEvidence{LockfilePath: project, LockfileMTime: lockfileAt, SessionHeartbeat: recent}, want: recent, wantAny: true},
+		{name: "fresh heartbeat is not unresponsive", ev: &EditorEvidence{LockfilePath: project, LockfileMTime: lockfileAt, SessionHeartbeat: fresh}},
+		{name: "clean shutdown is not unresponsive", ev: &EditorEvidence{LockfilePath: project, LockfileMTime: lockfileAt, SessionHeartbeat: stopped}},
+		{name: "silent heartbeat wins", ev: &EditorEvidence{LockfilePath: project, LockfileMTime: lockfileAt, StaleHeartbeat: stale, StaleBeatAge: 2 * time.Minute, SessionHeartbeat: fresh}, want: stale, wantAny: true},
+		{name: "previous session is not this session", ev: &EditorEvidence{LockfilePath: project, LockfileMTime: time.Now().Add(time.Hour), SessionHeartbeat: recent}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, _ := tc.ev.UnresponsiveHeartbeat()
+			if (got != nil) != tc.wantAny {
+				t.Fatalf("got %+v, want heartbeat %v", got, tc.wantAny)
+			}
+			if tc.want != nil && got != tc.want {
+				t.Errorf("got %+v, want %+v", got, tc.want)
+			}
+		})
+	}
+}

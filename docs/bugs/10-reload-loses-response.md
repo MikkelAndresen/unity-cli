@@ -232,9 +232,11 @@ Connector:
   response is written by the domain that is still alive. `wait_for_completion` awaits the state change
   only when no reload is coming; with a reload coming it says so and leaves the confirmation to the
   caller.
-- **`Editor/Tools/ExecuteCsharp.cs`** — `meta.state_change` names what the snippet started
-  (`"a play mode change is in flight"`, `"entered play mode"`, `"a script compilation is in flight"`),
+- **`Editor/Tools/ExecuteCsharp.cs`** — `meta.state_change` names the editor state the snippet moved
+  to (`"a play mode change is in flight"`, `"entered play mode"`, `"a script compilation is in flight"`),
   and the message repeats it, so a caller is not surprised by the next command needing `wait`.
+  (Initially it read "this snippet started …"; the review follow-up below says why the cause is not
+  claimed.)
 - **`Editor/HttpServer.cs`** — the slow-pickup meta is merged instead of replaced; `AnswerPending`
   distinguishes reload from quit instead of passing an error code around.
 
@@ -351,3 +353,59 @@ change lands — the confirmation is a CLI-side behaviour.
   line already; plain `exec` still shows it. Cosmetic, and unchanged by this fix.
 - Nothing in this repo may rely on `EditorApplication.delayCall`: it never runs while the editor is
   backgrounded (attempt 9). Deferred connector work must ride `EditorApplication.update`.
+
+## Review follow-up
+
+The review of `fix/10-reload-response` raised three C# findings; the Go ones are handled separately.
+
+- **Confirmed — every ongoing compile was attributed to the snippet.** `ChangeStartedSince` ended
+  with an unconditional `if (compiling) return "a script compilation is in flight";`, so a compile an
+  asset import started while the snippet sat in an `await` came back as
+  `(this snippet started a script compilation; …)`. Two changes: the helper takes `wasCompiling` and
+  only reports a compile that was not already running when the snippet began, and the message states
+  the observed change instead of its cause
+  (`(since the snippet started: a script compilation is in flight; …)`). The cause is genuinely
+  unknowable here — a compile an import starts and one the snippet requests look identical from
+  `EditorApplication.isCompiling` — so the answer says what changed and leaves `meta.state_change` as
+  the state it is. Proven live against the editor by scheduling `RequestScriptCompilation()` from an
+  earlier, already-answered command's update tick and having the next snippet poll until
+  `isCompiling`: the response message is the new one and `meta.state_change` is still reported.
+  Covered by `PlayModeTransitionTests.ChangeStartedSince_DoesNotBlameTheSnippetForACompileAlreadyRunning`
+  (fails against the unconditional check) plus the reworked table test.
+- **Accepted, not changed — a reload can still answer a request whose tool has already returned**
+  (medium, unproven). `ProcessItem` answers with `item.Ticket.TryAnswer(r)` on the main-thread
+  continuation *after* `await CommandRouter.Dispatch(...)` returns, so the ticket is still `Running`
+  in the window from Dispatch completing to that continuation running. `beforeAssemblyReload` runs on
+  the same main thread, and if it is served inside that window it sees `Stage == Running`, answers
+  `reload_during_command`, and the later `TryAnswer(r)` loses to the answered ticket — so the
+  "a request whose tool had already returned keeps its own value" claim above holds only once
+  `TryAnswer` has run, not the moment the tool returned. The alternative that closes the window is
+  `ConfigureAwait(false)` on that await so the ticket is answered without waiting for a main-thread
+  turn; it was rejected because it moves `Debug.LogException` and the command-lock release off the
+  main thread, where the tool-wrapping code would be touching Unity APIs from a thread-pool thread.
+  Not proven reachable in a live editor either (both the reload callback and the continuation are
+  main-thread work items, and attempts 4-10 never showed this interleave), so it stays a documented
+  race rather than an unverified rework.
+- **Confirmed — the queued-on-quit answer still told the caller to retry "once Unity answers again".**
+  `BuildReloadError`'s not-started branch carried that sentence even with `quitting: true`, where the
+  editor is gone and no answer is coming; `BuildReloadError(..., quitting: true)` said so for the
+  started branch only. The not-started quit branch now ends with *"The editor was quitting, so
+  nothing was applied."* and keeps the null `data.code` (no editor to wait for). Covered by
+  `RequestDeadlineTests.BuildReloadError_AQueuedRequestDuringAQuitIsNotToldToWait` (fails against the
+  old sentence).
+
+## Review follow-up (end-to-end run)
+
+- **`Unsolicited response received on idle HTTP channel` — reproduced, and it is not a double write.**
+  The note above called it cosmetic and Go-only. It is a connector-side defect, just not the one the
+  finding suspected: `HttpServer` writes exactly one response per request (`WriteResponse` is the only
+  writer, and the ticket CAS makes a second answer impossible), and every response carries a JSON body.
+  The stray response has `Content-Length: 0`, `Connection: close` and `Server: Mono-HTTPAPI/1.0` — a
+  shape no code path here produces. It is Mono's `HttpListener` closing the connections it still holds
+  when the listener stops for a domain reload: reproduced with a raw socket kept idle after its answer,
+  a real content-change compile+reload, and the empty 200 arriving on that idle connection.
+  `HandleRequest` now sets `response.KeepAlive = false`, so the client closes instead of pooling a
+  connection the reload can write into (a CLI invocation opens a connection per command anyway; a
+  local connect measured 0-4 ms). Covered by
+  `RequestDeadlineTests.Responses_AskTheClientNotToReuseTheConnection`; the probe that reproduced the
+  stray response now sees the connection close with zero extra bytes.

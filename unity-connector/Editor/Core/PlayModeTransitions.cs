@@ -72,19 +72,23 @@ namespace UnityCliConnector
         }
 
         /// <summary>
-        /// What the snippet set in motion between the captured state and now, or null when nothing is
+        /// What changed in the editor between the captured state and now, or null when nothing is
         /// observable yet. Only what is true at this instant is reported: leaving Play mode keeps
         /// <c>EditorApplication.isPlayingOrWillChangePlaymode</c> set until the change lands, so an exit
         /// is not detectable here and must not be guessed at.
+        ///
+        /// A change is all this can see. A compile an asset import starts, or a Play-mode change the
+        /// user makes, during a snippet that yields to the main loop looks exactly like one the snippet
+        /// asked for, so the caller reports that the state changed, never who changed it.
         /// </summary>
-        public static string ChangeStartedSince(bool wasPlaying, bool wasChanging)
+        public static string ChangeStartedSince(bool wasPlaying, bool wasChanging, bool wasCompiling)
         {
-            return ChangeStartedSince(wasPlaying, wasChanging,
+            return ChangeStartedSince(wasPlaying, wasChanging, wasCompiling,
                 EditorApplication.isPlaying, EditorApplication.isPlayingOrWillChangePlaymode,
                 EditorApplication.isCompiling);
         }
 
-        internal static string ChangeStartedSince(bool wasPlaying, bool wasChanging,
+        internal static string ChangeStartedSince(bool wasPlaying, bool wasChanging, bool wasCompiling,
             bool nowPlaying, bool nowChanging, bool compiling)
         {
             if (nowChanging && !wasChanging)
@@ -93,7 +97,9 @@ namespace UnityCliConnector
                     : "a play mode change is in flight";
             if (wasPlaying && !nowPlaying)
                 return "left play mode";
-            if (compiling)
+            // A compile that was already running when the snippet started is not something this
+            // snippet changed; reporting it would blame the snippet for someone else's import.
+            if (compiling && !wasCompiling)
                 return "a script compilation is in flight";
             return null;
         }

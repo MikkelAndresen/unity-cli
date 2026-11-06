@@ -111,6 +111,8 @@ end joined`
 // dialogClickScript presses one button of one Unity window, addressed by pid + exact window title
 // + exact button title, so it cannot land on a different dialog that appeared since the list.
 // argv: 1 = pid, 2 = exact window title, 3 = exact button title.
+// Sheets are enumerated per window: System Events exposes "sheet" as an element of "window", not
+// of "process", and wrapping the whole enumeration in one try would leave no window to match.
 const dialogClickScript = `on run argv
 	set thePid to (item 1 of argv) as integer
 	set winTitle to item 2 of argv
@@ -120,24 +122,50 @@ const dialogClickScript = `on run argv
 		set procs to (every process whose unix id is thePid)
 		if (count of procs) is 0 then return "NO_PROCESS" & US & thePid
 		set p to item 1 of procs
-		set elts to {}
+		set wins to {}
 		try
-			set elts to (every window of p) & (every sheet of p)
+			set wins to (every window of p)
 		end try
 		set sawWindow to false
-		repeat with w in elts
-			if my elementName(w) is not winTitle then continue repeat
-			set sawWindow to true
-			repeat with b in (buttons of w)
-				if my elementName(b) is not btnName then continue repeat
-				click b
-				return "CLICKED" & US & winTitle & US & btnName
+		repeat with w in wins
+			set wTitle to my elementName(w)
+			if wTitle is winTitle then
+				set sawWindow to true
+				set hit to my clickButton(w, btnName, US, winTitle)
+				if hit is not "" then return hit
+			end if
+			set shs to {}
+			try
+				set shs to (every sheet of w)
+			end try
+			repeat with s in shs
+				set sTitle to my elementName(s)
+				if sTitle is "" then set sTitle to wTitle
+				if sTitle is winTitle then
+					set sawWindow to true
+					set hit to my clickButton(s, btnName, US, winTitle)
+					if hit is not "" then return hit
+				end if
 			end repeat
 		end repeat
 		if sawWindow then return "NO_BUTTON" & US & winTitle & US & btnName
 		return "NO_WINDOW" & US & winTitle
 	end tell
 end run
+
+on clickButton(el, btnName, US, winTitle)
+	set btns to {}
+	try
+		tell application "System Events" to set btns to (buttons of el)
+	end try
+	repeat with b in btns
+		if my elementName(b) is btnName then
+			tell application "System Events" to click b
+			return "CLICKED" & US & winTitle & US & btnName
+		end if
+	end repeat
+	return ""
+end clickButton
 
 on elementName(el)
 	set n to ""
@@ -212,6 +240,23 @@ func collectWindows(needle string, list func(string) ([]dialogWindow, error)) ([
 	return windows, needle, nil
 }
 
+// clickScopeError refuses a click that cannot be tied to one Unity process after the project filter
+// fell back to every window: a startup dialog may not name the project, but another project's editor
+// does not either, and pressing a button there is irreversible.
+func clickScopeError(filter, windowNeedle string, windows []dialogWindow) error {
+	if filter != "" || windowNeedle != "" {
+		return nil
+	}
+	pids := map[int]struct{}{}
+	for _, w := range windows {
+		pids[w.PID] = struct{}{}
+	}
+	if len(pids) < 2 {
+		return nil
+	}
+	return fmt.Errorf("the project filter matched nothing and windows from %d Unity processes are listed — name one with --window \"<title>\" before clicking", len(pids))
+}
+
 // dialogsCmd lists or answers the Unity windows of this machine, from outside the editor.
 func dialogsCmd(args []string) error {
 	if runtime.GOOS != "darwin" {
@@ -233,6 +278,12 @@ func dialogsCmd(args []string) error {
 	if wantClick == "" {
 		report.Note = dialogsNote(windows)
 		return printDialogs(report)
+	}
+
+	if err := clickScopeError(filter, windowNeedle, windows); err != nil {
+		report.Note = dialogsNote(windows)
+		_ = printDialogs(report)
+		return err
 	}
 
 	target, button, note, err := selectButton(windows, wantClick, windowNeedle)
@@ -366,10 +417,36 @@ func selectButton(windows []dialogWindow, want, windowNeedle string) (dialogWind
 	}
 
 	if len(hits) > 1 {
-		var b strings.Builder
-		fmt.Fprintf(&b, "%q matches %d windows — name one with --window \"<title>\":", want, len(hits))
+		// Count windows, not button hits: one window can carry two loosely matching buttons, and
+		// listing it twice as if it were two windows sends the user looking for a --window choice
+		// that does not exist.
+		type windowButtons struct {
+			win     dialogWindow
+			buttons []string
+		}
+		var grouped []windowButtons
 		for _, h := range hits {
-			fmt.Fprintf(&b, "\n  pid %d: %q (%s)", h.win.PID, h.win.Title, strings.Join(h.win.Buttons, ", "))
+			found := false
+			for i := range grouped {
+				if grouped[i].win.PID == h.win.PID && grouped[i].win.Title == h.win.Title {
+					grouped[i].buttons = append(grouped[i].buttons, h.button)
+					found = true
+					break
+				}
+			}
+			if !found {
+				grouped = append(grouped, windowButtons{win: h.win, buttons: []string{h.button}})
+			}
+		}
+		var b strings.Builder
+		if len(grouped) == 1 {
+			fmt.Fprintf(&b, "%q matches %d buttons on window %q (%s) — use the exact button title:", want,
+				len(grouped[0].buttons), grouped[0].win.Title, strings.Join(grouped[0].buttons, ", "))
+		} else {
+			fmt.Fprintf(&b, "%q matches %d windows — name one with --window \"<title>\":", want, len(grouped))
+			for _, g := range grouped {
+				fmt.Fprintf(&b, "\n  pid %d: %q (%s)", g.win.PID, g.win.Title, strings.Join(g.win.Buttons, ", "))
+			}
 		}
 		return dialogWindow{}, "", "", fmt.Errorf("%s", b.String())
 	}
@@ -382,10 +459,12 @@ func selectButton(windows []dialogWindow, want, windowNeedle string) (dialogWind
 }
 
 // buttonMatches is the loose form of a button title test: case-insensitive, apostrophe-insensitive
-// (macOS writes "Don’t Save" where an agent types "Don't Save"), and a substring is enough.
+// (macOS writes "Don’t Save" where an agent types "Don't Save"), and the listed title may continue
+// after the requested one ("Continue" matches "Continue Anyway"). The match must start the title:
+// a substring test would let "Save" press "Don't Save".
 func buttonMatches(want, have string) bool {
 	want = normalizeButton(want)
-	return want != "" && strings.Contains(normalizeButton(have), want)
+	return want != "" && strings.HasPrefix(normalizeButton(have), want)
 }
 
 var buttonApostrophes = strings.NewReplacer("'", "", "\u2019", "", "\u2018", "", "`", "")
@@ -421,9 +500,17 @@ func parseClickResult(out string, pid int, window, button string) (*dialogAction
 	}
 }
 
+// osascriptRunner is the one place that executes AppleScript. Tests replace it to record the
+// list->click handoff on a machine with no osascript.
+var osascriptRunner = runOsascriptProcess
+
 // runOsascript runs one embedded AppleScript with argv, mapping permission failures to an
 // explanation of what to grant, since that is the failure an agent cannot fix from here.
 func runOsascript(script string, argv ...string) (string, error) {
+	return osascriptRunner(script, argv...)
+}
+
+func runOsascriptProcess(script string, argv ...string) (string, error) {
 	if _, err := os.Stat(osascriptPath); err != nil {
 		return "", fmt.Errorf("%s not found: dialogs needs the macOS host's AppleScript interpreter", osascriptPath)
 	}
@@ -481,7 +568,9 @@ func accessibilityPermissionError(stderr string) error {
 // "" means list every Unity process's windows.
 func projectNeedle(project string) string {
 	if project == "" {
-		if inst, err := client.DiscoverInstance("", 0); err == nil {
+		// Read the heartbeat without the instance scan: listing windows is read-only, and the scan
+		// prunes dead-pid files. The newest beat also names the project the newest editor is using.
+		if inst := client.NewestHeartbeat("", 0); inst != nil {
 			project = inst.ProjectPath
 		}
 	}

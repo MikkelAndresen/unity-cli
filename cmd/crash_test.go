@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"context"
 	"errors"
 	"os"
 	"path/filepath"
@@ -72,6 +73,7 @@ func TestAssessCrash_SilentHeartbeatWithDumpIsACrash(t *testing.T) {
 // TestAssessCrash_DumpOlderThanTheBeatIsAnotherCrash: the editor recovered from an earlier crash and
 // beat happily until now, so the silence is not that dump's fault.
 func TestAssessCrash_DumpOlderThanTheBeatIsAnotherCrash(t *testing.T) {
+	stubProcessTable(t, containerProcessTable())
 	project := crashedProjectFixture(t, "ready", 10*time.Second, 2*time.Hour)
 
 	if v := assessCrash(client.NewestHeartbeat(project, 8090)); v.Crashed {
@@ -93,6 +95,7 @@ func TestAssessCrash_StoppedMarkerStands(t *testing.T) {
 }
 
 func TestStalledEditorReport_CrashVersusStarting(t *testing.T) {
+	stubProcessTable(t, containerProcessTable())
 	// The fixture helper resets HOME for the instance files, so the first heartbeat is read before the
 	// second fixture replaces it.
 	crashedProject := crashedProjectFixture(t, "ready", 30*time.Second, 20*time.Second)
@@ -160,6 +163,57 @@ func TestAnnotateNoEditor_PrefersCrash(t *testing.T) {
 	}
 }
 
+// TestDiscoverStatusInstance_CrashHeartbeatSurvivesTheScan drives the port-less status entry point with
+// the pre-scan heartbeat the real discovery returns, proving the fallback does not re-read a file the
+// scan has already deleted.
+func TestDiscoverStatusInstance_CrashHeartbeatSurvivesTheScan(t *testing.T) {
+	project := t.TempDir()
+	writeCrashFileIn(t, project, "mono_crash.1b6a4e0a.0.json", 20*time.Second, monoCrashSample)
+	beat := &client.Instance{
+		State:       "ready",
+		ProjectPath: project,
+		Port:        8090,
+		PID:         65279,
+		Timestamp:   time.Now().Add(-30 * time.Second).UnixMilli(),
+	}
+
+	orig := discoverInstanceKeepingEvidence
+	discoverInstanceKeepingEvidence = func(string, int) (*client.Instance, *client.Instance, error) {
+		return nil, beat, errors.New("no Unity instances running")
+	}
+	t.Cleanup(func() { discoverInstanceKeepingEvidence = orig })
+
+	got, err := discoverStatusInstance(project, 0)
+	if err != nil {
+		t.Fatalf("expected the crashed heartbeat, got %v", err)
+	}
+	if got != beat {
+		t.Fatalf("got %+v, want the heartbeat read before the scan", got)
+	}
+}
+
+// TestAnnotateNoEditorWith_PrefersCrashAfterTheScan: commands outside status discover first, and the
+// scan can already have deleted the heartbeat; the pre-scan record must still win over startup evidence.
+func TestAnnotateNoEditorWith_PrefersCrashAfterTheScan(t *testing.T) {
+	project := t.TempDir()
+	writeCrashFileIn(t, project, "mono_crash.1b6a4e0a.0.json", 20*time.Second, monoCrashSample)
+	beat := &client.Instance{
+		State:       "ready",
+		ProjectPath: project,
+		Port:        8090,
+		PID:         65279,
+		Timestamp:   time.Now().Add(-30 * time.Second).UnixMilli(),
+	}
+
+	err := annotateNoEditorWith(beat, errors.New("no Unity instances running"), project, 0)
+	if err == nil || !strings.Contains(err.Error(), crashState) {
+		t.Fatalf("expected the crash report from the pre-scan heartbeat, got %v", err)
+	}
+	if strings.Contains(err.Error(), editorStartingState) {
+		t.Errorf("must not fall back to %s:\n%s", editorStartingState, err)
+	}
+}
+
 // TestAnnotateNoEditor_WithoutDumpKeepsEvidence: the starting-or-blocked answer must survive untouched.
 func TestAnnotateNoEditor_WithoutDumpKeepsEvidence(t *testing.T) {
 	dir := openUnityProjectDir(t, 45*time.Second)
@@ -215,6 +269,7 @@ func TestStatusCmd_CrashExitsNonZero(t *testing.T) {
 // TestStatusCmd_QuietHeartbeatKeepsExitZero pins the difference: the same silence with no dump is still
 // reported and still exits 0, as it did before crash detection.
 func TestStatusCmd_QuietHeartbeatKeepsExitZero(t *testing.T) {
+	stubProcessTable(t, containerProcessTable())
 	crashedProjectFixture(t, "ready", 30*time.Second, -1)
 	inst, err := readStatus(8090)
 	if err != nil {
@@ -230,10 +285,10 @@ func TestStatusCmd_QuietHeartbeatKeepsExitZero(t *testing.T) {
 // the disk says is dead ends it with the crash report instead of a 120 s timeout.
 func TestWaitForAlive_StopsOnACrashVerdict(t *testing.T) {
 	project := crashedProjectFixture(t, "ready", 30*time.Second, 20*time.Second)
-	resolve := func() (*client.Instance, error) { return client.NewestHeartbeat(project, 8090), nil }
+	resolve := resolveKeepingEvidence(project, 8090)
 
 	start := time.Now()
-	_, err := waitForAlive(resolve, 30000)
+	_, err := waitForAliveContext(context.Background(), resolve, 30000)
 	if err == nil {
 		t.Fatal("expected the crash report")
 	}
@@ -245,12 +300,35 @@ func TestWaitForAlive_StopsOnACrashVerdict(t *testing.T) {
 	}
 }
 
+// TestWaitForAlive_CrashSurvivesTheDeletedHeartbeat: the scan can delete the dead-pid file while the
+// wait is polling; the resolver must keep the record read before it, or the wait runs to its timeout.
+func TestWaitForAlive_CrashSurvivesTheDeletedHeartbeat(t *testing.T) {
+	project := crashedProjectFixture(t, "ready", 30*time.Second, 20*time.Second)
+	beat := client.NewestHeartbeat(project, 8090)
+
+	orig := discoverInstanceKeepingEvidence
+	discoverInstanceKeepingEvidence = func(string, int) (*client.Instance, *client.Instance, error) {
+		return nil, beat, errors.New("no Unity instances running")
+	}
+	t.Cleanup(func() { discoverInstanceKeepingEvidence = orig })
+
+	start := time.Now()
+	_, err := waitForAliveContext(context.Background(), resolveKeepingEvidence(project, 8090), 30000)
+	if err == nil || !strings.Contains(err.Error(), crashState) {
+		t.Fatalf("expected the crash report, got %v after %v", err, time.Since(start))
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Errorf("expected an immediate verdict, took %v", elapsed)
+	}
+}
+
 // TestWaitForAlive_SilentHeartbeatStillWaits: without crash evidence the old patience stands.
 func TestWaitForAlive_SilentHeartbeatStillWaits(t *testing.T) {
+	stubProcessTable(t, containerProcessTable())
 	project := crashedProjectFixture(t, "ready", 30*time.Second, -1)
 	resolve := func() (*client.Instance, error) { return client.NewestHeartbeat(project, 8090), nil }
 
-	_, err := waitForAlive(resolve, 200)
+	_, err := waitForAliveContext(context.Background(), resolve, 200)
 	if err == nil || !strings.Contains(err.Error(), "timed out") {
 		t.Fatalf("expected the old timeout, got %v", err)
 	}
@@ -275,5 +353,26 @@ func TestIsConnectionFailure_CrashIsNotRetryable(t *testing.T) {
 
 	if !isConnectionFailure(errors.New("cannot connect to Unity at port 8090: connection refused")) {
 		t.Error("unclassified connection failures must keep their old behaviour")
+	}
+}
+
+// TestIsConnectionFailure_MatchesEOFOnlyAsATransportEnd: "EOF" inside unrelated text (a JSON parser
+// complaining about an EOF marker, say) is not a dropped connection.
+func TestIsConnectionFailure_MatchesEOFOnlyAsATransportEnd(t *testing.T) {
+	tests := []struct {
+		err  string
+		want bool
+	}{
+		{"cannot connect to Unity at port 8090: EOF", true},
+		{"EOF", true},
+		{"unexpected EOF", true},
+		{"cannot connect to Unity at port 8090: connection reset by peer", true},
+		{"decode error: EOF marker found in archive", false},
+		{"compile_diagnostics: invalid character 'E' looking for beginning of value", false},
+	}
+	for _, tt := range tests {
+		if got := isConnectionFailure(errors.New(tt.err)); got != tt.want {
+			t.Errorf("isConnectionFailure(%q) = %v, want %v", tt.err, got, tt.want)
+		}
 	}
 }

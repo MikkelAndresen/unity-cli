@@ -25,13 +25,27 @@ namespace UnityCliConnector.BuildJobs
         static readonly object s_Lock = new();
         static List<BuildJobRecord> s_Jobs = new();
         static string s_Path;
+        // Set in an import worker: it shares the editor's projectPath, so its store would overwrite
+        // the editor's build-jobs.json with an empty list.
+        static bool s_Disabled;
 
         static BuildJobStore()
         {
             // Loading in a worker would see the editor's running job as abandoned and rewrite the
             // record as interrupted while the build is still going.
-            if (AssetDatabase.IsAssetImportWorkerProcess()) return;
+            if (AssetDatabase.IsAssetImportWorkerProcess())
+            {
+                s_Disabled = true;
+                return;
+            }
             Load();
+        }
+
+        internal static void SetWorkerForTests(bool worker) => s_Disabled = worker;
+
+        internal static int CountForTests
+        {
+            get { lock (s_Lock) return s_Jobs.Count; }
         }
 
         /// <summary>
@@ -39,6 +53,7 @@ namespace UnityCliConnector.BuildJobs
         /// </summary>
         public static void Add(BuildJobRecord job)
         {
+            if (s_Disabled) return;
             lock (s_Lock)
             {
                 s_Jobs.Add(job);
@@ -152,6 +167,7 @@ namespace UnityCliConnector.BuildJobs
 
         static void SaveLocked()
         {
+            if (s_Disabled) return;
             var path = FilePath();
             if (path == null) return;
 

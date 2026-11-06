@@ -214,6 +214,16 @@ namespace UnityCliConnector.Tests
         }
 
         [Test]
+        public void NoneMode_HonoursTheCharCapOnASingleLongLine()
+        {
+            var f = StackTraceFilter.Format(new string('x', 4000), StackTraceFilter.StacktraceMode.None, 6, 120);
+
+            Assert.LessOrEqual(f.Text.Length, 120);
+            Assert.Greater(f.CharsOmitted, 0);
+            StringAssert.Contains("characters omitted", f.Text);
+        }
+
+        [Test]
         public void FullMode_KeepsEveryFrameButStillHonoursTheCap()
         {
             var f = StackTraceFilter.Format(BurstTrace, StackTraceFilter.StacktraceMode.Full, 3, 0);

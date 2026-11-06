@@ -56,11 +56,17 @@ namespace UnityCliConnector
         {
             if (!Supports(code) || string.IsNullOrEmpty(message)) return null;
             var key = code + "|" + message;
-            if (s_HintCache.TryGetValue(key, out var cached)) return cached;
+            if (s_HintCache.TryGetValue(key, out var cached) && (cached != null || ApiIndex.Complete))
+                return cached;
 
             var hint = Build(code, message, budget);
-            if (s_HintCache.Count > 512) s_HintCache.Clear();
-            s_HintCache[key] = hint;
+            // A partial index or a spent budget cannot prove absence: the answer may only arrive
+            // once more assemblies are indexed on a later call.
+            if (hint != null || (ApiIndex.Complete && !budget.Expired))
+            {
+                if (s_HintCache.Count > 512) s_HintCache.Clear();
+                s_HintCache[key] = hint;
+            }
             return hint;
         }
 
@@ -72,8 +78,7 @@ namespace UnityCliConnector
             var target = ParseTarget(code, message);
             if (target == null) return null;
 
-            // Even a spent budget indexes a little: an unindexed domain has no candidates at all.
-            ApiIndex.EnsureIndexed(Math.Max(budget.RemainingMs, 60));
+            if (!budget.Expired) ApiIndex.EnsureIndexed(budget.RemainingMs);
 
             switch (code.ToUpperInvariant())
             {

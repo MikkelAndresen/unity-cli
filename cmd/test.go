@@ -1,12 +1,9 @@
 package cmd
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
-	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -14,18 +11,6 @@ import (
 
 	"github.com/youngwoocho02/unity-cli/internal/client"
 )
-
-type suppressWriter struct {
-	w        io.Writer
-	suppress string
-}
-
-func (s *suppressWriter) Write(p []byte) (int, error) {
-	if bytes.Contains(p, []byte(s.suppress)) {
-		return len(p), nil
-	}
-	return s.w.Write(p)
-}
 
 func testCmd(ctx context.Context, args []string, send sendFn, port int) (*client.CommandResponse, error) {
 	flags, err := parseSubFlags(args)
@@ -88,12 +73,85 @@ func testCmd(ctx context.Context, args []string, send sendFn, port int) (*client
 
 	fmt.Fprintln(os.Stderr, "PlayMode tests running, waiting for results...")
 
-	// Suppress "Unsolicited response received on idle HTTP channel" during domain reload
-	original := log.Writer()
-	log.SetOutput(&suppressWriter{w: os.Stderr, suppress: "Unsolicited response received on idle HTTP channel"})
-	defer log.SetOutput(original)
+	return pollTestResults(ctx, testResultsPort(resp, port))
+}
 
-	return pollTestResults(ctx, port)
+// testResultSummary is what a test run's reply says it did. Total stays a pointer so a connector
+// that answers without a count is told apart from one that counted zero tests.
+type testResultSummary struct {
+	Total  *int `json:"total"`
+	Passed int  `json:"passed"`
+	Failed int  `json:"failed"`
+}
+
+// applyTestVerdict turns a run that selected no test into a failure, the way verify reports "no test
+// ran". A filtered run that matches nothing is a typo in --filter or --assembly far more often than
+// an empty suite, and exiting 0 with {"total":0} reports it as a passing run.
+func applyTestVerdict(resp *client.CommandResponse, flags map[string]string) {
+	summary, ok := testSummaryIn(resp)
+	if !ok || summary.Total == nil || *summary.Total > 0 {
+		return
+	}
+	resp.Success = false
+	resp.Message = noTestsMatchedMessage(flags)
+}
+
+// testSummaryIn reads the run summary out of a reply that succeeded.
+func testSummaryIn(resp *client.CommandResponse) (testResultSummary, bool) {
+	if resp == nil || !resp.Success || len(resp.Data) == 0 {
+		return testResultSummary{}, false
+	}
+	var summary testResultSummary
+	if err := json.Unmarshal(resp.Data, &summary); err != nil {
+		return testResultSummary{}, false
+	}
+	return summary, true
+}
+
+func noTestsMatchedMessage(flags map[string]string) string {
+	var selection []string
+	if filter, ok := flags["filter"]; ok {
+		selection = append(selection, "filter "+filter)
+	}
+	if assembly, ok := flags["assembly"]; ok {
+		selection = append(selection, "assembly "+assembly)
+	}
+	if len(selection) == 0 {
+		return "no tests matched: the run selected no tests in this mode"
+	}
+	return "no tests matched (" + strings.Join(selection, ", ") + ")"
+}
+
+// staleOutsideSelectionNote is verify's note about project assemblies that are older than their
+// sources but sit outside --assembly, where the run will not load them. test only hears from the
+// connector about the assemblies it asked for, so this asks compile_status separately — and only for
+// a scoped run, the case where the note can differ from the connector's own refusal.
+func staleOutsideSelectionNote(send sendFn, assembly string) string {
+	if strings.TrimSpace(assembly) == "" {
+		return ""
+	}
+	prov, _ := fetchProvenance(send)
+	if prov == nil || prov.StaleAssemblyCount == 0 {
+		return ""
+	}
+	if staleAssembliesUnderTest(prov, assembly) > 0 {
+		return ""
+	}
+	return fmt.Sprintf("%d stale assembly(ies) are outside --assembly; the tests will not load them", prov.StaleAssemblyCount)
+}
+
+// testResultsPort is the port the connector stamped the run with: a compile or reload between the
+// resolve before the send and the send itself can move the connector, so polling the pre-send port
+// would wait ten minutes for a result file the run never writes. Connectors that predate the port
+// in the reply fall back to the caller's port.
+func testResultsPort(resp *client.CommandResponse, fallback int) int {
+	var data struct {
+		Port int `json:"port"`
+	}
+	if len(resp.Data) > 0 && json.Unmarshal(resp.Data, &data) == nil && data.Port > 0 {
+		return data.Port
+	}
+	return fallback
 }
 
 func pollTestResults(ctx context.Context, port int) (*client.CommandResponse, error) {
@@ -103,9 +161,10 @@ func pollTestResults(ctx context.Context, port int) (*client.CommandResponse, er
 	}
 
 	resultsPath := filepath.Join(home, ".unity-cli", "status", fmt.Sprintf("test-results-%d.json", port))
-	deadline := time.Now().Add(10 * time.Minute)
 
-	for time.Now().Before(deadline) {
+	// The invocation context is the only bound: an explicit --timeout 0 means no deadline, which is
+	// what the help text promises, so there is no second 10-minute limit here.
+	for {
 		select {
 		case <-ctx.Done():
 			if ctx.Err() == context.DeadlineExceeded {
@@ -134,6 +193,4 @@ func pollTestResults(ctx context.Context, port int) (*client.CommandResponse, er
 			return nil, modalBlockedError(inst, "test --mode PlayMode", true)
 		}
 	}
-
-	return nil, fmt.Errorf("timed out waiting for test results (10m)")
 }

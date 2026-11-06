@@ -245,14 +245,14 @@ func waitForBuild(poll sendFn, logw io.Writer, id string) (*client.CommandRespon
 			}
 			lastJob = job
 
+			if job.terminal() {
+				return finalizeBuild(resp, job, logw, started)
+			}
+
 			if line := buildProgressLine(job); line != "" &&
 				(line != lastLine || time.Since(lastLineAt) > buildProgressEvery) {
 				fmt.Fprintln(logw, line)
 				lastLine, lastLineAt = line, time.Now()
-			}
-
-			if job.terminal() {
-				return finalizeBuild(resp, job, logw, started)
 			}
 		} else {
 			lastErr = err
@@ -419,7 +419,8 @@ func formatBytes(bytes int64) string {
 		return strconv.FormatInt(bytes, 10) + " B"
 	}
 	div, exp := int64(unit), 0
-	for n := bytes / unit; n >= unit && exp < 4; n /= unit {
+	// "KMGT" has no index 4, so a PiB-sized value stays in TB instead of indexing past it.
+	for n := bytes / unit; n >= unit && exp < 3; n /= unit {
 		div *= unit
 		exp++
 	}

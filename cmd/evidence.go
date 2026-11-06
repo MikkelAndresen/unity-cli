@@ -37,6 +37,13 @@ const staleLockfileAge = 2 * time.Hour
 // A crash is checked first because it outranks the starting-or-blocked reading: both have a silent
 // heartbeat, and only one of them is worth waiting for.
 func annotateNoEditor(err error, project string, port int) error {
+	return annotateNoEditorWith(client.NewestHeartbeat(project, port), err, project, port)
+}
+
+// annotateNoEditorWith is annotateNoEditor for a caller that already discovered an instance: beat is
+// the heartbeat read before that discovery, whose scan deletes the dead-pid file the crash verdict
+// needs. It is nil when there was none to read.
+func annotateNoEditorWith(beat *client.Instance, err error, project string, port int) error {
 	if err == nil {
 		return nil
 	}
@@ -44,9 +51,9 @@ func annotateNoEditor(err error, project string, port int) error {
 	if errors.As(err, &already) {
 		return err
 	}
-	if inst := client.NewestHeartbeat(project, port); inst != nil {
-		if verdict := assessCrash(inst); verdict.Crashed {
-			return crashedError(inst, verdict, err)
+	if beat != nil {
+		if verdict := assessCrash(beat); verdict.Crashed {
+			return crashedError(beat, verdict, err)
 		}
 	}
 	ev := client.FindEditorEvidence(project, port)
@@ -62,15 +69,25 @@ func evidenceSentence(ev *client.EditorEvidence) string {
 	if project == "" {
 		project = "this project"
 	}
-	if ev.SilentHeartbeatThisSession() {
+	if beat, age := ev.UnresponsiveHeartbeat(); beat != nil {
 		pid := ""
-		if ev.StaleHeartbeat.PID > 0 {
-			pid = fmt.Sprintf(", pid %d", ev.StaleHeartbeat.PID)
+		if beat.PID > 0 {
+			pid = fmt.Sprintf(", pid %d", beat.PID)
+		}
+		if ev.LockfilePath == "" {
+			return fmt.Sprintf("%s: Unity's connector for %s stopped answering %s ago%s (last state %q), and no Temp/UnityLockfile is held — the editor has probably exited.",
+				editorUnresponsiveState, project, client.FormatAge(age), pid, beat.State)
 		}
 		return fmt.Sprintf("%s: Unity's connector for %s stopped answering %s ago%s (last state %q) — the main thread is likely blocked (long exec/build/import), a modal dialog is open, or the editor hung.",
-			editorUnresponsiveState, project, client.FormatAge(ev.StaleBeatAge), pid, ev.StaleHeartbeat.State)
+			editorUnresponsiveState, project, client.FormatAge(age), pid, beat.State)
 	}
 	if ev.LockfilePath != "" {
+		// The lockfile age decides what the sentence may claim: a session that has been "starting"
+		// for hours is not still importing.
+		if ev.LockfileAge > staleLockfileAge && !ev.HeartbeatThisSession() {
+			return fmt.Sprintf("%s: Unity's Temp/UnityLockfile for %s is %s old and no heartbeat from this session exists — the editor probably crashed instead of quitting, rather than still starting.",
+				editorStartingState, project, client.FormatAge(ev.LockfileAge))
+		}
 		return fmt.Sprintf("%s: Unity appears open for %s (%s) but the connector has not loaded — it is still importing/compiling, or %s.",
 			editorStartingState, project, ev.Summary(), startupDialogCauses)
 	}
@@ -80,10 +97,21 @@ func evidenceSentence(ev *client.EditorEvidence) string {
 
 // evidenceHint is the one-line form, for paths that already print their own message.
 func evidenceHint(ev *client.EditorEvidence) string {
-	if ev.SilentHeartbeatThisSession() {
-		return fmt.Sprintf("%s Try 'unity-cli dialogs' on the macOS host; if it stays silent, restart the editor ('unity-restart' in agent-sandbox).", evidenceSentence(ev))
+	return fmt.Sprintf("%s Next: %s", evidenceSentence(ev), evidenceNext(ev))
+}
+
+// evidenceNext is the next step for the operator; the hint and the report must never disagree on it.
+func evidenceNext(ev *client.EditorEvidence) string {
+	if beat, _ := ev.UnresponsiveHeartbeat(); beat != nil {
+		if ev.LockfilePath == "" {
+			return "the project holds no Temp/UnityLockfile, so the editor has probably exited; relaunch it ('unity-restart' in agent-sandbox) and read its log."
+		}
+		return "try 'unity-cli dialogs' on the macOS host; if it stays silent, restart the editor ('unity-restart' in agent-sandbox)."
 	}
-	return fmt.Sprintf("%s Run 'unity-cli dialogs' on the macOS host, or ask the user.", evidenceSentence(ev))
+	if ev.LockfilePath != "" && ev.LockfileAge > staleLockfileAge && !ev.HeartbeatThisSession() {
+		return "the editor probably crashed; relaunch it ('unity-restart' in agent-sandbox) and read its crash log or Logs/Editor.log."
+	}
+	return "run 'unity-cli dialogs' on the macOS host to read the dialog's title and buttons, or ask the user to look at the editor."
 }
 
 // evidenceReport is the whole actionable report for an editor that is open but silent.
@@ -102,17 +130,16 @@ func evidenceReport(ev *client.EditorEvidence, discovery error) string {
 		fmt.Fprintf(&b, "  Lockfile: none at %s/Temp/UnityLockfile, so Unity may not be holding this project open\n", ev.ProjectPath)
 	}
 
-	if ev.StaleHeartbeat != nil {
+	if beat, age := ev.UnresponsiveHeartbeat(); beat != nil {
+		fmt.Fprintf(&b, "  Heartbeat: %s (state %q, pid %d, last beat %s ago)\n",
+			beat.SourceFile, beat.State, beat.PID, client.FormatAge(age))
+	} else if ev.StaleHeartbeat != nil {
 		fmt.Fprintf(&b, "  Heartbeat: %s (state %q, pid %d, last beat %s ago)\n",
 			ev.StaleFile, ev.StaleHeartbeat.State, ev.StaleHeartbeat.PID, client.FormatAge(ev.StaleBeatAge))
 	}
 	if discovery != nil {
 		fmt.Fprintf(&b, "  Lookup:   %s\n", strings.ReplaceAll(discovery.Error(), "\n", " "))
 	}
-	if ev.SilentHeartbeatThisSession() {
-		b.WriteString("  Next:     try 'unity-cli dialogs' on the macOS host; if it stays silent, restart the editor ('unity-restart' in agent-sandbox).")
-	} else {
-		b.WriteString("  Next:     run 'unity-cli dialogs' on the macOS host to read the dialog's title and buttons, or ask the user to look at the editor.")
-	}
+	b.WriteString("  Next:     " + evidenceNext(ev))
 	return b.String()
 }

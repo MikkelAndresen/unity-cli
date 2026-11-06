@@ -147,9 +147,10 @@ func TestFindEditorExecutable_NotFoundListsCandidates(t *testing.T) {
 		override,
 		fromEnv,
 		"$UNITY_EDITOR",
-		"--editor override",
+		"--editor-path override",
 		filepath.Join(home, "Unity", "Hub", "Editor", testVersion, "Editor", "Unity"),
 		"UNITY_EDITOR",
+		"pass --editor-path <path>",
 	} {
 		if !strings.Contains(msg, want) {
 			t.Errorf("error message missing %q:\n%s", want, msg)

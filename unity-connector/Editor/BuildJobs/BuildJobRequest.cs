@@ -159,8 +159,8 @@ namespace UnityCliConnector.BuildJobs
         static string[] RequestedScenes(string[] requested) => requested ?? Array.Empty<string>();
 
         /// <summary>
-        /// Every scene the build will be handed, whatever its source, must still be an asset and still
-        /// be on disk. Build Settings keeps entries for scenes that were deleted, and the build's own
+        /// Every scene the build will be handed, whatever its source, must still be a scene asset and
+        /// still be on disk. Build Settings keeps entries for scenes that were deleted, and the build's own
         /// "Verify Build setup" step then fails with a misleading "incorrect path for a scene file"
         /// after the job has been accepted.
         /// </summary>
@@ -187,7 +187,7 @@ namespace UnityCliConnector.BuildJobs
         static bool SceneExists(string scene, string projectRoot)
         {
             if (string.IsNullOrEmpty(scene)) return false;
-            if (AssetDatabase.LoadAssetAtPath<UnityEngine.Object>(scene) == null) return false;
+            if (AssetDatabase.LoadAssetAtPath<SceneAsset>(scene) == null) return false;
             return string.IsNullOrEmpty(projectRoot) ||
                    File.Exists(Path.GetFullPath(Path.Combine(projectRoot, scene)));
         }

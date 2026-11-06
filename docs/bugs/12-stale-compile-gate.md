@@ -177,3 +177,98 @@ binding is optional and degrades to no timestamp rather than failing initializat
 - The blocked message embeds `DescribeLastCompile()`, which is the last finished compile even when
   the errors came from the console of a later failed compile; `compiled_at_ms` is in `data` for
   callers that need the exact clock.
+
+## Review follow-up
+
+A read-only review of this branch raised seven findings. All were fixed; two of them
+(1 and 2) changed the freshness model itself, on the owner's decision: use the console ordinal
+`LogEntry.globalLineIndex` instead of the log's time-of-day, because time-of-day cannot separate an
+entry from yesterday and never sees a compile's own diagnostics after the reload it caused.
+
+### What changed
+
+1. **Post-reload console diagnostics are kept.** The compile's ordinal boundary is captured before
+   the compile logs anything and lives in `SessionState`, so the domain created by a successful
+   compile still recognizes the compile's console warnings/errors. `compile_diagnostics
+   --include_warnings` now reports them (previously the "not older than the reload's finish"
+   threshold dropped every one of them).
+2. **No more 24-hour aliasing.** Freshness is ordinal, not clock-of-day; the timestamp rule survives
+   only as the documented fallback for a session with no ordinal boundary yet
+   (`console_freshness.mode = "timestamp"` in the gate payload, `CompilationGate.ConsoleFreshnessMode`
+   for other tools).
+3. **A sticky entry that names compiler errors blocks again.** `StickyError` is one bit for failed
+   builds, runtime errors and the play-mode banner; `CompileDiag.StickyCompileFailure` keeps the
+   banner ("All compiler errors have to be fixed…", "Scripts have compiler errors.") as compile
+   evidence and still rejects build/runtime stickies.
+4. **`Packages/...` diagnostics resolve.** `DiagnosticFileExists` maps a logical package asset path
+   through `PackageInfo.FindForAssetPath(...).resolvedPath`, so registry (`Library/PackageCache`) and
+   `file:` package diagnostics are no longer treated as deleted files.
+5. **Tests cover the reload and no-start paths, and the real bindings.** New cases pin the reload
+   boundary, the no-op compile, the timestamp fallback, and the clear-detected paths; a real-console
+   test asserts `LogEntry.globalLineIndex` and `GetEntryTimestampInternal` return what the gate
+   expects.
+6. **Narrating comments removed** (`GateMessage`, `IsCurrentConsoleDiagnostic`); the remaining
+   comments state the non-local coupling and the measured constraints.
+7. **The virtual-source exemption is name-based.** Only a file name of `unknown` or an
+   angle-bracketed placeholder is exempt, so `Assets/unknown/Old.cs` keeps its existence check.
+
+### Measurement that shaped the implementation
+
+The first implementation captured the ordinal boundary *inside* `compilationStarted`. Live runs
+showed that read is unreliable: it can fail outright, and when it returns it can report a maximum
+that is higher than the ordinals the same compile gives its own diagnostics (e.g. boundary 157 while
+that compile's warnings ended up at 155-156, with 157 later assigned to a post-reload log line).
+Ordinals themselves are stable (`LogEntry.globalLineIndex` of an existing entry does not move when
+new entries are added — measured), so the boundary is now snapshotted only while the editor is idle:
+on every gate read and after every compile that rebuilt an assembly. `compilationStarted` merely
+adopts the last snapshot.
+
+The second finding from the same instrumentation: a `refresh --compile` can be followed by a second
+compile that fires `compilationStarted`/`compilationFinished` but never
+`assemblyCompilationFinished` (nothing rebuilt). Such a no-op compile must not advance the boundary,
+or it would declare the real compile's console diagnostics stale — so the boundary only advances when
+at least one assembly finished.
+
+### Verification (live, this branch)
+
+- `editor refresh --compile --keep-console` with a scratch file under `Tests/Editor` carrying a
+  deliberate `CS1525` error → `exec` blocked, message naming
+  `GhostR12CompileProbe.cs(7,26) CS1525`, payload `console_freshness: {mode: ordinal, ...}`.
+- Same file turned into an `[Obsolete]` call (a warning) → compile succeeds and reloads →
+  `compile_diagnostics --include_warnings` still reports `CS0618` from that scratch file after the
+  reload (finding 1).
+- Scratch file and its `.meta` removed → compile clean → `exec` runs and the previously blocking
+  `CS1525` console entry is no longer reported (ordinal boundary, not a 24-hour clock).
+- EditMode: `verify --assembly UnityCliConnector.Tests.Editor,UnityCliConnector.InputInjection.Tests.Editor`
+  → 450/451 passed, 1 skipped (the opt-in modal dialog test).
+
+### Residual risk
+
+- The boundary is only as fresh as the last idle snapshot. If a compile starts without any prior gate
+  read or finished compile in the session (first compile after the editor opens), the gate falls back
+  to the persisted start clock and console timestamps, which keeps that compile's diagnostics but
+  cannot order entries more than a day apart.
+- `PackageInfo.FindForAssetPath` returns null for a package path that is no longer installed; such a
+  console diagnostic is treated as stale (correct for a removed package, and the pipeline cache
+  remains the primary source for installed ones).
+
+## Review follow-up (end-to-end run)
+
+- **The compile clock could read 0 while `compile_status` knew the compile.** The heartbeat published
+  `CompilationGate.LastCompileFinishedAt`; `HeartbeatPayloadTests.MarkCompileRequested_…` reset the gate
+  and never restored it, and the reset erased the `unity-cli/console-freshness` SessionState key, so
+  after a 403-test run the heartbeat reported `compileFinishedAt: 0` for minutes while the separate
+  provenance record still named a valid compile. Three changes: `ResetForTests` switches the gate into
+  a test key (`unity-cli/console-freshness.tests`) so a test cannot erase or overwrite the live record
+  at all; the fixture restores the live state; and `Heartbeat.ResolveCompileFinishedAt()` falls back to
+  `CompileProvenance`'s finish clock, so the two records cannot disagree about whether this editor can
+  prove a compile happened. Covered by
+  `CompilationGateTests.ResetForTests_CannotClobberTheLiveSessionRecord`,
+  `HeartbeatPayloadTests.CompileFinishedAt_FallsBackToProvenanceSoTheCLINeverSeesATrackedZero` and the
+  fixed fixture.
+- **`CompilationGate.NoteNothingToCompile()`** publishes a compile that rebuilt nothing (see
+  `editor refresh --compile` in the README): it moves both clocks without clearing the diagnostics
+  cache or adopting a new console boundary, and records no rebuilt assemblies. `refresh_unity` skips
+  the request only when the project is provably current, which took `editor refresh --compile` on an
+  unchanged project from 20-28 s to ~2.5 s (the 20 s was a forced compile plus its ~10 s domain
+  reload, not the 20 s `compileIdleGrace`).

@@ -285,3 +285,27 @@ observable proof: neither `console` nor `console_filter` could read that line ba
   the caller sees EOF as before.
 - Play-mode entry/exit (#10) was not exercised here; the code path it needs (`beforeAssemblyReload`
   answering pending requests, then refusing new ones) is the one exercised above.
+
+## Review follow-up
+
+The code review of `fix/8-server-deadline` raised four findings against this change; two had already
+been fixed by later commits on the stack.
+
+- **Confirmed — quit could accept a request after answering the snapshot.** `Stop()` now sets
+  `s_RefusingWork` before `AnswerPending`, so the quit path mirrors `beforeAssemblyReload`.
+  `HandleRequest` also re-reads the flag after `Track`: a reload that flips it between the first read
+  and tracking would otherwise miss the ticket in its "answer everything" snapshot and leave the
+  caller with an empty body, which the CLI reports as success.
+- **Confirmed — the quit answer's missing `data.code` was contradicted by the README.** The code is
+  deliberate (see #10): a quit has no editor to wait for, so `BuildReloadError(..., quitting: true)`
+  carries no code. The README now says so instead of claiming every quit answer is `domain_reload`.
+- **Confirmed — a very short client budget can expire before the 0.5 s queue floor.** The floor stays
+  (it keeps a tiny budget from racing the answer), and the README now says a sub-floor budget can time
+  out client-side first.
+- **Already fixed — slow-pickup `meta` overwrote `exec`'s compile meta**, and the CLI hint treated an
+  already-started request as one that never ran. The current tree merges a CLR `meta` object with
+  `JObject.FromObject` and answers started requests `reload_during_command`; both have regression
+  tests.
+- Also cancelled the queue-deadline timer once the real answer wins. Low-severity review notes about
+  comment narration and the missing space before `[heartbeat:` were handled only for the message
+  itself, not by rewriting unrelated comments.
