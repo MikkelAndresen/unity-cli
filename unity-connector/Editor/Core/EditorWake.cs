@@ -55,10 +55,13 @@ namespace UnityCliConnector
         /// has work in the new domain takes a new hold.
         internal static IDisposable Hold()
         {
-            if (s_SignalTick == null) return Released.Instance;
+            bool first;
+            lock (s_Lock) first = s_Holds++ == 0;
+            // Outside s_Lock: AppActivity's update takes its own lock and then reads HoldCount.
+            if (first) AppActivity.Begin();
+            if (s_SignalTick == null) return new Handle();
             lock (s_Lock)
             {
-                s_Holds++;
                 if (s_Pump == null && !s_Stopped)
                 {
                     s_Pump = new Thread(Pump) { IsBackground = true, Name = "UnityCliConnector.EditorWake" };
@@ -107,14 +110,10 @@ namespace UnityCliConnector
             public void Dispose()
             {
                 if (Interlocked.Exchange(ref m_Disposed, 1) != 0) return;
-                lock (s_Lock) s_Holds--;
+                bool last;
+                lock (s_Lock) last = --s_Holds == 0;
+                if (last) AppActivity.Released();
             }
-        }
-
-        sealed class Released : IDisposable
-        {
-            internal static readonly Released Instance = new();
-            public void Dispose() { }
         }
     }
 }

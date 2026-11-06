@@ -186,6 +186,8 @@ namespace UnityCliConnector.Tools
             var max = Math.Max(1, args.Value<int?>("max") ?? 20);
             var timings = new JObject();
             var result = new JObject { ["job"] = state.job, ["refresh"] = state.refresh, ["timings_ms"] = timings };
+            // Later than 0 in a domain the job resumed in after a reload.
+            timings["steps_started"] = NowMs() - state.started_ms;
             var clock = Stopwatch.StartNew();
 
             // The compile clock advances when a compile ends, with or without errors; a compile with
@@ -199,8 +201,18 @@ namespace UnityCliConnector.Tools
             }
             else
             {
+                long busyCompiling = 0, busyUpdating = 0, last = NowMs();
                 while (true)
                 {
+                    var now = NowMs();
+                    if (EditorApplication.isCompiling) busyCompiling += now - last;
+                    if (EditorApplication.isUpdating) busyUpdating += now - last;
+                    last = now;
+                    timings["compile_busy_compiling"] = busyCompiling;
+                    timings["compile_busy_updating"] = busyUpdating;
+                    timings["compile_clock_advanced_ms"] = CompilationGate.LastCompileFinishedAt > state.baseline
+                        ? CompilationGate.LastCompileFinishedAt - state.started_ms
+                        : (long?)null;
                     var idle = !EditorApplication.isCompiling && !EditorApplication.isUpdating;
                     if (idle && CompilationGate.LastCompileFinishedAt > state.baseline)
                     {
