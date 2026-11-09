@@ -8,16 +8,37 @@ CLI tool to control Unity Editor from the command line.
 cmd/                  # Go CLI — thin passthrough layer
   root.go             # Entry point, flag/arg parsing, default passthrough
   editor.go           # editor command (waitForReady polling)
+  quit.go             # editor quit: quit_editor, wait for exit, optional SIGTERM fallback
+  restart.go          # editor restart: stop, optional clean, relaunch, wait for ready
   test.go             # test command (PlayMode result polling)
+  build.go            # build command (job start, build_status polling, progress lines)
   verify.go           # verify command (compile + compile_diagnostics + tests, brief output)
+  wait.go             # wait command: block until the heartbeat is idle, then report compile provenance
+  provenance.go       # compileProvenance payload shared by verify, editor refresh --compile and wait
+  playmode.go         # editor play/stop state confirmation, and the state report after a reload took a command's answer
   status.go           # status, waitForAlive, heartbeat reading
+  signals.go          # SIGINT/SIGTERM/SIGALRM/SIGHUP handling; signals_unix.go/signals_windows.go
+  evidence.go         # editor_starting_or_blocked: the startup-dialog report built from on-disk evidence
+  dialogs.go          # dialogs command (macOS only): list/click Unity windows with AppleScript
   update.go           # self-update from GitHub releases
   version_check.go    # periodic update notice (12h interval)
-internal/client/      # Unity HTTP client, instance discovery
+internal/client/      # Unity HTTP client, instance discovery, Temp/UnityLockfile evidence,
+                      # crash artifacts (mono_crash/Editor-prev.log) and why a dropped connection died
+internal/editor/      # editor lifecycle: heartbeat files, exit waiting, process termination,
+                      # editor executable discovery, launch, project clean/version checks
 unity-connector/      # C# Unity Editor package (UPM)
   Editor/
-    Core/             # Shared utilities (Response, ParamCoercion, ToolParams, StringCaseUtility)
+    Core/             # Shared utilities (Response, ParamCoercion, ToolParams, StringCaseUtility, StackTraceFilter, CompileProvenance,
+                      # AssemblyStaleness (output DLL vs newest source), ExecAwait, ExecCompileCache, ExecCompiler, ExecSource, MainThread,
+                      # RequestTicket/RequestTracker (every accepted request gets one answer: queue deadline,
+                      # domain-reload answer, skip-on-abandon), ErrorCodes (data.code contract with the CLI),
+                      # ResponseJson (serialization can never leave a connection unanswered),
+                      # PlayModeTransitions (play-mode change deferred a tick so its answer survives the reload it starts))
+                      # ApiIndex/ApiReflection/XmlDocLookup back `api`; CompileHints reuses them for compile-error hints
     Tools/            # Tool implementations (auto-registered via [UnityCliTool] attribute)
+    Burst/            # burst_status tool; own asmdef, only compiles when com.unity.burst is present
+    BuildJobs/        # Player build jobs: job record, Temp/ persistence across reloads, runner off the command lock
+    InputInjection/   # `input` tool — own asmdef, only compiles when com.unity.inputsystem is present
     Modal/            # macOS modal dialog handling: AppKit via objc_msgSend, runs during the modal loop
     TestRunner/       # Test runner (RunTests, TestRunnerState)
 ```
@@ -30,6 +51,15 @@ unity-connector/      # C# Unity Editor package (UPM)
 2. CLI command name matches the tool name — default passthrough handles dispatch
 3. Positional args arrive as `args` array, flags as named params
 4. Go-side code is only needed for polling/waiting logic (editor, test)
+5. A tool that needs an optional package goes in its own folder + asmdef with `versionDefines` and
+   `defineConstraints` (see `Editor/InputInjection/` and `Editor/Burst/`); ToolDiscovery scans every
+   loaded assembly, so no registration is needed. Unity must generate the `.meta` files — refresh the
+   asset database rather than writing GUIDs. Keep the version-sensitive part in that assembly and the
+   pure logic (parsing, filtering) in `Editor/Core/` so the tests compile without the package.
+6. A tool that must answer while the main thread is busy (a modal loop, a player build) is marked
+   `[UnityCliTool(RunOffMainThread = true)]`: the HTTP server calls it on the request thread, past the
+   command lock and the compilation gate. It may then touch no Unity API except through a thread-safe
+   path of its own (`modal`, `build_status`).
 
 ## Verification
 
@@ -54,6 +84,11 @@ go test -tags integration ./...
 
 CI skips these since Unity is not available.
 
+The real-dialog modal test (`DisplayDialog_IsAnsweredOverHttp`) is opt-in on top of `[Explicit]`: set
+`UNITY_CLI_DIALOG_TESTS=1` in the editor's environment (a GUI-launched editor does not inherit the
+shell's), and drive it by a path that does not use the CLI's modal watcher, which would otherwise
+abort the run on the dialog it opens.
+
 ## Checklist
 
 ### 변경 시
@@ -73,7 +108,7 @@ CLI(Go)와 Connector(C#)는 같은 릴리스 버전으로 맞춘다.
 - **Connector heartbeat**: `unity-connector/Editor/Heartbeat.cs`의 `CONNECTOR_VERSION`도 같은 `X.Y.Z`로 갱신한다.
 - 개발 빌드의 CLI `Version=dev`는 비교 예외지만, 배포 빌드는 항상 Connector 버전과 같아야 한다.
 - Go 코드나 C# 커넥터 코드 중 하나만 바뀌어도, 배포 시에는 tag와 `package.json` 버전을 같은 번호로 갱신한다.
-- CLI는 실행 전 Connector heartbeat의 `connectorVersion`을 읽어 버전이 다르거나 없으면 에러를 낸다. 버전 갱신 누락을 정상 동작으로 넘기지 않는다.
+- CLI는 실행 전 Connector heartbeat의 `connectorVersion`을 읽어 호환성을 판정한다. patch 차이는 조용히 허용하고, minor/major 차이는 stderr 경고 한 줄만 낸다. 진단용 명령은 게이트하지 않으며, `minConnectorVersion`(0.7.0)보다 오래된 connector만 거부한다. 버전 갱신 누락은 경고로 드러내되 세션을 막지 않는다.
 
 ### 작업 마무리 시
 

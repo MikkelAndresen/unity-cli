@@ -116,10 +116,15 @@ namespace UnityCliConnector.Tests
         /// Opens a real dialog on the main thread and answers it over the
         /// connector's HTTP server from another thread. Explicit because it pops up
         /// a dialog, and a regression leaves that dialog open until a human clicks it.
+        /// Explicit alone is not enough: an assembly-filtered run (unity-cli verify --assembly)
+        /// counts as selecting it, and the CLI's modal watcher then aborts the run on this dialog
+        /// before the responder thread answers it. Hence the opt-in variable.
         [Test, Explicit("Opens a real modal dialog")]
         public void DisplayDialog_IsAnsweredOverHttp()
         {
             if (!RuntimeInformation.IsOSPlatform(OSPlatform.OSX)) Assert.Ignore("Modal handling is macOS-only.");
+            if (Environment.GetEnvironmentVariable("UNITY_CLI_DIALOG_TESTS") != "1")
+                Assert.Ignore("Set UNITY_CLI_DIALOG_TESTS=1 in the editor's environment to run the real-dialog test.");
             Assert.IsTrue(HttpServer.IsRunning, "Connector HTTP server is not running.");
 
             var port = HttpServer.Port;

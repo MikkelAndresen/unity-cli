@@ -32,7 +32,14 @@ namespace UnityCliConnector
 		public const int StickyErrorMask = 1 << 13;
 
 		// What the console fallback treats as a compile-blocking error.
-		internal const int CompileBlockingMask = ScriptCompileErrorMask | StickyErrorMask;
+		public const int CompileBlockingMask = ScriptCompileErrorMask | StickyErrorMask;
+
+		// StickyError is one bit for every failure the console pins there: a failed player build, a
+		// runtime error from an earlier play session, and the play-mode "compiler errors have to be
+		// fixed" banner. Only the last one is evidence that the project does not compile, and the
+		// mode word cannot tell them apart, so the message text decides.
+		private static readonly Regex CompileFailurePattern = new(
+			@"\bcompiler errors?\b", RegexOptions.Compiled | RegexOptions.IgnoreCase);
 
 		// Internal seam for unit tests: when set, bypasses reflection entirely and
 		// returns the supplied diagnostics. Production code must not set this.
@@ -42,6 +49,10 @@ namespace UnityCliConnector
 		private static readonly Regex HeaderPattern = new(
 			@"^(?<file>[^()]+)\((?<line>\d+),(?<col>\d+)\):\s+(?<sev>error|warning)\s+(?<code>[A-Z]+\d+):\s*(?<msg>.+)$",
 			RegexOptions.Compiled);
+
+		// Unity's GetEntryTimestampInternal prefixes the message with e.g. "[07:20:09]".
+		private static readonly Regex TimestampPattern = new(
+			@"^\s*\[(?<h>\d{1,2}):(?<m>\d{2}):(?<s>\d{2})\]", RegexOptions.Compiled);
 
 		public static bool IsAvailable => ReadConsole.IsReflectionAvailable;
 		public static string InitError => IsAvailable ? null : "ReadConsole reflection unavailable";
@@ -57,11 +68,33 @@ namespace UnityCliConnector
 			var result = new List<CompileDiag>();
 			diagnostics = result;
 
-			return ReadConsole.TryForEachEntry((mode, message, file, line) =>
+			return ReadConsole.TryForEachEntry((mode, message, file, line, timestamp, index) =>
 			{
-				if (TryConvertEntry(mode, message, file, line, includeWarnings, out var diag))
+				if (TryConvertEntry(mode, message, file, line, includeWarnings, out var diag, timestamp, index))
 					result.Add(diag);
 			});
+		}
+
+		/// The console's ordinal range (oldest and newest globalLineIndex), or false when this Unity
+		/// version does not expose the field — and for a test that replaced the console with
+		/// <see cref="TestOverride"/>, whose entries carry whatever ordinals it seeded.
+		public static bool TryGetConsoleIndexRange(out int firstIndex, out int lastIndex)
+		{
+			if (TestOverride != null)
+			{
+				firstIndex = -1;
+				lastIndex = -1;
+				return false;
+			}
+			return ReadConsole.TryGetConsoleIndexRange(out firstIndex, out lastIndex);
+		}
+
+		/// Every in-memory console entry, unfiltered, with the full message including its stack
+		/// trace. <see cref="Parse"/> cuts the head, and a Burst error writes its position only as an
+		/// "(at <file>:<line>)" frame — so a tool that wants Burst's file:line has to read past the head.
+		public static bool TryForEachRawEntry(Action<int, string, string, int> visitor)
+		{
+			return ReadConsole.TryForEachEntry(visitor);
 		}
 
 		/// Pure conversion of an in-memory LogEntry's primitive fields into a CompileDiag.
@@ -69,7 +102,7 @@ namespace UnityCliConnector
 		/// an empty message. Extracted so tests can exercise the mode-bit filtering
 		/// without faking out the LogEntries API.
 		internal static bool TryConvertEntry(int mode, string message, string file, int line,
-			bool includeWarnings, out CompileDiag diag)
+			bool includeWarnings, out CompileDiag diag, string timestamp = null, int consoleIndex = -1)
 		{
 			diag = default;
 			var isError = (mode & CompileBlockingMask) != 0;
@@ -77,7 +110,24 @@ namespace UnityCliConnector
 			if (!isError && !(includeWarnings && isWarning)) return false;
 			if (string.IsNullOrEmpty(message)) return false;
 			diag = Parse(message, file, line, isError);
+			diag.Sticky = (mode & StickyErrorMask) != 0;
+			diag.StickyCompileFailure = diag.Sticky && CompileFailurePattern.IsMatch(diag.Message);
+			diag.TimeOfDaySeconds = ParseTimestampSeconds(timestamp);
+			diag.HasTimestamp = diag.TimeOfDaySeconds >= 0;
+			diag.ConsoleIndex = consoleIndex;
 			return true;
+		}
+
+		internal static long ParseTimestampSeconds(string timestamp)
+		{
+			if (string.IsNullOrEmpty(timestamp)) return -1;
+			var m = TimestampPattern.Match(timestamp);
+			if (!m.Success) return -1;
+			var h = int.Parse(m.Groups["h"].Value);
+			var min = int.Parse(m.Groups["m"].Value);
+			var s = int.Parse(m.Groups["s"].Value);
+			if (h > 23 || min > 59 || s > 59) return -1;
+			return h * 3600L + min * 60L + s;
 		}
 
 		internal static CompileDiag Parse(string fullMessage, string fileFallback, int lineFallback, bool isError)
@@ -95,6 +145,20 @@ namespace UnityCliConnector
 					Severity = m.Groups["sev"].Value,
 					Code = m.Groups["code"].Value,
 					Message = m.Groups["msg"].Value
+				};
+
+			// Burst writes "<file>(<line>,<col>): Burst error BCxxxx: ...", or "(0,0): Burst error ..."
+			// with the position only in a stack frame. Neither reads as a C# header, so without this a
+			// Burst error is reported with no file and no code.
+			if (BurstErrors.TryParse(fullMessage, fileFallback, lineFallback, out var burst))
+				return new CompileDiag
+				{
+					File = burst.File,
+					Line = burst.Line,
+					Col = burst.Col,
+					Severity = isError ? "error" : "warning",
+					Code = burst.Code,
+					Message = burst.Message
 				};
 
 			// Header didn't match — fall back to LogEntry's own file/line fields.
@@ -117,6 +181,21 @@ namespace UnityCliConnector
 			public string Severity;
 			public string Code;
 			public string Message;
+			/// <summary>What the caller should write instead, for the codes where that is knowable
+			/// (see <see cref="CompileHints"/>). Null when there is nothing close to suggest.</summary>
+			public string Hint;
+			/// <summary>Sticky console entry (build/runtime failure banner), not a compiler diagnostic.</summary>
+			public bool Sticky;
+			/// <summary>Sticky entry whose text says compilation is broken (the play-mode or build
+			/// "compiler errors" banner). The only sticky entries the gate may block on.</summary>
+			public bool StickyCompileFailure;
+			/// <summary>Console-wide ordinal of the entry (LogEntry.globalLineIndex); -1 is unknown.</summary>
+			public int ConsoleIndex;
+			/// <summary>Local time of day from LogEntries.GetEntryTimestampInternal; -1 is unknown.</summary>
+			public long TimeOfDaySeconds;
+			public bool HasTimestamp;
+
+			public bool HasConsoleIndex => ConsoleIndex >= 0;
 		}
 	}
 }

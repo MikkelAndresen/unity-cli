@@ -2,9 +2,11 @@ using System;
 using System.IO;
 using System.Security.Cryptography;
 using System.Text;
+using System.Threading;
 using Newtonsoft.Json;
 using UnityEditor;
 using UnityEngine;
+using UnityCliConnector.BuildJobs;
 using UnityCliConnector.Modal;
 
 namespace UnityCliConnector
@@ -16,10 +18,25 @@ namespace UnityCliConnector
             Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".unity-cli", "instances");
 
         static double s_LastWrite;
+        // Keeps "starting" fresh while the main thread has not ticked yet (a large import can hold
+        // it for longer than the CLI's silence threshold). Disposed by the first Tick.
+        static Timer s_StartupBeater;
         const double INTERVAL = 0.5;
         const string CONNECTOR_VERSION = "0.7.0";
+        // A requested compile that never starts must not keep the state "compiling" forever; the
+        // CLI's nothing_to_compile grace is shorter than this, so an expiry only bounds a rare
+        // queued-behind-import case, it is not the normal path.
+        const double COMPILE_PENDING_MAX = 60.0;
+        const string TickedSessionKey = "unity-cli/heartbeat-ticked";
         static string s_ForcedState;
         static double s_CompileRequestTime;
+        static long s_CompileStartBaseline;
+        static long s_CompileRequestWallMs;
+        // Unix ms of the listener coming up in this editor process; published while "starting" so
+        // the CLI can show how long the editor has been waiting for its first tick (the beater keeps
+        // the heartbeat itself fresh, which hides that age).
+        static long s_StartingSince;
+        static bool s_TickedThisDomain;
         static string s_FilePath;
 
         // Snapshot of main-thread-only values so the file can be rewritten from the
@@ -30,19 +47,114 @@ namespace UnityCliConnector
         static int s_Pid;
         static string s_LastState = "ready";
         static bool s_LastCompileErrors;
+        static long s_LastCompileFinishedAt;
+
+        /// <summary>The state of the last heartbeat written. Readable from any thread — it is the
+        /// main-thread snapshot, which is what a request thread answers with when the main thread is
+        /// not ticking.</summary>
+        internal static string LastState => Volatile.Read(ref s_LastState);
+
+        // Set while a build job holds the main thread. GetState is main-thread only, so the flag is
+        // what keeps a heartbeat written from the build's own beater thread saying "building".
+        static volatile bool s_BuildActive;
+        static volatile BuildHeartbeatSnapshot s_BuildInfo;
 
         static Heartbeat()
         {
+            // An AssetImportWorker shares the editor's projectPath, so its heartbeat would land in the
+            // same file with the worker's pid — e.g. MarkStopped on the worker's quit.
+            if (AssetDatabase.IsAssetImportWorkerProcess()) return;
+
             EditorApplication.update += Tick;
             EditorApplication.quitting += Cleanup;
             AssemblyReloadEvents.beforeAssemblyReload += OnBeforeAssemblyReload;
-            AssemblyReloadEvents.afterAssemblyReload += () => { s_ForcedState = null; s_LastWrite = 0; };
+            AssemblyReloadEvents.afterAssemblyReload += OnAfterAssemblyReload;
             EditorApplication.playModeStateChanged += OnPlayModeChanged;
         }
 
         static void OnBeforeAssemblyReload()
         {
+            StopStartupBeater();
             WriteState("reloading");
+        }
+
+        static void OnAfterAssemblyReload()
+        {
+            s_ForcedState = null;
+            s_LastWrite = 0;
+            // InitializeOnLoad order is not guaranteed: HttpServer.Start may have run first, in which
+            // case this is the write that puts the new session's first heartbeat on disk.
+            if (HttpServer.IsRunning) OnListenerStarted();
+        }
+
+        /// <summary>
+        /// Publishes a heartbeat as soon as the listener is up. The listener starts before
+        /// EditorApplication.update does any useful work on a cold import, and until the first tick
+        /// the old Tick early-return left the daemon with no heartbeat at all ("state None") even
+        /// though the socket was answering. The first tick replaces "starting" with the real state.
+        /// </summary>
+        internal static void OnListenerStarted()
+        {
+            // A reload is not a startup: this process has already ticked, so its real state is
+            // knowable and "starting" would make the CLI's reload note read a routine compile as a
+            // hung launch. SessionState survives the reload that resets the statics above.
+            if (s_LastWrite == 0 && s_StartingSince == 0 && !TickedBeforeThisReload())
+            {
+                s_StartingSince = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+                WriteState("starting");
+                StartStartupBeater();
+                return;
+            }
+
+            Write();
+        }
+
+        static bool TickedBeforeThisReload()
+        {
+            try
+            {
+                return SessionState.GetBool(TickedSessionKey, false);
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        static void MarkTicked()
+        {
+            if (s_TickedThisDomain) return;
+            s_TickedThisDomain = true;
+            try
+            {
+                SessionState.SetBool(TickedSessionKey, true);
+            }
+            catch
+            {
+                // SessionState is unavailable very early in a launch; losing the marker only
+                // costs one extra "starting" write after the next reload.
+            }
+        }
+
+        static void StartStartupBeater()
+        {
+            StopStartupBeater();
+            s_StartupBeater = new Timer(_ =>
+            {
+                if (s_LastWrite != 0)
+                {
+                    StopStartupBeater();
+                    return;
+                }
+                WriteFromAnyThread();
+            }, null, 500, 500);
+        }
+
+        static void StopStartupBeater()
+        {
+            var timer = s_StartupBeater;
+            s_StartupBeater = null;
+            timer?.Dispose();
         }
 
         static void OnPlayModeChanged(PlayModeStateChange change)
@@ -58,18 +170,51 @@ namespace UnityCliConnector
         }
 
         /// <summary>
-        /// Marks that a compile was requested. Keeps "compiling" state forced
-        /// for a grace period so the CLI poller never sees a premature "ready".
+        /// Marks that a compile was requested. Keep "compiling" forced until the compile actually
+        /// starts (its start clock moves) or finishes: a request can sit behind a long asset import,
+        /// and a fixed short grace would let the CLI conclude nothing_to_compile before it runs.
         /// </summary>
         public static void MarkCompileRequested()
         {
             s_CompileRequestTime = EditorApplication.timeSinceStartup;
+            s_CompileRequestWallMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+            s_CompileStartBaseline = CompilationGate.LastCompileStartedAt;
             WriteState("compiling");
+        }
+
+        /// <summary>
+        /// Publishes what the running build job is doing. Safe from any thread; the value is an
+        /// immutable snapshot, so the heartbeat never serializes a half-updated one.
+        /// </summary>
+        internal static void PublishBuild(BuildHeartbeatSnapshot info)
+        {
+            s_BuildInfo = info;
+        }
+
+        /// <summary>
+        /// Marks the editor as building. Two paths keep the heartbeat saying so: the state written here
+        /// is what the build's beater thread re-writes while BuildPlayer holds the main thread, and the
+        /// flag is what GetState returns if the main thread does tick during a build.
+        /// </summary>
+        internal static void MarkBuildStarted()
+        {
+            s_BuildActive = true;
+            WriteState(BuildJobRecord.PhaseBuilding);
+        }
+
+        internal static void MarkBuildFinished()
+        {
+            s_BuildActive = false;
+            s_BuildInfo = null;
+            // MarkBuildStarted forced the state; leaving it would write "building" with no build.
+            if (s_ForcedState == BuildJobRecord.PhaseBuilding) s_ForcedState = null;
+            Write();
         }
 
         static void Tick()
         {
             if (!HttpServer.IsRunning) return;
+            StopStartupBeater();
 
             var now = EditorApplication.timeSinceStartup;
             if (now - s_LastWrite < INTERVAL) return;
@@ -77,7 +222,10 @@ namespace UnityCliConnector
 
             if (s_CompileRequestTime > 0)
             {
-                if (now - s_CompileRequestTime < 3.0 && EditorApplication.isCompiling == false)
+                var started = CompilationGate.LastCompileStartedAt != s_CompileStartBaseline;
+                var finished = CompilationGate.LastCompileFinishedAt > s_CompileRequestWallMs;
+                var expired = now - s_CompileRequestTime >= COMPILE_PENDING_MAX;
+                if (!expired && !finished && (EditorApplication.isCompiling || !started))
                 {
                     Write();
                     return;
@@ -86,17 +234,39 @@ namespace UnityCliConnector
             }
 
             s_ForcedState = null;
+            s_StartingSince = 0;
+            MarkTicked();
             Write();
+        }
+
+        // The hash key must match internal/editor/heartbeat.go: forward slashes, no trailing
+        // separator, and the dataPath's own "/Assets" suffix removed. Only the suffix is stripped:
+        // a project directory that itself contains an "Assets" segment keeps it, because the CLI
+        // hashes the user-supplied project path and a replace-anywhere would diverge from it.
+        static string ProjectRoot() => ProjectRootFromDataPath(Application.dataPath);
+
+        internal static string ProjectRootFromDataPath(string dataPath)
+        {
+            if (string.IsNullOrEmpty(dataPath)) return "";
+            var path = dataPath.Replace('\\', '/').TrimEnd('/');
+            const string suffix = "/Assets";
+            return path.EndsWith(suffix, StringComparison.Ordinal)
+                ? path.Substring(0, path.Length - suffix.Length)
+                : path;
+        }
+
+        internal static string InstanceFileNameFor(string projectPath)
+        {
+            using var md5 = MD5.Create();
+            var hash = BitConverter.ToString(md5.ComputeHash(Encoding.UTF8.GetBytes(projectPath)))
+                .Replace("-", "").Substring(0, 16).ToLower();
+            return $"{hash}.json";
         }
 
         static string GetFilePath()
         {
             if (s_FilePath != null) return s_FilePath;
-            var projectPath = Application.dataPath.Replace("/Assets", "");
-            using var md5 = MD5.Create();
-            var hash = BitConverter.ToString(md5.ComputeHash(Encoding.UTF8.GetBytes(projectPath)))
-                .Replace("-", "").Substring(0, 16).ToLower();
-            s_FilePath = Path.Combine(s_Dir, $"{hash}.json");
+            s_FilePath = Path.Combine(s_Dir, InstanceFileNameFor(ProjectRoot()));
             return s_FilePath;
         }
 
@@ -104,7 +274,7 @@ namespace UnityCliConnector
         {
             if (s_ProjectPath == null)
             {
-                s_ProjectPath = Application.dataPath.Replace("/Assets", "");
+                s_ProjectPath = ProjectRoot();
                 s_UnityVersion = Application.unityVersion;
                 s_Pid = System.Diagnostics.Process.GetCurrentProcess().Id;
                 GetFilePath();
@@ -112,6 +282,7 @@ namespace UnityCliConnector
 
             s_LastState = s_ForcedState ?? GetState();
             s_LastCompileErrors = EditorUtility.scriptCompilationFailed;
+            s_LastCompileFinishedAt = ResolveCompileFinishedAt();
             WriteFile();
         }
 
@@ -129,18 +300,14 @@ namespace UnityCliConnector
         static void WriteFile()
         {
             var modal = s_LastState == "stopped" ? null : ModalWatchdog.Current;
-            var status = new
-            {
-                state = modal != null ? "modal" : s_LastState,
-                projectPath = s_ProjectPath,
-                port = HttpServer.Port,
-                pid = s_Pid,
-                unityVersion = s_UnityVersion,
-                connectorVersion = GetConnectorVersion(),
-                timestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
-                compileErrors = s_LastCompileErrors,
+            var state = modal != null ? "modal" : s_LastState;
+            var status = BuildStatus(
+                state,
+                s_LastCompileErrors,
+                s_LastCompileFinishedAt,
                 modal,
-            };
+                s_BuildActive ? s_BuildInfo : null,
+                state == "starting" ? s_StartingSince : 0);
 
             lock (s_WriteLock)
             {
@@ -156,17 +323,67 @@ namespace UnityCliConnector
             }
         }
 
+        /// <summary>
+        /// Builds the heartbeat payload. Property names here are the contract with the Go CLI's
+        /// client.Instance struct, so renaming one breaks polling silently.
+        /// </summary>
+        internal static object BuildStatus(string state, bool compileErrors, long compileFinishedAt,
+            ModalDialog modal, BuildHeartbeatSnapshot build = null, long startingSince = 0)
+        {
+            return new
+            {
+                state,
+                projectPath = s_ProjectPath,
+                port = HttpServer.Port,
+                pid = s_Pid,
+                unityVersion = s_UnityVersion,
+                connectorVersion = GetConnectorVersion(),
+                timestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+                // Only meaningful while the state is "starting"; older CLI versions ignore it.
+                startingSince = startingSince > 0 ? startingSince : (long?)null,
+                compileErrors,
+                compileFinishedAt,
+                modal,
+                build,
+            };
+        }
+
         static string GetConnectorVersion()
         {
             return CONNECTOR_VERSION;
         }
 
-        static string GetState()
+        /// <summary>
+        /// The compile clock the CLI reads, from whichever record still has it: both are stamped by the
+        /// same compile events, and a domain that lost the gate's copy (a session that started before
+        /// any compile, a test fixture holding the gate) must not report "no compile clock" while
+        /// compile_status names a valid compile.
+        /// </summary>
+        internal static long ResolveCompileFinishedAt()
         {
-            if (EditorApplication.isCompiling) return "compiling";
-            if (EditorApplication.isUpdating) return "refreshing";
-            if (EditorApplication.isPlaying)
-                return EditorApplication.isPaused ? "paused" : "playing";
+            // The clock only moves forward, so the later of the two records is the truthful one: either
+            // can be behind the other for a while (a compile that landed while a test held the gate went
+            // to the live key only through provenance), and publishing the older one reads as a compile
+            // the CLI has already seen.
+            var gate = CompilationGate.LastCompileFinishedAt;
+            var provenance = CompileProvenance.LastCompileFinishedAtMs();
+            return gate > provenance ? gate : provenance;
+        }
+
+        static string GetState() => StateFor(s_BuildActive, EditorApplication.isCompiling,
+            EditorApplication.isUpdating, EditorApplication.isPlaying, EditorApplication.isPaused);
+
+        /// The published state, with the editor's flags passed in so the mapping can be tested: the
+        /// heartbeat is what `status` and `wait` read, and a paused game that reported "playing" made
+        /// an agent wait on a run that was never going to advance.
+        internal static string StateFor(bool building, bool compiling, bool updating, bool playing, bool paused)
+        {
+            // A build blocks the main thread for minutes without touching isCompiling/isUpdating;
+            // without this the heartbeat would say "ready" while nothing can be answered.
+            if (building) return BuildJobRecord.PhaseBuilding;
+            if (compiling) return "compiling";
+            if (updating) return "refreshing";
+            if (playing) return paused ? "paused" : "playing";
             return "ready";
         }
 
@@ -177,8 +394,35 @@ namespace UnityCliConnector
 
         public static void MarkStopped()
         {
+            StopStartupBeater();
             s_ForcedState = "stopped";
             Write();
         }
+
+        // A cold launch's "starting" is written before the first Tick, so the test path needs the
+        // same pre-tick state the real listener has.
+        internal static void ResetStartupForTests()
+        {
+            StopStartupBeater();
+            s_LastWrite = 0;
+            s_ForcedState = null;
+            s_StartingSince = 0;
+            s_TickedThisDomain = false;
+            try { SessionState.EraseBool(TickedSessionKey); }
+            catch { }
+        }
+
+        internal static void MarkTickedForTests()
+        {
+            s_TickedThisDomain = true;
+            try { SessionState.SetBool(TickedSessionKey, true); }
+            catch { }
+        }
+
+        internal static void TickForTests() => Tick();
+
+        internal static void ResetTickIntervalForTests() => s_LastWrite = 0;
+
+        internal static string FilePathForTests() => GetFilePath();
     }
 }

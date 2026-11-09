@@ -3,6 +3,7 @@
   "rootNamespace": "UnityCliConnector.Tests",
   "references": [
     "UnityCliConnector.Editor",
+    "UnityCliConnector.TestRunner",
     "UnityEditor.TestRunner",
     "UnityEngine.TestRunner"
   ],

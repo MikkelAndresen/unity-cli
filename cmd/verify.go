@@ -1,13 +1,16 @@
 package cmd
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
+	"os"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/youngwoocho02/unity-cli/internal/client"
 )
 
 // Exit codes of `unity-cli verify`.
@@ -24,35 +27,97 @@ type verifyDiag struct {
 	Severity string `json:"severity"`
 	Code     string `json:"code"`
 	Message  string `json:"message"`
+	// Hint names the closest real members/types (or the replacement for an obsolete API) when the
+	// code is one an agent can act on: CS0117/CS1061/CS0246/CS0234/CS0619/CS0618.
+	Hint string `json:"hint,omitempty"`
 }
 
 type verifyResult struct {
 	Compile struct {
-		OK     bool         `json:"ok"`
-		Total  int          `json:"total"`
-		Errors []verifyDiag `json:"errors,omitempty"`
-		Source string       `json:"source,omitempty"` // "console" when the connector predates compile_diagnostics
+		OK           bool            `json:"ok"`
+		Total        int             `json:"total"`
+		TotalAtLeast bool            `json:"total_is_lower_bound,omitempty"`
+		Errors       []verifyDiag    `json:"errors,omitempty"`
+		Source       string          `json:"source,omitempty"` // "console" when the connector predates compile_diagnostics
+		Provenance   json.RawMessage `json:"provenance,omitempty"`
 	} `json:"compile"`
-	Tests *struct {
-		Total    int      `json:"total"`
-		Passed   int      `json:"passed"`
-		Failed   int      `json:"failed"`
-		Skipped  int      `json:"skipped"`
-		Failures []string `json:"failures,omitempty"`
-	} `json:"tests,omitempty"`
-	Notes []string `json:"notes,omitempty"`
-	Error string   `json:"error,omitempty"`
-	Exit  int      `json:"exit"`
+	Burst *verifyBurst `json:"burst,omitempty"`
+	Tests *verifyTests `json:"tests,omitempty"`
+	Notes []string     `json:"notes,omitempty"`
+	// Burst could not be checked at all (old connector answers, editor busy, HTTP timeout). The tool
+	// being absent is not an error: it means the project has no Burst to ask.
+	BurstError string `json:"burst_error,omitempty"`
+	Error      string `json:"error,omitempty"`
+	Exit       int    `json:"exit"`
 }
 
+type verifyTests struct {
+	Total    int               `json:"total"`
+	Passed   int               `json:"passed"`
+	Failed   int               `json:"failed"`
+	Skipped  int               `json:"skipped"`
+	Failures []string          `json:"failures,omitempty"`
+	Logged   []loggedException `json:"logged_exceptions,omitempty"`
+}
+
+// loggedException is an exception a failing test logged instead of throwing (Entities logs what a
+// system throws in OnUpdate), so the failure's own message never names it.
+type loggedException struct {
+	Test      string `json:"test"`
+	Exception string `json:"exception"`
+	At        string `json:"at,omitempty"`
+}
+
+// verifyBurst is the burst_status reply. Compiled/failed/... count the [BurstCompile] targets in the
+// project's own assemblies; ErrorCount counts every Burst (BCxxxx) error the editor is holding.
+type verifyBurst struct {
+	Idle           bool         `json:"idle"`
+	IdleKnown      bool         `json:"idle_known"`
+	Eager          string       `json:"eager"`
+	Method         string       `json:"method"`
+	Version        string       `json:"burst_version"`
+	WaitedMs       int          `json:"waited_ms"`
+	WaitS          float64      `json:"wait_s"`
+	TimedOut       bool         `json:"timed_out"`
+	ProjectTargets int          `json:"project_targets"`
+	PackageTargets int          `json:"package_targets"`
+	Matched        int          `json:"matched"`
+	Compiled       int          `json:"compiled"`
+	Failed         int          `json:"failed"`
+	NotCompiled    int          `json:"not_compiled"`
+	Unknown        int          `json:"unknown"`
+	ErrorCount     int          `json:"error_count"`
+	Errors         []verifyDiag `json:"errors,omitempty"`
+	Notes          []string     `json:"notes,omitempty"`
+}
+
+// defaultBurstWaitSeconds is verify's bounded wait for Burst to finish. The connector waits exactly
+// this long; verify's invocation budget (30 min by default) is what bounds the request.
+const defaultBurstWaitSeconds = 60
+
 // verifyCmd checks that the project compiles and its tests pass, in one call and with output short
-// enough for an agent's context. testSend carries no request timeout (test runs can be long); port
+// enough for an agent's context. ctx carries the invocation's long default budget (30 minutes); port
 // is where PlayMode results are polled.
-func verifyCmd(args []string, send, testSend sendFn, resolve instanceResolver, port int, out io.Writer) int {
-	flags := parseSubFlags(args)
+func verifyCmd(ctx context.Context, args []string, send, testSend sendFn, resolve instanceResolver, port int, out io.Writer) int {
+	flags, err := parseSubFlags(args)
+	if err != nil {
+		_, _ = fmt.Fprintln(os.Stderr, err)
+		return verifyFailed
+	}
 	_, noTests := flags["no-tests"]
+	_, noBurst := flags["no-burst"]
 	_, keepConsole := flags["keep-console"]
+	_, allowStale := flags["allow-stale"]
+	if !allowStale {
+		_, allowStale = flags["allow_stale"]
+	}
 	_, asJSON := flags["json"]
+	burstWait := defaultBurstWaitSeconds
+	if v, ok := flags["burst-wait"]; ok {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			burstWait = n
+		}
+	}
 	max := 20
 	if v, ok := flags["max"]; ok {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
@@ -60,13 +125,13 @@ func verifyCmd(args []string, send, testSend sendFn, resolve instanceResolver, p
 		}
 	}
 
-	// The connector closes its connection across a domain reload; Go's HTTP client logs that as an
-	// "Unsolicited response" line, which is noise in the brief output.
-	original := log.Writer()
-	log.SetOutput(&suppressWriter{w: original, suppress: "Unsolicited response received on idle HTTP channel"})
-	defer log.SetOutput(original)
-
 	var r verifyResult
+	if code, handled := verifyInEditor(ctx, verifyOptions{
+		flags: flags, noTests: noTests, noBurst: noBurst, keepConsole: keepConsole, allowStale: allowStale,
+		asJSON: asJSON, burstWait: burstWait, max: max,
+	}, testSend, resolve, port, out); handled {
+		return code
+	}
 	finish := func(code int) int {
 		r.Exit = code
 		if asJSON {
@@ -79,6 +144,11 @@ func verifyCmd(args []string, send, testSend sendFn, resolve instanceResolver, p
 	}
 	noReply := func(format string, a ...interface{}) int {
 		r.Error = fmt.Sprintf(format, a...)
+		for _, arg := range a {
+			if err, ok := arg.(error); ok && isConnectorRefusal(err) {
+				return finish(verifyFailed)
+			}
+		}
 		return finish(verifyNoReply)
 	}
 
@@ -97,96 +167,196 @@ func verifyCmd(args []string, send, testSend sendFn, resolve instanceResolver, p
 	if !resp.Success {
 		return noReply("editor: %s", resp.Message)
 	}
-	hasErrors, timedOut, err := waitForReadyTo(resolve, io.Discard, "verify")
+	// The refresh reply carries the connector's compile clock at request time; waiting for that clock
+	// to advance is proof a compile finished, unlike waiting for the state to read "ready" (which an
+	// editor that had not started compiling also says).
+	baseline := compileBaseline{}
+	if v, ok := reportFieldInt(resp.Data, "compile_finished_at"); ok {
+		baseline.FinishedAt, baseline.Tracked = v, true
+	}
+	if current, rerr := resolve(); rerr == nil && current != nil {
+		if !baseline.Tracked {
+			baseline.FinishedAt = current.CompileFinishedAt
+		}
+		baseline.PID = current.PID
+	}
+	outcome, err := waitForCompileTo(ctx, resolve, io.Discard, "verify", baseline)
 	if err != nil {
 		return noReply("compile: %v", err)
 	}
-	if timedOut {
-		return noReply("compile: still compiling after 5 minutes")
+	if outcome.TimedOut {
+		return noReply("compile: still compiling after %s", compileWaitTimeout)
 	}
+	noteSkippedCompile(&outcome, resp.Data)
+	hasErrors := outcome.HasErrors
 
-	diags, total, source, err := verifyDiagnostics(send, max, hasErrors)
+	findings, err := verifyDiagnostics(send, max, hasErrors, verifyDiagnosticsWait)
 	if err != nil {
 		return noReply("compile: %v", err)
 	}
-	r.Compile.Total, r.Compile.Errors, r.Compile.Source = total, diags, source
-	r.Compile.OK = total == 0 && !hasErrors
+	r.Compile.Total, r.Compile.TotalAtLeast, r.Compile.Errors, r.Compile.Source, r.Compile.Provenance =
+		findings.Total, findings.TotalAtLeast, findings.Diags, findings.Source, findings.ProvenanceJSON
+	r.Compile.OK = findings.Total == 0 && !hasErrors
 	if !asJSON {
-		printCompile(out, r.Compile.OK, total, diags, source, hasErrors)
+		printCompile(out, r.Compile.OK, findings.Total, findings.TotalAtLeast, findings.Diags, findings.Source, hasErrors)
+		printProvenance(out, findings.Provenance, false)
+	}
+	if outcome.NothingToCompile {
+		note := "no script compilation was observed after the refresh; the compile verdict is the editor's current state"
+		if outcome.SkipProven {
+			note = "nothing changed since the last compile, so it was not repeated; the verdict is that compile's"
+		}
+		r.Notes = append(r.Notes, note)
+		if !asJSON {
+			_, _ = fmt.Fprintf(out, "  (%s)\n", note)
+		}
 	}
 	if !r.Compile.OK {
 		return finish(verifyFailed)
 	}
+
+	staleCount := staleAssembliesUnderTest(findings.Provenance, flags["assembly"])
+	if findings.Provenance != nil && findings.Provenance.StaleAssemblyCount > staleCount && staleCount == 0 {
+		r.Notes = append(r.Notes, fmt.Sprintf("%d stale assembly(ies) are outside --assembly; the tests will not load them",
+			findings.Provenance.StaleAssemblyCount))
+		if !asJSON {
+			_, _ = fmt.Fprintf(out, "  (%d stale assembly(ies) are outside --assembly; the tests will not load them)\n",
+				findings.Provenance.StaleAssemblyCount)
+		}
+	}
+	if staleCount > 0 {
+		line := findings.Provenance.StaleAssemblyLine
+		if line == "" || staleCount != findings.Provenance.StaleAssemblyCount {
+			line = fmt.Sprintf("%d project assembly(ies) under test are older than their sources", staleCount)
+		}
+		if !allowStale {
+			if asJSON {
+				r.Error = line + " — tests were not run; pass --allow-stale to run them anyway"
+			} else {
+				_, _ = fmt.Fprintln(out, line)
+				_, _ = fmt.Fprintf(out, "tests: refused (%d stale assembly(s)) — run unity-cli editor refresh --compile, or pass --allow-stale to run them anyway\n",
+					staleCount)
+			}
+			return finish(verifyFailed)
+		}
+		if !asJSON {
+			_, _ = fmt.Fprintf(out, "warning: %s\n", line)
+		}
+	}
+
+	// Burst compiles outside Unity's script compilation, so a clean C# compile says nothing about the
+	// [BurstCompile] jobs; ask Burst itself. A missing tool means no Burst (or an old connector): say
+	// nothing rather than claiming the project has no Burst work.
+	if !noBurst {
+		burst, found, err := verifyBurstStatus(send, burstWait, max)
+		if err != nil {
+			r.BurstError = err.Error()
+			if !asJSON {
+				_, _ = fmt.Fprintf(out, "burst: could not be checked (%s)\n", firstLine(err.Error()))
+			}
+		}
+		if found && burst != nil {
+			r.Burst = burst
+			if !asJSON {
+				printBurst(out, burst)
+			}
+			if burst.ErrorCount > 0 {
+				return finish(verifyFailed)
+			}
+		}
+	}
+
 	if noTests {
 		return finish(verifyOK)
 	}
 
+	tresp, err := runVerifyTests(ctx, flags, allowStale, testSend, port)
+	if err != nil {
+		return noReply("tests: %v", err)
+	}
+	return reportVerifyTests(&r, tresp.Success, tresp.Message, tresp.Data, flags, resolve, out, asJSON, max, false, finish, noReply)
+}
+
+// runVerifyTests runs the tests the CLI way: `test` with verify's selection, which polls PlayMode
+// results across the domain reload.
+func runVerifyTests(ctx context.Context, flags map[string]string, allowStale bool, testSend sendFn, port int) (*client.CommandResponse, error) {
 	testArgs := []string{"--auto-save-scenes"}
 	for _, k := range []string{"mode", "filter", "assembly"} {
 		if v, ok := flags[k]; ok {
 			testArgs = append(testArgs, "--"+k, v)
 		}
 	}
-	tresp, err := testCmd(testArgs, testSend, port)
-	if err != nil {
-		return noReply("tests: %v", err)
+	if allowStale {
+		testArgs = append(testArgs, "--allow-stale")
 	}
+	return testCmd(ctx, testArgs, testSend, port)
+}
+
+// reportVerifyTests prints a run_tests reply as verify's test section and returns verify's exit
+// code. alsoFailed carries an earlier failure that did not stop the tests (Burst errors in the
+// in-editor verify, which runs the tests while Burst finishes).
+func reportVerifyTests(r *verifyResult, success bool, message string, data json.RawMessage, flags map[string]string,
+	resolve instanceResolver, out io.Writer, asJSON bool, max int, alsoFailed bool,
+	finish func(int) int, noReply func(string, ...interface{}) int) int {
 	var summary struct {
-		Total    int      `json:"total"`
-		Passed   int      `json:"passed"`
-		Failed   int      `json:"failed"`
-		Skipped  int      `json:"skipped"`
-		Failures []string `json:"failures"`
-		Blocked  string   `json:"blocked"`
+		Total    int               `json:"total"`
+		Passed   int               `json:"passed"`
+		Failed   int               `json:"failed"`
+		Skipped  int               `json:"skipped"`
+		Failures []string          `json:"failures"`
+		Logged   []loggedException `json:"logged_exceptions"`
+		Blocked  string            `json:"blocked"`
 	}
-	if len(tresp.Data) > 0 {
-		_ = json.Unmarshal(tresp.Data, &summary)
+	if len(data) > 0 {
+		_ = json.Unmarshal(data, &summary)
 	}
-	if !tresp.Success && summary.Failed == 0 {
+	if !success && summary.Failed == 0 {
 		// Not a test failure: dirty untitled scene, compile gate, missing Test Framework, ...
-		return noReply("tests: %s", tresp.Message)
+		return noReply("tests: %s", message)
 	}
-	r.Tests = &struct {
-		Total    int      `json:"total"`
-		Passed   int      `json:"passed"`
-		Failed   int      `json:"failed"`
-		Skipped  int      `json:"skipped"`
-		Failures []string `json:"failures,omitempty"`
-	}{summary.Total, summary.Passed, summary.Failed, summary.Skipped, firstLines(summary.Failures, max)}
+	r.Tests = &verifyTests{summary.Total, summary.Passed, summary.Failed, summary.Skipped,
+		firstLines(summary.Failures, max), summary.Logged}
+	printed := len(r.Notes) // notes before this point were printed where they arose
 	if _, ok := flags["assembly"]; ok {
 		if inst, err := resolve(); err == nil && inst != nil && versionBefore(inst.ConnectorVersion, 0, 7) {
 			r.Notes = append(r.Notes, "connector < 0.7.0 ignores --assembly: every test ran")
 		}
 	}
 	if !asJSON {
-		printTests(out, r.Tests.Total, r.Tests.Passed, r.Tests.Failed, r.Tests.Skipped, r.Tests.Failures)
-		for _, n := range r.Notes {
+		printTests(out, r.Tests)
+		for _, n := range r.Notes[printed:] {
 			_, _ = fmt.Fprintf(out, "  (%s)\n", n)
 		}
 	}
-	if summary.Failed > 0 || summary.Total == 0 {
+	if alsoFailed || summary.Failed > 0 || summary.Total == 0 {
 		return finish(verifyFailed)
 	}
 	return finish(verifyOK)
 }
 
-// verifyDiagnostics returns this compile's errors in the project's own code. When the heartbeat
-// reports errors but none are in the source tree, it returns the third-party ones instead, so a
-// failed compile is never reported as clean. Connectors before 0.7.0 have no compile_diagnostics;
-// their console errors stand in, marked with source "console".
-func verifyDiagnostics(send sendFn, max int, hasErrors bool) ([]verifyDiag, int, string, error) {
-	query := func(sourceTreeOnly bool) ([]verifyDiag, int, bool, error) {
-		deadline := time.Now().Add(time.Minute)
+// verifyDiagnosticsWait is how long compile_diagnostics may keep answering "still compiling"
+// before the diagnostic read gives up. A variable so the compile report can skip the wait after
+// its own compile wait already timed out.
+var verifyDiagnosticsWait = time.Minute
+
+// verifyDiagnostics returns this compile's findings: the errors in the project's own code and the
+// provenance object that came with them. When the heartbeat reports errors but none are in the
+// source tree, it returns the third-party ones instead, so a failed compile is never reported as
+// clean. Connectors before 0.7.0 have no compile_diagnostics; their console errors stand in, marked
+// with source "console", and they predate provenance too.
+func verifyDiagnostics(send sendFn, max int, hasErrors bool, wait time.Duration) (compileFindings, error) {
+	query := func(sourceTreeOnly bool) (compileFindings, bool, error) {
+		deadline := time.Now().Add(wait)
 		for {
 			resp, err := send("compile_diagnostics", map[string]interface{}{"source_tree_only": sourceTreeOnly, "limit": max})
 			if err != nil {
-				return nil, 0, false, err
+				return compileFindings{}, false, err
 			}
 			if !resp.Success {
 				if strings.Contains(resp.Message, "Unknown command") {
-					return nil, 0, false, nil
+					return compileFindings{}, false, nil
 				}
-				return nil, 0, true, fmt.Errorf("%s", resp.Message)
+				return compileFindings{}, true, fmt.Errorf("%s", resp.Message)
 			}
 			var d struct {
 				Compiling   bool         `json:"compiling"`
@@ -194,48 +364,86 @@ func verifyDiagnostics(send sendFn, max int, hasErrors bool) ([]verifyDiag, int,
 				Diagnostics []verifyDiag `json:"diagnostics"`
 			}
 			if err := json.Unmarshal(resp.Data, &d); err != nil {
-				return nil, 0, true, fmt.Errorf("unreadable compile_diagnostics reply: %w", err)
+				return compileFindings{}, true, fmt.Errorf("unreadable compile_diagnostics reply: %w", err)
 			}
-			if !d.Compiling {
-				return d.Diagnostics, d.Total, true, nil
+			if d.Compiling {
+				if time.Now().After(deadline) {
+					return compileFindings{}, true, fmt.Errorf("editor still compiling")
+				}
+				time.Sleep(statusPollInterval)
+				continue
 			}
-			if time.Now().After(deadline) {
-				return nil, 0, true, fmt.Errorf("editor still compiling")
-			}
-			time.Sleep(statusPollInterval)
+			p, pjson := provenanceIn(resp.Data)
+			return compileFindings{Diags: d.Diagnostics, Total: d.Total, Provenance: p, ProvenanceJSON: pjson}, true, nil
 		}
 	}
 
-	diags, total, supported, err := query(true)
+	found, supported, err := query(true)
 	if err != nil {
-		return nil, 0, "", err
+		return compileFindings{}, err
 	}
 	if !supported {
-		return consoleErrors(send, max)
+		consoleDiags, consoleTotal, atLeast, source, consoleErr := consoleErrors(send, max)
+		return compileFindings{Diags: consoleDiags, Total: consoleTotal, TotalAtLeast: atLeast, Source: source}, consoleErr
 	}
-	if total == 0 && hasErrors {
-		diags, total, _, err = query(false)
+	if found.Total == 0 && hasErrors {
+		if second, _, err2 := query(false); err2 == nil {
+			found = second
+		} else {
+			err = err2
+		}
 	}
-	return diags, total, "", err
+	return found, err
 }
 
-func consoleErrors(send sendFn, max int) ([]verifyDiag, int, string, error) {
+func consoleErrors(send sendFn, max int) ([]verifyDiag, int, bool, string, error) {
 	resp, err := send("console", map[string]interface{}{"type": "error", "lines": max, "stacktrace": "none"})
 	if err != nil {
-		return nil, 0, "", err
+		return nil, 0, false, "", err
 	}
-	var messages []string
-	if len(resp.Data) > 0 {
-		_ = json.Unmarshal(resp.Data, &messages)
-	}
+	messages, total, atLeast := consoleEntryInfo(resp.Data)
 	diags := make([]verifyDiag, 0, len(messages))
 	for _, m := range messages {
 		diags = append(diags, verifyDiag{Severity: "error", Message: firstLine(m)})
 	}
-	return diags, len(diags), "console", nil
+	return diags, total, atLeast, "console", nil
 }
 
-func printCompile(out io.Writer, ok bool, total int, diags []verifyDiag, source string, hasErrors bool) {
+// consoleEntryMessages reads the entry list out of a console reply. A bare array is what a
+// connector without caps returns; the capped connector wraps the entries in an object that also
+// carries the truncation counts.
+func consoleEntryMessages(data []byte) []string {
+	messages, _, _ := consoleEntryInfo(data)
+	return messages
+}
+
+// consoleEntryInfo also returns the pre-cap total, so verify does not report a byte- or
+// line-truncated list as the whole error count. atLeast is the connector saying it stopped scanning
+// once --lines entries matched, so the total is only a lower bound.
+func consoleEntryInfo(data []byte) (messages []string, total int, atLeast bool) {
+	if len(data) == 0 {
+		return nil, 0, false
+	}
+	var list []string
+	if err := json.Unmarshal(data, &list); err == nil {
+		return list, len(list), false
+	}
+	var capped struct {
+		Entries      []string `json:"entries"`
+		EntriesTotal int      `json:"entries_total"`
+		LowerBound   bool     `json:"entries_total_is_lower_bound"`
+	}
+	if err := json.Unmarshal(data, &capped); err != nil {
+		return nil, 0, false
+	}
+	total = capped.EntriesTotal
+	if total < len(capped.Entries) {
+		total = len(capped.Entries)
+	}
+	return capped.Entries, total, capped.LowerBound
+}
+
+func printCompile(out io.Writer, ok bool, total int, atLeast bool, diags []verifyDiag, source string, hasErrors bool) {
 	if ok {
 		_, _ = fmt.Fprintln(out, "compile: ok")
 		return
@@ -248,7 +456,11 @@ func printCompile(out io.Writer, ok bool, total int, diags []verifyDiag, source 
 		_, _ = fmt.Fprintf(out, "compile: failed, but no error was reported%s; see unity-cli console\n", note)
 		return
 	}
-	_, _ = fmt.Fprintf(out, "compile: %d error(s)%s\n", total, note)
+	count := fmt.Sprintf("%d", total)
+	if atLeast {
+		count = "at least " + count
+	}
+	_, _ = fmt.Fprintf(out, "compile: %s error(s)%s\n", count, note)
 	for _, d := range diags {
 		where := ""
 		if d.File != "" {
@@ -259,10 +471,83 @@ func printCompile(out io.Writer, ok bool, total int, diags []verifyDiag, source 
 			code = d.Code + " "
 		}
 		_, _ = fmt.Fprintf(out, "  %s%s%s\n", where, code, d.Message)
+		if d.Hint != "" {
+			_, _ = fmt.Fprintf(out, "    hint: %s\n", d.Hint)
+		}
 	}
 }
 
-func printTests(out io.Writer, total, passed, failed, skipped int, failures []string) {
+// verifyBurstStatus asks the connector's burst_status tool and waits up to waitSeconds for Burst to
+// go idle. found=false when the connector has no such tool — no Burst installed, or a connector older
+// than the tool — which is not a failure and leaves verify's verdict untouched. A transport error or a
+// tool error comes back as err: verify reports it and keeps going, because Burst is a signal on top
+// of the compile/test verdict, not part of it.
+func verifyBurstStatus(send sendFn, waitSeconds, max int) (*verifyBurst, bool, error) {
+	params := map[string]interface{}{"wait": waitSeconds, "limit": max}
+	resp, err := send("burst_status", params)
+	if err != nil {
+		return nil, false, err
+	}
+	if !resp.Success {
+		if strings.Contains(resp.Message, "Unknown command") {
+			return nil, false, nil
+		}
+		return nil, true, fmt.Errorf("%s", resp.Message)
+	}
+	var b verifyBurst
+	if err := json.Unmarshal(resp.Data, &b); err != nil {
+		return nil, true, fmt.Errorf("unreadable burst_status reply: %w", err)
+	}
+	return &b, true, nil
+}
+
+func printBurst(out io.Writer, b *verifyBurst) {
+	if b == nil {
+		return
+	}
+	// Agents read every verify; a Burst line with nothing wrong in it is noise they pay for each
+	// time. --json keeps the full reply.
+	clean := b.ErrorCount == 0 && b.Failed == 0 && b.NotCompiled == 0 && b.Unknown == 0 && !b.TimedOut
+	if clean && b.Compiled == 0 {
+		return
+	}
+	line := fmt.Sprintf("burst: %d targets compiled, %d error(s)", b.Compiled, b.ErrorCount)
+	if b.Failed > 0 {
+		line += fmt.Sprintf(", %d failed", b.Failed)
+	}
+	if b.NotCompiled > 0 {
+		line += fmt.Sprintf(", %d not compiled", b.NotCompiled)
+	}
+	if b.Unknown > 0 {
+		line += fmt.Sprintf(", %d unknown", b.Unknown)
+	}
+	if b.TimedOut {
+		line += fmt.Sprintf(" (Burst still compiling after %ds)", int(b.WaitS))
+	}
+	_, _ = fmt.Fprintln(out, line)
+	for _, e := range b.Errors {
+		where := ""
+		if e.File != "" && e.Line > 0 {
+			where = fmt.Sprintf("%s:%d", e.File, e.Line)
+			if e.Col > 0 {
+				where += fmt.Sprintf(":%d", e.Col)
+			}
+			where += " "
+		}
+		code := ""
+		if e.Code != "" {
+			code = e.Code + " "
+		}
+		_, _ = fmt.Fprintf(out, "  %s%s%s\n", where, code, e.Message)
+	}
+	// One caveat line is enough for a two-line summary; the tool keeps the rest for burst_status.
+	if !clean && len(b.Notes) > 0 {
+		_, _ = fmt.Fprintf(out, "  (%s)\n", b.Notes[0])
+	}
+}
+
+func printTests(out io.Writer, t *verifyTests) {
+	total, passed, failed, skipped := t.Total, t.Passed, t.Failed, t.Skipped
 	if total == 0 {
 		_, _ = fmt.Fprintln(out, "tests: none ran (check --assembly / --filter)")
 		return
@@ -275,9 +560,45 @@ func printTests(out io.Writer, total, passed, failed, skipped int, failures []st
 		line += fmt.Sprintf(", %d skipped", skipped)
 	}
 	_, _ = fmt.Fprintln(out, line)
-	for _, f := range failures {
+	for _, f := range t.Failures {
 		_, _ = fmt.Fprintf(out, "  %s\n", f)
+		for _, e := range t.Logged {
+			if !strings.HasPrefix(f, e.Test+":") {
+				continue
+			}
+			if e.At != "" {
+				_, _ = fmt.Fprintf(out, "    logged %s (at %s)\n", e.Exception, e.At)
+			} else {
+				_, _ = fmt.Fprintf(out, "    logged %s\n", e.Exception)
+			}
+		}
 	}
+}
+
+// staleAssembliesUnderTest narrows the provenance's stale assemblies to the ones the test run will
+// load. `test --assembly Foo.Tests` scans only Foo.Tests, so verify must not refuse because an
+// unrelated assembly is stale. Without a filter every stale assembly counts; a truncated list
+// cannot prove the requested ones are clean, so it keeps the full count.
+func staleAssembliesUnderTest(prov *compileProvenance, assembly string) int {
+	if prov == nil {
+		return 0
+	}
+	wanted := map[string]struct{}{}
+	for _, name := range strings.Split(assembly, ",") {
+		if name = strings.TrimSpace(name); name != "" {
+			wanted[name] = struct{}{}
+		}
+	}
+	if len(wanted) == 0 || prov.StaleAssembliesTruncated {
+		return prov.StaleAssemblyCount
+	}
+	count := 0
+	for _, stale := range prov.StaleAssemblies {
+		if _, ok := wanted[stale.Name]; ok {
+			count++
+		}
+	}
+	return count
 }
 
 func firstLines(items []string, max int) []string {
@@ -316,9 +637,13 @@ func versionBefore(version string, major, minor int) bool {
 	return ma < major || (ma == major && mi < minor)
 }
 
-// verifyExit maps an error that stopped verify before it could ask the editor anything
-// (no instance, editor not alive, version mismatch, a dialog) to exit code 2.
+// verifyExit maps an error that stopped verify (or wait) before it could ask the editor anything
+// (no instance, editor not alive, a dialog) to exit code 2. A connector below the minimum protocol
+// is a refusal, not a missing answer, so verify reports it as a failure (1) instead.
 func verifyExit(out io.Writer, err error) int {
 	_, _ = fmt.Fprintln(out, err.Error())
+	if isConnectorRefusal(err) {
+		return verifyFailed
+	}
 	return verifyNoReply
 }

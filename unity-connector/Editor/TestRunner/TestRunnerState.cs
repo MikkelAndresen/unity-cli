@@ -17,10 +17,26 @@ namespace UnityCliConnector.TestRunner
     [InitializeOnLoad]
     public static class TestRunnerState
     {
+        static bool s_WorkerForTests;
+
         static TestRunnerState()
         {
+            // An import worker has no listener and cannot own a test run; scanning the editor's
+            // pending markers there would let a worker reattach (and clear) them.
+            if (IsWorkerProcess()) return;
             AssemblyReloadEvents.afterAssemblyReload += OnAfterAssemblyReload;
         }
+
+        static bool IsWorkerProcess()
+        {
+            if (s_WorkerForTests) return true;
+            try { return AssetDatabase.IsAssetImportWorkerProcess(); }
+            catch { return false; }
+        }
+
+        internal static void SetWorkerForTests(bool worker) => s_WorkerForTests = worker;
+
+        internal static void RunAfterAssemblyReloadForTests() => OnAfterAssemblyReload();
 
         public static void MarkPending(int port, string filter)
         {
@@ -45,6 +61,7 @@ namespace UnityCliConnector.TestRunner
 
         static void OnAfterAssemblyReload()
         {
+            if (IsWorkerProcess()) return;
             try
             {
                 Directory.CreateDirectory(RunTests.StatusDir);
@@ -68,15 +85,18 @@ namespace UnityCliConnector.TestRunner
             var passed  = new List<string>();
             var failed  = new List<string>();
             var skipped = new List<string>();
+            var logged  = new List<RunTests.LoggedException>();
 
+            var wake = EditorWake.Hold();
             var api = ScriptableObject.CreateInstance<TestRunnerApi>();
             var callbacks = new RunTests.TestCallbacks(
-                onResult: r => RunTests.CollectResult(r, passed, failed, skipped),
+                onResult: r => RunTests.CollectResult(r, passed, failed, skipped, logged),
                 onFinished: _ =>
                 {
+                    wake.Dispose();
                     Object.DestroyImmediate(api);
                     ClearPending(port);
-                    RunTests.WriteResultsFile(port, passed, failed, skipped);
+                    RunTests.WriteResultsFile(port, passed, failed, skipped, logged);
                 }
             );
 

@@ -22,7 +22,7 @@ namespace UnityCliConnector.Tools
             string menuPath = p.Get("menu_path")
                 ?? (p.GetRaw("args") as JArray)?[0]?.ToString();
             if (string.IsNullOrWhiteSpace(menuPath))
-                return new ErrorResponse("'menu_path' parameter required.");
+                return new ErrorResponse("usage: unity-cli menu \"<Menu/Path>\" (e.g. unity-cli menu \"Assets/Refresh\")");
 
             if (Blacklist.Contains(menuPath))
                 return new ErrorResponse($"Execution of '{menuPath}' is blocked for safety.");

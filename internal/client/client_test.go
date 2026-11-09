@@ -2,10 +2,14 @@ package client
 
 import (
 	"encoding/json"
+	"fmt"
+	"io"
+	"net"
 	"os"
 	"path/filepath"
 	"runtime"
 	"testing"
+	"time"
 )
 
 // stubIsProcessDead replaces isProcessDead for testing.
@@ -299,6 +303,34 @@ func TestScanInstances_KeepsZeroPID(t *testing.T) {
 	}
 }
 
+// TestDiscoverInstanceKeepingEvidence_KeepsTheDeletedHeartbeat pins the ordering: the crash record
+// is read before ScanInstances deletes the dead-pid file, so a caller can still report the crash.
+func TestDiscoverInstanceKeepingEvidence_KeepsTheDeletedHeartbeat(t *testing.T) {
+	stubIsProcessDead(t, map[int]bool{100: true})
+
+	home := writeInstanceFiles(t, map[string]Instance{
+		"dead.json": {
+			State:       "ready",
+			ProjectPath: "/projects/dead",
+			Port:        8090,
+			PID:         100,
+			Timestamp:   1000,
+		},
+	})
+
+	inst, beat, err := DiscoverInstanceKeepingEvidence("", 0)
+	if err == nil || inst != nil {
+		t.Fatalf("expected no live instance, got %+v, %v", inst, err)
+	}
+	if beat == nil || beat.PID != 100 {
+		t.Fatalf("expected the heartbeat read before the scan, got %+v", beat)
+	}
+	deadPath := filepath.Join(home, ".unity-cli", "instances", "dead.json")
+	if _, statErr := os.Stat(deadPath); !os.IsNotExist(statErr) {
+		t.Error("the scan should have deleted the dead-pid file")
+	}
+}
+
 // TestDiscoverInstance_ProjectPathMatchesSlashVariants verifies --project can
 // match Windows-style backslashes against Unity's forward-slash projectPath.
 func TestDiscoverInstance_ProjectPathMatchesSlashVariants(t *testing.T) {
@@ -371,5 +403,192 @@ func TestDiscoverInstance_PortFlagRequiresActiveInstance(t *testing.T) {
 
 	if _, err := DiscoverInstance("", 8091); err == nil {
 		t.Fatal("expected error for port without an active instance file")
+	}
+}
+
+// TestDiscoverInstance_ProjectPicksFreshestHeartbeat covers a project with two heartbeat records:
+// an old one (a pre-#14 worker's, or one written under a different path hash) sorted first on disk and
+// the editor's current one written later. Discovery must follow the newer beat, not the first match.
+func TestDiscoverInstance_ProjectPicksFreshestHeartbeat(t *testing.T) {
+	stubIsProcessDead(t, map[int]bool{})
+
+	home := writeInstanceFiles(t, map[string]Instance{
+		"aaa_old.json": {
+			State:       "ready",
+			ProjectPath: "/projects/current",
+			Port:        8090,
+			PID:         100,
+			Timestamp:   1000,
+		},
+		"zzz_new.json": {
+			State:       "ready",
+			ProjectPath: "/projects/current",
+			Port:        8091,
+			PID:         200,
+			Timestamp:   2000,
+		},
+	})
+	t.Setenv("HOME", home)
+
+	got, err := DiscoverInstance("/projects/current", 0)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got.Port != 8091 || got.Timestamp != 2000 {
+		t.Fatalf("got port %d timestamp %d, want the newest beat on 8091", got.Port, got.Timestamp)
+	}
+}
+
+// TestReconnectInstance_FollowsTheNewestLiveProjectFile: the retry target is the newest non-stopped
+// record, even when a stopped file is newer, and a record from another project is never chosen.
+func TestReconnectInstance_FollowsTheNewestLiveProjectFile(t *testing.T) {
+	home := writeInstanceFiles(t, map[string]Instance{
+		"new_stopped.json": {
+			State:       "stopped",
+			ProjectPath: "/projects/current",
+			Port:        8092,
+			PID:         200,
+			Timestamp:   5000,
+		},
+		"other.json": {
+			State:       "ready",
+			ProjectPath: "/projects/other",
+			Port:        8093,
+			PID:         300,
+			Timestamp:   6000,
+		},
+		"old.json": {
+			State:       "ready",
+			ProjectPath: "/projects/current",
+			Port:        8090,
+			PID:         100,
+			Timestamp:   1000,
+		},
+		"current.json": {
+			State:       "ready",
+			ProjectPath: "/projects/current",
+			Port:        8091,
+			PID:         100,
+			Timestamp:   2000,
+		},
+	})
+	t.Setenv("HOME", home)
+
+	got := ReconnectInstance(&Instance{State: "ready", ProjectPath: "/projects/current", Port: 8090, PID: 100, Timestamp: 1000})
+	if got == nil || got.Port != 8091 {
+		t.Fatalf("ReconnectInstance = %+v, want the live 8091 heartbeat", got)
+	}
+}
+
+func TestReconnectInstance_DoesNotFollowSiblingProjectWithSharedPrefix(t *testing.T) {
+	home := writeInstanceFiles(t, map[string]Instance{
+		"game.json": {
+			State:       "ready",
+			ProjectPath: "/projects/Game",
+			Port:        8090,
+			PID:         100,
+			Timestamp:   1000,
+		},
+		"game2.json": {
+			State:       "ready",
+			ProjectPath: "/projects/Game2",
+			Port:        8092,
+			PID:         200,
+			Timestamp:   2000,
+		},
+	})
+	t.Setenv("HOME", home)
+
+	got := ReconnectInstance(&Instance{State: "ready", ProjectPath: "/projects/Game", Port: 8090, PID: 100, Timestamp: 1000})
+	if got == nil || got.Port != 8090 {
+		t.Fatalf("ReconnectInstance = %+v, want the Game heartbeat, not the newer /projects/Game2 one", got)
+	}
+}
+
+func TestRequestNotDelivered(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	port := ln.Addr().(*net.TCPAddr).Port
+	_ = ln.Close()
+
+	_, refused := net.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", port))
+	if refused == nil {
+		t.Fatal("expected the dial to a closed port to fail")
+	}
+	if !RequestNotDelivered(refused) {
+		t.Errorf("a refused dial must count as not delivered: %v", refused)
+	}
+	if RequestNotDelivered(io.EOF) {
+		t.Error("EOF after a connection was established must not count as not delivered")
+	}
+}
+
+// TestReconnectInstance_NewerBeatWinsWhateverThePID: the retry target is the newest record, not the
+// one whose pid happens to match the old heartbeat; a pid tie-break would hide a real port move.
+func TestReconnectInstance_NewerBeatWinsWhateverThePID(t *testing.T) {
+	home := writeInstanceFiles(t, map[string]Instance{
+		"old.json": {
+			State:       "ready",
+			ProjectPath: "/projects/current",
+			Port:        8090,
+			PID:         100,
+			Timestamp:   1000,
+		},
+		"new.json": {
+			State:       "ready",
+			ProjectPath: "/projects/current",
+			Port:        8091,
+			PID:         999,
+			Timestamp:   2000,
+		},
+	})
+	t.Setenv("HOME", home)
+
+	got := ReconnectInstance(&Instance{State: "ready", ProjectPath: "/projects/current", Port: 8090, PID: 100, Timestamp: 1000})
+	if got == nil || got.Port != 8091 || got.PID != 999 {
+		t.Fatalf("ReconnectInstance = %+v, want the newer 8091 heartbeat", got)
+	}
+}
+
+// TestReconnectInstance_EqualTimestampKeepsTheFirstRecord pins the branch the retry relies on: an
+// unchanged beat is not evidence of a move, so no newer record appears.
+func TestReconnectInstance_EqualTimestampKeepsTheFirstRecord(t *testing.T) {
+	home := writeInstanceFiles(t, map[string]Instance{
+		"only.json": {
+			State:       "ready",
+			ProjectPath: "/projects/current",
+			Port:        8090,
+			PID:         100,
+			Timestamp:   1000,
+		},
+	})
+	t.Setenv("HOME", home)
+
+	got := ReconnectInstance(&Instance{State: "ready", ProjectPath: "/projects/current", Port: 8090, PID: 100, Timestamp: 1000})
+	if got == nil || got.Timestamp != 1000 || got.Port != 8090 {
+		t.Fatalf("ReconnectInstance = %+v, want the unchanged record", got)
+	}
+}
+
+func TestInstanceStartingFor(t *testing.T) {
+	tests := []struct {
+		name string
+		inst *Instance
+		want time.Duration
+		ok   bool
+	}{
+		{"starting with stamp", &Instance{State: "starting", StartingSince: 1000, Timestamp: 61000}, time.Minute, true},
+		{"ready ignores stamp", &Instance{State: "ready", StartingSince: 1000, Timestamp: 61000}, 0, false},
+		{"old connector", &Instance{State: "starting", Timestamp: 61000}, 0, false},
+		{"beat before stamp", &Instance{State: "starting", StartingSince: 9000, Timestamp: 1000}, 0, false},
+		{"nil", nil, 0, false},
+	}
+	for _, tt := range tests {
+		got, ok := tt.inst.StartingFor()
+		if got != tt.want || ok != tt.ok {
+			t.Errorf("%s: StartingFor() = %v, %v; want %v, %v", tt.name, got, ok, tt.want, tt.ok)
+		}
 	}
 }

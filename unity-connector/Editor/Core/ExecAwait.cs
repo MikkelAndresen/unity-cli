@@ -175,19 +175,7 @@ namespace UnityCliConnector
             }
         }
 
-        static Task NextUpdate()
-        {
-            var tcs = new TaskCompletionSource<bool>();
-
-            void Handler()
-            {
-                EditorApplication.update -= Handler;
-                tcs.TrySetResult(true);
-            }
-
-            EditorApplication.update += Handler;
-            return tcs.Task;
-        }
+        static Task NextUpdate() => EditorUpdateAwaiter.Next();
 
         /// <summary>
         /// True when the task finished inside the budget. budgetMs &lt; 0 means wait

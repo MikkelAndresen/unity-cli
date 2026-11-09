@@ -1,7 +1,9 @@
 package cmd
 
 import (
+	"context"
 	"encoding/json"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -114,9 +116,9 @@ func TestDiscoverStatusInstance_PortAllowsStoppedInstance(t *testing.T) {
 	}
 }
 
-func TestStatusCmd_ReturnsConnectorVersionMismatch(t *testing.T) {
+func TestStatusCmd_PatchDriftSucceeds(t *testing.T) {
 	origVersion := Version
-	Version = "v0.3.14"
+	Version = "0.7.1"
 	t.Cleanup(func() { Version = origVersion })
 
 	writeInstanceFile(t, client.Instance{
@@ -125,51 +127,26 @@ func TestStatusCmd_ReturnsConnectorVersionMismatch(t *testing.T) {
 		Port:             8090,
 		PID:              os.Getpid(),
 		UnityVersion:     "6000.3.10f1",
-		ConnectorVersion: "0.3.13",
+		ConnectorVersion: "0.7.0",
 		Timestamp:        time.Now().UnixMilli(),
 	})
 
-	err := statusCmd(&client.Instance{Port: 8090})
-	if err == nil {
-		t.Fatal("expected connector mismatch error")
-	}
-	if !strings.Contains(err.Error(), "connector version mismatch") {
-		t.Fatalf("expected mismatch error, got %v", err)
-	}
-	if !strings.Contains(err.Error(), "--ignore-version-mismatch") {
-		t.Fatalf("expected ignore option hint, got %v", err)
-	}
-}
-
-func TestStatusCmd_ReturnsMissingConnectorVersion(t *testing.T) {
-	origVersion := Version
-	Version = "v0.3.14"
-	t.Cleanup(func() { Version = origVersion })
-
-	writeInstanceFile(t, client.Instance{
-		State:        "ready",
-		ProjectPath:  "/home/user/MyProject",
-		Port:         8090,
-		PID:          os.Getpid(),
-		UnityVersion: "6000.3.10f1",
-		Timestamp:    time.Now().UnixMilli(),
+	out := captureStdout(t, func() {
+		if err := statusCmd(&client.Instance{Port: 8090}); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
 	})
-
-	err := statusCmd(&client.Instance{Port: 8090})
-	if err == nil {
-		t.Fatal("expected missing connector version error")
+	if !strings.Contains(out, "CLI:     0.7.1") || !strings.Contains(out, "Connector: 0.7.0") {
+		t.Fatalf("status must show both versions, got:\n%s", out)
 	}
-	if !strings.Contains(err.Error(), "connector version is unknown") {
-		t.Fatalf("expected missing version error, got %v", err)
-	}
-	if !strings.Contains(err.Error(), "--ignore-version-mismatch") {
-		t.Fatalf("expected ignore option hint, got %v", err)
+	if !strings.Contains(out, "Compatibility: compatible") {
+		t.Fatalf("status must show the compatibility verdict, got:\n%s", out)
 	}
 }
 
-func TestStatusCmd_AllowsMatchingConnectorVersion(t *testing.T) {
+func TestStatusCmd_DoesNotGateAnOldConnector(t *testing.T) {
 	origVersion := Version
-	Version = "v0.3.14"
+	Version = "0.8.0"
 	t.Cleanup(func() { Version = origVersion })
 
 	writeInstanceFile(t, client.Instance{
@@ -178,18 +155,23 @@ func TestStatusCmd_AllowsMatchingConnectorVersion(t *testing.T) {
 		Port:             8090,
 		PID:              os.Getpid(),
 		UnityVersion:     "6000.3.10f1",
-		ConnectorVersion: "0.3.14",
+		ConnectorVersion: "0.6.0",
 		Timestamp:        time.Now().UnixMilli(),
 	})
 
-	if err := statusCmd(&client.Instance{Port: 8090}); err != nil {
-		t.Fatalf("unexpected error: %v", err)
+	out := captureStdout(t, func() {
+		if err := statusCmd(&client.Instance{Port: 8090}); err != nil {
+			t.Fatalf("status must not fail on a version mismatch: %v", err)
+		}
+	})
+	if !strings.Contains(out, "Compatibility: connector 0.6.0 is older than the minimum 0.7.0") {
+		t.Fatalf("expected the too-old verdict, got:\n%s", out)
 	}
 }
 
-func TestStatusCmd_ReturnsConnectorVersionMismatchWhenStale(t *testing.T) {
+func TestStatusCmd_StaleHeartbeatDoesNotGateVersion(t *testing.T) {
 	origVersion := Version
-	Version = "v0.3.14"
+	Version = "0.8.0"
 	t.Cleanup(func() { Version = origVersion })
 
 	writeInstanceFile(t, client.Instance{
@@ -198,66 +180,17 @@ func TestStatusCmd_ReturnsConnectorVersionMismatchWhenStale(t *testing.T) {
 		Port:             8090,
 		PID:              os.Getpid(),
 		UnityVersion:     "6000.3.10f1",
-		ConnectorVersion: "0.3.13",
+		ConnectorVersion: "0.6.0",
 		Timestamp:        time.Now().Add(-10 * time.Second).UnixMilli(),
 	})
 
-	err := statusCmd(&client.Instance{Port: 8090})
-	if err == nil {
-		t.Fatal("expected stale connector mismatch error")
-	}
-	if !strings.Contains(err.Error(), "connector version mismatch") {
-		t.Fatalf("expected mismatch error, got %v", err)
-	}
-}
-
-func TestCheckConnectorVersion_AllowsMatchingLeadingV(t *testing.T) {
-	inst := &client.Instance{ConnectorVersion: "0.3.10"}
-	if err := checkConnectorVersion(inst, "v0.3.10", false); err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-}
-
-func TestCheckConnectorVersion_RejectsMismatch(t *testing.T) {
-	inst := &client.Instance{ConnectorVersion: "0.3.9"}
-	err := checkConnectorVersion(inst, "v0.3.10", false)
-	if err == nil {
-		t.Fatal("expected mismatch error")
-	}
-	if !strings.Contains(err.Error(), "--ignore-version-mismatch") {
-		t.Fatalf("expected ignore option hint, got %v", err)
-	}
-}
-
-func TestCheckConnectorVersion_RejectsMissingConnectorVersion(t *testing.T) {
-	inst := &client.Instance{}
-	err := checkConnectorVersion(inst, "v0.3.10", false)
-	if err == nil {
-		t.Fatal("expected missing connector version error")
-	}
-	if !strings.Contains(err.Error(), "--ignore-version-mismatch") {
-		t.Fatalf("expected ignore option hint, got %v", err)
-	}
-}
-
-func TestCheckConnectorVersion_SkipsDevCliVersion(t *testing.T) {
-	inst := &client.Instance{ConnectorVersion: "0.3.10"}
-	if err := checkConnectorVersion(inst, "dev", false); err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-}
-
-func TestCheckConnectorVersion_IgnoreMismatchAllowsMismatch(t *testing.T) {
-	inst := &client.Instance{ConnectorVersion: "0.3.9"}
-	if err := checkConnectorVersion(inst, "v0.3.10", true); err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-}
-
-func TestCheckConnectorVersion_IgnoreMismatchAllowsMissingConnectorVersion(t *testing.T) {
-	inst := &client.Instance{}
-	if err := checkConnectorVersion(inst, "v0.3.10", true); err != nil {
-		t.Fatalf("unexpected error: %v", err)
+	errOut := captureStderr(t, func() {
+		if err := statusCmd(&client.Instance{Port: 8090}); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	})
+	if !strings.Contains(errOut, "Compatibility: connector 0.6.0 is older than the minimum 0.7.0") {
+		t.Fatalf("expected the compatibility verdict on a stale heartbeat, got:\n%s", errOut)
 	}
 }
 
@@ -286,7 +219,7 @@ func TestWaitForAlive_FollowsResolverPortChange(t *testing.T) {
 		}, nil
 	}
 
-	inst, err := waitForAlive(resolve, 100)
+	inst, err := waitForAliveContext(context.Background(), resolve, 100)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -295,5 +228,101 @@ func TestWaitForAlive_FollowsResolverPortChange(t *testing.T) {
 	}
 	if callCount < 2 {
 		t.Fatalf("expected resolver to be called multiple times, got %d", callCount)
+	}
+}
+
+func TestWaitForAlive_DoesNotReturnWhileTheConnectorIsStarting(t *testing.T) {
+	origPollInterval := statusPollInterval
+	statusPollInterval = 5 * time.Millisecond
+	t.Cleanup(func() { statusPollInterval = origPollInterval })
+
+	project := "/work/FoW"
+	callCount := 0
+	resolve := func() (*client.Instance, error) {
+		callCount++
+		state := "starting"
+		if callCount >= 3 {
+			state = "ready"
+		}
+		return &client.Instance{
+			State:       state,
+			ProjectPath: project,
+			Port:        8090,
+			// The startup beater refreshes the timestamp while the state stays "starting".
+			Timestamp: time.Now().Add(time.Duration(callCount) * time.Millisecond).UnixMilli(),
+		}, nil
+	}
+
+	inst, err := waitForAliveContext(context.Background(), resolve, 200)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if inst.State != "ready" {
+		t.Fatalf("state = %q, want ready", inst.State)
+	}
+	if callCount < 3 {
+		t.Fatalf("expected to wait through the starting beats, got %d call(s)", callCount)
+	}
+}
+
+func TestWaitForCompile_ReadyHeartbeatIsNotEvidence(t *testing.T) {
+	compileTestBudgets(t)
+	// The heartbeat was already "ready" and its compile clock never moves: polling must not
+	// report a compile it never saw finish.
+	resolve := func() (*client.Instance, error) {
+		return &client.Instance{State: "ready", CompileFinishedAt: 1_000}, nil
+	}
+
+	out, err := waitForCompileTo(context.Background(), resolve, io.Discard, "editor refresh --compile", compileBaseline{FinishedAt: 1_000})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if out.Evidence || !out.NothingToCompile || out.TimedOut {
+		t.Errorf("outcome = %+v, want nothing_to_compile without evidence", out)
+	}
+}
+
+func TestWaitForCompile_ClockAdvanceAfterRequestIsEvidence(t *testing.T) {
+	compileTestBudgets(t)
+	// The compile can finish before the first poll; the connector's clock is what proves it ran.
+	resolve := func() (*client.Instance, error) {
+		return &client.Instance{State: "ready", CompileFinishedAt: 1_001, CompileErrors: true}, nil
+	}
+
+	out, err := waitForCompileTo(context.Background(), resolve, io.Discard, "editor refresh --compile", compileBaseline{FinishedAt: 1_000})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !out.Evidence || out.NothingToCompile || !out.HasErrors {
+		t.Errorf("outcome = %+v, want evidence of a compile that ended in errors", out)
+	}
+}
+
+func TestWaitForCompile_KeepsWaitingWhileCompiling(t *testing.T) {
+	compileTestBudgets(t)
+	resolve := func() (*client.Instance, error) {
+		return &client.Instance{State: "compiling", CompileFinishedAt: 1_000, CompileErrors: true}, nil
+	}
+
+	out, err := waitForCompileTo(context.Background(), resolve, io.Discard, "editor refresh --compile", compileBaseline{FinishedAt: 1_000})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !out.TimedOut || out.NothingToCompile || !out.HasErrors {
+		t.Errorf("outcome = %+v, want a timeout that keeps the last seen compile state", out)
+	}
+}
+
+func TestStartingNote_NamesAgeAndFlagsLongStartups(t *testing.T) {
+	short := startingNote(&client.Instance{State: "starting", StartingSince: 1, Timestamp: 1 + 90_000})
+	if !strings.Contains(short, "starting for 1m30s") || strings.Contains(short, "wedged") {
+		t.Errorf("short startup note: %s", short)
+	}
+	long := startingNote(&client.Instance{State: "starting", StartingSince: 1, Timestamp: 1 + int64(longStartup/time.Millisecond) + 1000})
+	if !strings.Contains(long, "wedged") {
+		t.Errorf("long startup should say how to tell an import from a wedge: %s", long)
+	}
+	if old := startingNote(&client.Instance{State: "starting", Timestamp: 5}); strings.Contains(old, "starting for") {
+		t.Errorf("a connector without startingSince has no age to print: %s", old)
 	}
 }

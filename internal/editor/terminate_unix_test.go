@@ -1,0 +1,76 @@
+//go:build !windows
+
+package editor
+
+import (
+	"errors"
+	"strings"
+	"testing"
+)
+
+func stubProcessCommand(t *testing.T, comm string, err error) {
+	t.Helper()
+	orig := processCommand
+	processCommand = func(int) (string, error) { return comm, err }
+	t.Cleanup(func() { processCommand = orig })
+}
+
+func TestTerminate_RefusesNonUnityProcess(t *testing.T) {
+	stubProcessCommand(t, "bash", nil)
+
+	err := Terminate(12345)
+	if err == nil || !strings.Contains(err.Error(), "not a Unity editor") {
+		t.Fatalf("expected refusal for a non-Unity process, got %v", err)
+	}
+}
+
+func TestTerminate_RefusesInvisiblePID(t *testing.T) {
+	stubProcessCommand(t, "", errors.New("exit status 1"))
+
+	err := Terminate(12345)
+	if err == nil || !strings.Contains(err.Error(), "not visible") {
+		t.Fatalf("expected not-visible error, got %v", err)
+	}
+}
+
+func TestTerminate_RejectsInvalidPID(t *testing.T) {
+	if err := Terminate(0); err == nil {
+		t.Fatal("expected error for pid 0")
+	}
+}
+
+func TestVerifyUnityProcess_AcceptsUnityBinary(t *testing.T) {
+	for _, comm := range []string{"Unity", "/Applications/Unity/Hub/Editor/6000.4.4f1/Unity.app/Contents/MacOS/Unity"} {
+		stubProcessCommand(t, comm, nil)
+		if err := verifyUnityProcess(1); err != nil {
+			t.Errorf("%q should be accepted: %v", comm, err)
+		}
+	}
+}
+
+// TestIsUnityProcessName pins the check both platform guards share: the unix comm path and a
+// Windows tasklist row must agree, and an unrelated process (even one whose path contains "unity"
+// only as part of another word) must not be terminated.
+func TestIsUnityProcessName(t *testing.T) {
+	tests := []struct {
+		line string
+		want bool
+	}{
+		{"/Applications/Unity/Hub/Editor/6000.4.4f1/Unity.app/Contents/MacOS/Unity", true},
+		{`"Unity.exe","65279","Console","1","1,234 K"`, true},
+		{`C:\\Program Files\\Unity\\Hub\\Editor\\Unity.exe`, true},
+		{"nginx", false},
+		{"/opt/community/tool", false},
+		{"/Applications/Unity Hub.app/Contents/MacOS/Unity Hub", false},
+		{"UnityShaderCompiler", false},
+		{`"UnityHub.exe","4242","Console","1","9,000 K"`, false},
+		{"INFO: No tasks are running which match the specified criteria.", false},
+		{"python3", false},
+		{"", false},
+	}
+	for _, tt := range tests {
+		if got := isUnityProcessName(tt.line); got != tt.want {
+			t.Errorf("isUnityProcessName(%q) = %v, want %v", tt.line, got, tt.want)
+		}
+	}
+}

@@ -23,6 +23,7 @@ namespace UnityCliConnector.Modal
 
         static ModalWatchdog()
         {
+            if (AssetDatabase.IsAssetImportWorkerProcess()) return;
             if (!ModalDispatcher.IsSupported) return;
             s_Timer = new Timer(_ => Tick(), null, INTERVAL_MS, INTERVAL_MS);
             AssemblyReloadEvents.beforeAssemblyReload += Stop;

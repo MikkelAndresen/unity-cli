@@ -4,7 +4,7 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Reflection;
-using System.Text;
+using System.Runtime.CompilerServices;
 using System.Text.RegularExpressions;
 using System.Threading.Tasks;
 using Newtonsoft.Json.Linq;
@@ -16,21 +16,29 @@ namespace UnityCliConnector.Tools
     [UnityCliTool(Name = "exec", Description = "Execute arbitrary C# code at runtime. Full access to Unity and all loaded assemblies.")]
     public static class ExecuteCsharp
     {
-        private static readonly string[] DefaultUsings =
-        {
-            "System",
-            "System.Collections",
-            "System.Collections.Generic",
-            "System.IO",
-            "System.Linq",
-            "System.Reflection",
-            "System.Threading.Tasks",
-            "UnityEngine",
-            "UnityEngine.SceneManagement",
-            "UnityEditor",
-            "UnityEditor.SceneManagement",
-            "UnityEditorInternal",
-        };
+        // The 30000 mirrors the csc wait the old synchronous compile used, so a slow
+        // compile still answers instead of hanging the request.
+        private const int CompileTimeoutMs = 30000;
+
+        // An off-main-thread await only resumes on the editor thread while this domain's
+        // synchronization context is pumping; a reload mid-await leaves the continuation on
+        // a thread-pool thread, where invoking the snippet would throw inside every Unity
+        // API it touches.
+        private const string ReloadedMessage =
+            "The editor reloaded during the compile, so the snippet never ran. Re-issue the command.";
+
+        // Snippet assemblies are named with this prefix so they can be excluded from the
+        // reference list. They are byte-loaded (empty Location) and so already drop out of
+        // it, but if a Unity version ever reports a location for them, referencing an
+        // earlier snippet would grow both the .rsp list and every later snippet's cache key.
+        private const string ExecAssemblyPrefix = "unity-cli-exec-";
+
+        // csc and dotnet live somewhere inside the Unity install, so finding them means a
+        // full-tree walk (measured 1.1 s per walk on this host; exec used to pay two of them
+        // per call, on the main thread). Resolved once per domain and off the main thread.
+        private static string s_CompilerMemoKey;
+        private static string s_CscPath;
+        private static string s_DotnetPath;
 
         public class Parameters
         {
@@ -39,6 +47,9 @@ namespace UnityCliConnector.Tools
 
             [ToolParameter("Additional using directives (comma-separated, e.g. Unity.Entities,Unity.Mathematics)")]
             public string[] Usings { get; set; }
+
+            [ToolParameter("Drop the default using directives and aliases; combine with --usings to supply the whole set")]
+            public bool NoDefaultUsings { get; set; }
 
             [ToolParameter("Path to csc compiler (csc.dll or csc.exe). Auto-detected if omitted.")]
             public string Csc { get; set; }
@@ -50,6 +61,9 @@ namespace UnityCliConnector.Tools
             // there as an attribute argument (CS0182), so it cannot be referenced.
             [ToolParameter("Max ms to await a returned Task / pump a returned coroutine (default 30000; 0 or negative waits forever)")]
             public int AwaitTimeout { get; set; }
+
+            [ToolParameter("Run even when Unity reports outstanding compile errors (the central compilation gate's escape hatch)")]
+            public bool SkipCompileCheck { get; set; }
         }
 
         public static async Task<object> HandleCommand(JObject parameters)
@@ -67,17 +81,45 @@ namespace UnityCliConnector.Tools
                 if (usingsToken.Type == JTokenType.Array)
                     extraUsings.AddRange(usingsToken.ToObject<string[]>());
                 else
-                    extraUsings.AddRange(usingsToken.ToString().Split(','));
+                    extraUsings.AddRange(SplitUsingList(usingsToken.ToString()));
             }
 
+            var includeDefaults = !(p.GetBool("no_default_usings") || p.GetBool("noDefaultUsings"));
             var cscPath = p.Get("csc");
             var dotnetPath = p.Get("dotnet");
             var awaitTimeout = p.GetInt("await_timeout") ?? p.GetInt("awaitTimeout") ?? ExecAwait.DefaultTimeoutMs;
-            return await CompileAndExecute(BuildSource(code, extraUsings, DetectBodyKind(code)),
-                cscPath, dotnetPath, awaitTimeout);
+            var kind = DetectBodyKind(code);
+            var statementForm = ExecSource.BuildMapped(code, extraUsings, includeDefaults, kind, returnExpression: false);
+            // A snippet that is one expression and nothing else is compiled as `return (expr);`, so
+            // `exec "Time.time"` returns the value instead of failing with "; expected". The statement
+            // form is kept as the retry for the one case that is a valid statement but not a value: a
+            // void call (`Debug.Log("x")`), which only compiles — and only answers — as a statement.
+            if (!ExecSource.WrapSingleExpression(code, kind))
+                return await CompileAndExecute(statementForm, null, cscPath, dotnetPath, awaitTimeout);
+            var expressionForm = ExecSource.BuildMapped(code, extraUsings, includeDefaults, kind, returnExpression: true);
+            return await CompileAndExecute(expressionForm, statementForm, cscPath, dotnetPath, awaitTimeout);
         }
 
-        private enum BodyKind { Sync, Async, Iterator }
+        /// <summary>
+        /// Splits the comma-separated --usings value, leaving commas inside a generic
+        /// argument list (`Map = Dictionary<string, int>`) in the same entry.
+        /// </summary>
+        private static IEnumerable<string> SplitUsingList(string raw)
+        {
+            var depth = 0;
+            var start = 0;
+            for (var i = 0; i < raw.Length; i++)
+            {
+                if (raw[i] == '<') depth++;
+                else if (raw[i] == '>' && depth > 0) depth--;
+                else if (raw[i] == ',' && depth == 0)
+                {
+                    yield return raw.Substring(start, i - start);
+                    start = i + 1;
+                }
+            }
+            yield return raw.Substring(start);
+        }
 
         /// <summary>
         /// Picks the signature the body is compiled into. Only the keywords the body
@@ -86,205 +128,312 @@ namespace UnityCliConnector.Tools
         /// unless the submitted code asks for it. A body that merely *returns* a Task
         /// needs no special signature — ExecAwait unwraps it after invocation.
         /// </summary>
-        private static BodyKind DetectBodyKind(string code)
+        private static ExecSource.BodyKind DetectBodyKind(string code)
         {
-            if (Regex.IsMatch(code, @"\byield\s+(return|break)\b")) return BodyKind.Iterator;
-            if (Regex.IsMatch(code, @"\b(await|async)\b")) return BodyKind.Async;
-            return BodyKind.Sync;
+            if (Regex.IsMatch(code, @"\byield\s+(return|break)\b")) return ExecSource.BodyKind.Iterator;
+            if (Regex.IsMatch(code, @"\b(await|async)\b")) return ExecSource.BodyKind.Async;
+            return ExecSource.BodyKind.Sync;
         }
 
-        private static string BuildSource(string code, List<string> extraUsings, BodyKind kind)
+        /// <summary>
+        /// Reference set for the snippet compile, from this domain's loadable assemblies.
+        /// Dynamic and byte-loaded (in-memory) assemblies have no usable location, and
+        /// previous exec output is excluded by name: both would otherwise make the .rsp
+        /// list — and so every later snippet's cache key — grow with the exec count.
+        /// Sorted so the .rsp order, and therefore the key, does not depend on load order.
+        /// </summary>
+        private static IReadOnlyList<string> CollectReferences()
         {
-            var sb = new StringBuilder();
-            foreach (var u in DefaultUsings)
-                sb.AppendLine($"using {u};");
-            foreach (var u in extraUsings)
-                sb.AppendLine($"using {u};");
+            var pairs = new List<(string Name, string Location)>();
+            var names = new HashSet<string>();
 
-            sb.AppendLine();
-            sb.AppendLine("public static class __CliDynamic {");
-            switch (kind)
+            foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
             {
-                case BodyKind.Iterator:
-                    sb.AppendLine("  public static System.Collections.IEnumerator Execute() {");
-                    break;
-                case BodyKind.Async:
-                    sb.AppendLine("  public static async System.Threading.Tasks.Task<object> Execute() {");
-                    break;
-                default:
-                    sb.AppendLine("  public static object Execute() {");
-                    break;
-            }
-            sb.AppendLine(code);
-            sb.AppendLine("  }");
-            sb.AppendLine("}");
-            return sb.ToString();
-        }
-
-        private static async Task<object> CompileAndExecute(string source, string cscOverride = null,
-            string dotnetOverride = null, int awaitTimeoutMs = ExecAwait.DefaultTimeoutMs)
-        {
-            var utf8 = new UTF8Encoding(false);
-            var tmpDir = Path.Combine(Path.GetTempPath(), "unity-cli-exec");
-            Directory.CreateDirectory(tmpDir);
-
-            var id = Guid.NewGuid().ToString("N").Substring(0, 8);
-            var srcFile = Path.Combine(tmpDir, $"{id}.cs");
-            var outFile = Path.Combine(tmpDir, $"{id}.dll");
-            var rspFile = Path.Combine(tmpDir, $"{id}.rsp");
-
-            try
-            {
-                File.WriteAllText(srcFile, source, utf8);
-
-                var rsp = new StringBuilder();
-                rsp.AppendLine("-target:library");
-                rsp.AppendLine($"-out:\"{outFile}\"");
-                rsp.AppendLine("-nologo");
-                rsp.AppendLine("-nowarn:0105,1701,1702");
-                rsp.AppendLine("-langversion:latest");
-                rsp.AppendLine($"\"{srcFile}\"");
-
-                var added = new HashSet<string>();
-                foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
-                {
-                    try
-                    {
-                        if (asm.IsDynamic || string.IsNullOrEmpty(asm.Location)) continue;
-                        if (!added.Add(asm.GetName().Name)) continue;
-                        rsp.AppendLine($"-r:\"{asm.Location}\"");
-                    }
-                    catch { }
-                }
-
-                File.WriteAllText(rspFile, rsp.ToString(), utf8);
-
-                var rspArg = $"@\"{rspFile}\"";
-                var csc = FindCsc(cscOverride);
-                string exe, args;
-
-                if (csc != null && csc.EndsWith(".dll"))
-                {
-                    var dotnet = FindDotnet(dotnetOverride);
-                    if (dotnet == null)
-                        return new ErrorResponse(
-                            "Cannot find dotnet runtime under: " +
-                            EditorApplication.applicationContentsPath +
-                            "\nSpecify the path manually with --dotnet <path>");
-                    exe = dotnet;
-                    args = $"exec \"{csc}\" {rspArg}";
-                }
-                else if (csc != null)
-                {
-                    exe = csc;
-                    args = rspArg;
-                }
-                else
-                {
-                    return new ErrorResponse(
-                        "Cannot find csc compiler under: " +
-                        EditorApplication.applicationContentsPath +
-                        "\nSpecify the path manually with --csc <path-to-csc.dll-or-csc.exe>");
-                }
-
-                var psi = new ProcessStartInfo
-                {
-                    FileName = exe,
-                    Arguments = args,
-                    UseShellExecute = false,
-                    RedirectStandardOutput = true,
-                    RedirectStandardError = true,
-                    CreateNoWindow = true,
-                    StandardOutputEncoding = Encoding.UTF8,
-                    StandardErrorEncoding = Encoding.UTF8,
-                };
-
-                using (var proc = Process.Start(psi))
-                {
-                    var stdout = proc.StandardOutput.ReadToEnd();
-                    var stderr = proc.StandardError.ReadToEnd();
-                    proc.WaitForExit(30000);
-
-                    if (proc.ExitCode != 0)
-                    {
-                        var output = string.IsNullOrEmpty(stderr) ? stdout : stderr;
-                        return new ErrorResponse($"Compile error:\n{FormatErrors(output)}");
-                    }
-                }
-
-                var bytes = File.ReadAllBytes(outFile);
-                var compiled = Assembly.Load(bytes);
-                var method = compiled.GetType("__CliDynamic")?.GetMethod("Execute");
-                if (method == null)
-                    return new ErrorResponse("Internal error: compiled type or method not found.");
-
-                object result;
                 try
                 {
-                    result = method.Invoke(null, null);
+                    if (asm.IsDynamic || string.IsNullOrEmpty(asm.Location)) continue;
+                    var name = asm.GetName().Name;
+                    if (string.IsNullOrEmpty(name) || !names.Add(name)) continue;
+                    if (name.StartsWith(ExecAssemblyPrefix, StringComparison.Ordinal)) continue;
+                    pairs.Add((name, asm.Location));
                 }
-                catch (TargetInvocationException tie)
+                catch (Exception ex) when (ex is NotSupportedException || ex is InvalidOperationException)
                 {
-                    var inner = tie.InnerException ?? tie;
-                    return new ErrorResponse($"Runtime error: {inner.GetType().Name}: {inner.Message}");
+                    // Location throws for dynamic modules; one unreadable reference is no
+                    // reason to drop the rest of the set.
                 }
-
-                // An async body reports its exceptions on the returned Task, not as a
-                // TargetInvocationException, so both paths have to be handled.
-                var outcome = await ExecAwait.ResolveAsync(result, awaitTimeoutMs);
-
-                if (outcome.Error != null)
-                    return new ErrorResponse($"Runtime error: {outcome.Error.GetType().Name}: {outcome.Error.Message}");
-
-                if (outcome.TimedOut)
-                {
-                    var budget = awaitTimeoutMs <= 0
-                        ? "no timeout is set"
-                        : $"await_timeout of {awaitTimeoutMs}ms is set";
-                    return new ErrorResponse(
-                        $"exec timed out with the returned operation still unfinished (status: {outcome.Status}, " +
-                        $"steps: {outcome.Steps}, {budget}). The operation is still running in the editor and its " +
-                        "result is not observable from this response; a domain reload would also drop it silently. " +
-                        "Raise --await_timeout, or park the result somewhere durable (static field, ScriptableObject) " +
-                        "and read it back with a second exec.",
-                        new
-                        {
-                            timed_out = true,
-                            status = outcome.Status,
-                            steps = outcome.Steps,
-                            await_timeout_ms = awaitTimeoutMs,
-                        });
-                }
-
-                var message = outcome.Steps > 0
-                    ? $"OK (routine completed in {outcome.Steps} steps)"
-                    : "OK";
-                return new SuccessResponse(message, Serialize(outcome.Value, 0));
             }
-            finally
-            {
-                try { File.Delete(srcFile); } catch { }
-                try { File.Delete(outFile); } catch { }
-                try { File.Delete(rspFile); } catch { }
-            }
+
+            pairs.Sort((a, b) => string.CompareOrdinal(a.Name, b.Name));
+            var locations = new List<string>(pairs.Count);
+            for (var i = 0; i < pairs.Count; i++) locations.Add(pairs[i].Location);
+            return locations;
         }
 
-        private static string FindCsc(string cscOverride = null)
+        // The third constructor argument, not the second: `data` stays the tool's result
+        // payload, so a caller parsing it sees the same shape as before the metadata existed.
+        private static object CompileMeta(string state, long compileMs, int referenceCount,
+            string serializationError = null, string stateChange = null)
+        {
+            if (serializationError == null && stateChange == null)
+                return new { compile = state, compile_ms = compileMs, reference_assemblies = referenceCount };
+            return new
+            {
+                compile = state,
+                compile_ms = compileMs,
+                reference_assemblies = referenceCount,
+                serialization_error = serializationError,
+                state_change = stateChange,
+            };
+        }
+
+        private static async Task<object> CompileAndExecute(ExecSource.Generated source,
+            ExecSource.Generated? statementFallback = null, string cscOverride = null,
+            string dotnetOverride = null, int awaitTimeoutMs = ExecAwait.DefaultTimeoutMs)
+        {
+            // Compiler discovery and the reference set read Unity APIs and this domain's
+            // assembly list, so both are taken before anything is awaited.
+            var contentsPath = EditorApplication.applicationContentsPath;
+            var isWindows = Application.platform == RuntimePlatform.WindowsEditor;
+            var references = CollectReferences();
+
+            var resolved = await ResolveCompilerAsync(cscOverride, dotnetOverride, contentsPath, isWindows);
+            if (resolved.Error != null)
+                return new ErrorResponse(resolved.Error)
+                    { meta = CompileMeta("missing_compiler", 0, references.Count) };
+            if (!MainThread.IsCurrent)
+                return new ErrorResponse(ReloadedMessage)
+                    { meta = CompileMeta("interrupted", 0, references.Count) };
+
+            var csc = resolved.Csc;
+            var dotnet = resolved.Dotnet;
+            var key = ExecCompileCache.KeyFor(source.Text, csc, dotnet, references);
+
+            string compileState;
+            long compileMs = 0;
+            MethodInfo method;
+            var sourceName = "";
+
+            if (ExecCompileCache.TryGet(key, out var cached))
+            {
+                method = cached.Method;
+                compileState = "cached";
+            }
+            else
+            {
+                var id = ExecAssemblyPrefix + Guid.NewGuid().ToString("N").Substring(0, 12);
+                var sw = Stopwatch.StartNew();
+                var compiled = await ExecCompiler.CompileAsync(source.Text, references, csc, dotnet, id, CompileTimeoutMs);
+                var generated = source;
+                var snippetName = id;
+                // Only a void call needs the statement fallback: `return (Debug.Log("x"));` cannot
+                // convert void to object, while as a statement it runs and the snippet answers null.
+                // Any other failure would fail in both shapes, so it is reported from the shape the
+                // caller wrote — and a broken expression pays for one compile, not two.
+                if (!compiled.Ok && !compiled.TimedOut && statementFallback is { } statement &&
+                    compiled.Diagnostics != null &&
+                    compiled.Diagnostics.IndexOf("'void'", StringComparison.OrdinalIgnoreCase) >= 0)
+                {
+                    var statementId = ExecAssemblyPrefix + Guid.NewGuid().ToString("N").Substring(0, 12);
+                    var retried = await ExecCompiler.CompileAsync(statement.Text, references, csc, dotnet, statementId,
+                        CompileTimeoutMs);
+                    if (retried.Ok)
+                    {
+                        compiled = retried;
+                        generated = statement;
+                        snippetName = statementId;
+                        key = ExecCompileCache.KeyFor(statement.Text, csc, dotnet, references);
+                    }
+                    else if (retried.TimedOut)
+                    {
+                        compiled = retried;
+                    }
+                }
+                compileMs = sw.ElapsedMilliseconds;
+                sourceName = snippetName;
+
+                if (compiled.TimedOut)
+                    return new ErrorResponse($"Compile timed out after {compileMs}ms.")
+                        { meta = CompileMeta("timeout", compileMs, references.Count) };
+
+                if (!compiled.Ok)
+                    return new ErrorResponse($"Compile error:\n{FormatErrors(compiled.Diagnostics, generated.BodyStartLine)}")
+                        { meta = CompileMeta("failed", compileMs, references.Count) };
+
+                // See ReloadedMessage: the compile finished, but not on the thread that may
+                // load an assembly and run Unity APIs.
+                if (!MainThread.IsCurrent)
+                    return new ErrorResponse(ReloadedMessage)
+                        { meta = CompileMeta("interrupted", compileMs, references.Count) };
+
+                var assembly = Load(compiled);
+                method = assembly.GetType(ExecSource.TypeName)?.GetMethod("Execute");
+                if (method == null)
+                    return new ErrorResponse("Internal error: compiled type or method not found.")
+                        { meta = CompileMeta("compiled", compileMs, references.Count) };
+
+                ExecCompileCache.Put(key, new CompiledSnippet(assembly, method));
+                compileState = "compiled";
+            }
+
+            var playModeBefore = EditorApplication.isPlaying;
+            var playModeChangingBefore = EditorApplication.isPlayingOrWillChangePlaymode;
+            var compilingBefore = EditorApplication.isCompiling;
+            object result;
+            try
+            {
+                result = method.Invoke(null, null);
+            }
+            catch (TargetInvocationException tie)
+            {
+                var inner = tie.InnerException ?? tie;
+                return new ErrorResponse(FormatRuntimeError(inner, sourceName, source.BodyStartLine))
+                    { meta = CompileMeta(compileState, compileMs, references.Count) };
+            }
+
+            // An async body reports its exceptions on the returned Task, not as a
+            // TargetInvocationException, so both paths have to be handled.
+            var outcome = await ExecAwait.ResolveAsync(result, awaitTimeoutMs);
+
+            if (outcome.Error != null)
+                return new ErrorResponse(FormatRuntimeError(outcome.Error, sourceName, source.BodyStartLine))
+                    { meta = CompileMeta(compileState, compileMs, references.Count) };
+
+            if (outcome.TimedOut)
+            {
+                var budget = awaitTimeoutMs <= 0
+                    ? "no timeout is set"
+                    : $"await_timeout of {awaitTimeoutMs}ms is set";
+                return new ErrorResponse(
+                    $"exec timed out with the returned operation still unfinished (status: {outcome.Status}, " +
+                    $"steps: {outcome.Steps}, {budget}). The operation is still running in the editor and its " +
+                    "result is not observable from this response; a domain reload would also drop it silently. " +
+                    "Raise --await_timeout, or park the result somewhere durable (static field, ScriptableObject) " +
+                    "and read it back with a second exec.",
+                    new
+                    {
+                        timed_out = true,
+                        status = outcome.Status,
+                        steps = outcome.Steps,
+                        await_timeout_ms = awaitTimeoutMs,
+                    },
+                    CompileMeta(compileState, compileMs, references.Count));
+            }
+
+            var message = outcome.Steps > 0
+                ? $"OK (routine completed in {outcome.Steps} steps)"
+                : "OK";
+            // A snippet that changed play mode may have reloaded the domain this very response is
+            // being written from, so the answer says what the editor's state moved to. It is reported
+            // in meta rather than guessed at, because the reload may still be a tick away, and it
+            // names the state rather than the snippet because a change made by an asset import or by
+            // the user while the snippet yields is indistinguishable from one the snippet asked for.
+            var stateChange = MainThread.IsCurrent
+                ? PlayModeTransitions.ChangeStartedSince(playModeBefore, playModeChangingBefore, compilingBefore)
+                : null;
+            if (stateChange != null)
+                message += $" (since the snippet started: {stateChange}; the next command may have to wait for the editor)";
+            string serializationError;
+            var data = Serialize(outcome.Value, out serializationError);
+            return new SuccessResponse(message, data,
+                CompileMeta(compileState, compileMs, references.Count, serializationError, stateChange));
+        }
+
+        /// <summary>
+        /// Resolves the compiler to run: the Unity-install walk happens at most once per
+        /// domain and never on the main thread. Only the reads that need the main thread
+        /// (applicationContentsPath, Application.platform) stay there; their values come in.
+        /// </summary>
+        private static async Task<CompilerPaths> ResolveCompilerAsync(string cscOverride, string dotnetOverride,
+            string contentsPath, bool isWindowsEditor)
+        {
+            var memoKey = (cscOverride ?? string.Empty) + "\n" + (dotnetOverride ?? string.Empty);
+            if (s_CompilerMemoKey != memoKey)
+            {
+                s_CscPath = await Task.Run(
+                    () => FindCscFile(cscOverride, contentsPath, isWindowsEditor)).ConfigureAwait(false);
+                s_DotnetPath = s_CscPath != null && s_CscPath.EndsWith(".dll", StringComparison.OrdinalIgnoreCase)
+                    ? await Task.Run(() => FindDotnetFile(dotnetOverride, contentsPath, isWindowsEditor))
+                        .ConfigureAwait(false)
+                    : null;
+                // A missing compiler is not memoized: the lookup can run while the Unity
+                // install is still being populated, and caching that would fail every later
+                // exec until a domain reload.
+                if (s_CscPath != null &&
+                    (!s_CscPath.EndsWith(".dll", StringComparison.OrdinalIgnoreCase) || s_DotnetPath != null))
+                    s_CompilerMemoKey = memoKey;
+            }
+
+            if (s_CscPath == null)
+                return CompilerPaths.Fail(
+                    "Cannot find csc compiler under: " + contentsPath +
+                    "\nSpecify the path manually with --csc <path-to-csc.dll-or-csc.exe>");
+
+            if (s_CscPath.EndsWith(".dll", StringComparison.OrdinalIgnoreCase) && s_DotnetPath == null)
+                return CompilerPaths.Fail(
+                    "Cannot find dotnet runtime under: " + contentsPath +
+                    "\nSpecify the path manually with --dotnet <path>");
+
+            return CompilerPaths.Ok(s_CscPath, s_DotnetPath);
+        }
+
+        readonly struct CompilerPaths
+        {
+            internal readonly string Csc;
+            /// Null when csc is an executable and so needs no host runtime.
+            internal readonly string Dotnet;
+            internal readonly string Error;
+
+            CompilerPaths(string csc, string dotnet, string error)
+            {
+                Csc = csc;
+                Dotnet = dotnet;
+                Error = error;
+            }
+
+            internal static CompilerPaths Ok(string csc, string dotnet) => new CompilerPaths(csc, dotnet, null);
+            internal static CompilerPaths Fail(string error) => new CompilerPaths(null, null, error);
+        }
+
+        private static string FindCscFile(string cscOverride, string contentsPath, bool isWindowsEditor)
         {
             if (!string.IsNullOrEmpty(cscOverride))
                 return cscOverride;
 
-            var content = EditorApplication.applicationContentsPath;
-            var cscDll = SearchFile(content, "csc.dll");
+            var cscDll = SearchFile(contentsPath, "csc.dll");
             if (cscDll != null) return cscDll;
 
-            if (Application.platform == RuntimePlatform.WindowsEditor)
+            if (isWindowsEditor)
             {
-                var cscExe = SearchFile(content, "csc.exe");
+                var cscExe = SearchFile(contentsPath, "csc.exe");
                 if (cscExe != null) return cscExe;
             }
 
             return null;
+        }
+
+        private static string FindDotnetFile(string dotnetOverride, string contentsPath, bool isWindowsEditor)
+        {
+            if (!string.IsNullOrEmpty(dotnetOverride))
+                return dotnetOverride;
+
+            var name = "dotnet" + (isWindowsEditor ? ".exe" : "");
+            var found = SearchFile(contentsPath, name);
+            if (found != null) return found;
+
+            if (!isWindowsEditor)
+            {
+                var macPaths = new[]
+                {
+                    "/usr/local/share/dotnet/dotnet",
+                    "/opt/homebrew/bin/dotnet",
+                    "/usr/local/bin/dotnet",
+                };
+                foreach (var p in macPaths)
+                    if (File.Exists(p)) return p;
+            }
+
+            return name;
         }
 
         private static string SearchFile(string dir, string name)
@@ -300,31 +449,7 @@ namespace UnityCliConnector.Tools
             return null;
         }
 
-        private static string FindDotnet(string dotnetOverride = null)
-        {
-            if (!string.IsNullOrEmpty(dotnetOverride))
-                return dotnetOverride;
-
-            var name = "dotnet" + (Application.platform == RuntimePlatform.WindowsEditor ? ".exe" : "");
-            var found = SearchFile(EditorApplication.applicationContentsPath, name);
-            if (found != null) return found;
-
-            if (Application.platform != RuntimePlatform.WindowsEditor)
-            {
-                var macPaths = new[]
-                {
-                    "/usr/local/share/dotnet/dotnet",
-                    "/opt/homebrew/bin/dotnet",
-                    "/usr/local/bin/dotnet",
-                };
-                foreach (var p in macPaths)
-                    if (File.Exists(p)) return p;
-            }
-
-            return name;
-        }
-
-        private static string FormatErrors(string raw)
+        private static string FormatErrors(string raw, int bodyStartLine = 0)
         {
             var lines = raw.Split('\n');
             var errors = new List<string>();
@@ -332,68 +457,364 @@ namespace UnityCliConnector.Tools
             {
                 var trimmed = line.Trim();
                 if (string.IsNullOrEmpty(trimmed)) continue;
-                var m = Regex.Match(trimmed, @"\((\d+),\d+\):\s*error\s+\w+:\s*(.+)");
+                var m = Regex.Match(trimmed, @"^(.+?)\((\d+),\d+\):\s*error\s+\w+:\s*(.+)");
                 if (m.Success)
-                    errors.Add($"L{m.Groups[1].Value}: {m.Groups[2].Value}");
+                {
+                    var lineNumber = int.Parse(m.Groups[2].Value);
+                    var snippetLine = SnippetLine(m.Groups[1].Value, lineNumber, bodyStartLine);
+                    errors.Add($"L{snippetLine}: {m.Groups[3].Value}");
+                }
                 else if (trimmed.Contains("error"))
                     errors.Add(trimmed);
             }
             return errors.Count > 0 ? string.Join("\n", errors) : raw;
         }
 
-        private static object Serialize(object obj, int depth)
+        /// <summary>
+        /// Maps a compiler line to the line the caller wrote. The generated body carries a
+        /// `#line 1 "exec-snippet"` directive, so a diagnostic in it already says the snippet's line;
+        /// only a diagnostic in the generated prologue (a bad --usings directive, a malformed wrapper)
+        /// still names the temporary file, and it is clamped to the first snippet line.
+        /// </summary>
+        internal static int SnippetLine(string file, int lineNumber, int bodyStartLine)
+        {
+            if (file.IndexOf(ExecSource.Generated.SnippetFileName, StringComparison.Ordinal) >= 0)
+                return lineNumber;
+            if (bodyStartLine <= 0) return lineNumber;
+            return Math.Max(1, lineNumber - bodyStartLine + 1);
+        }
+
+        // A runtime stack is a diagnostic, not a payload: a handful of user frames is enough to see
+        // which snippet line threw, and the entry cap keeps a deep graph from flooding the answer.
+        private const int RuntimeStackFrames = 5;
+        private const int RuntimeStackChars = 1200;
+
+        /// <summary>
+        /// The exception type, message and a short stack, with generated-file frames rewritten to the
+        /// snippet line they came from. Frames inside Unity's engine are collapsed by the same filter
+        /// read_console uses, so what is left is where the caller's code actually threw.
+        /// </summary>
+        internal static string FormatRuntimeError(Exception exception, string snippetName, int bodyStartLine)
+        {
+            var formatted = StackTraceFilter.Format(exception.ToString(), StackTraceFilter.StacktraceMode.User,
+                RuntimeStackFrames, RuntimeStackChars);
+            return "Runtime error: " + RewriteSnippetFrames(formatted.Text, snippetName, bodyStartLine);
+        }
+
+        /// <summary>
+        /// Rewrites `in <temp file>.cs:line N` to `in snippet:line N` using the same mapping as the
+        /// compiler diagnostics. A stack without symbols (no portable PDB) has no line numbers and is
+        /// left as the runtime printed it.
+        /// </summary>
+        internal static string RewriteSnippetFrames(string stack, string snippetName, int bodyStartLine)
+        {
+            if (string.IsNullOrEmpty(stack)) return stack;
+            // The portable PDB attributes frames to the #line document, so a frame reads
+            // `in <temp dir>/exec-snippet:3` and its number is already the snippet's.
+            stack = Regex.Replace(stack,
+                @"in\s+[^\r\n]*?" + Regex.Escape(ExecSource.Generated.SnippetFileName) + @":(?<line>\d+)",
+                match => $"in snippet:line {match.Groups["line"].Value}");
+            return Regex.Replace(stack,
+                @"in\s+(?<file>[^\r\n]*?)\.cs:line (?<line>\d+)",
+                match =>
+                {
+                    var file = match.Groups["file"].Value;
+                    var line = int.Parse(match.Groups["line"].Value);
+                    var mapped = file.IndexOf(ExecSource.Generated.SnippetFileName, StringComparison.Ordinal) >= 0
+                        ? line
+                        : SnippetLine(file + ".cs", line, bodyStartLine);
+                    return $"in snippet:line {mapped}";
+                });
+        }
+
+        /// <summary>
+        /// Loads the compiled snippet. The portable PDB travels with it so a stack trace can name the
+        /// snippet line; runtimes that refuse the symbol store still run the snippet, just without
+        /// line numbers in its frames.
+        /// </summary>
+        private static Assembly Load(ExecCompiler.Result compiled)
+        {
+            if (compiled.Pdb is { Length: > 0 })
+            {
+                try { return Assembly.Load(compiled.Bytes, compiled.Pdb); }
+                catch (Exception e) when (e is ArgumentException || e is BadImageFormatException ||
+                                          e is NotSupportedException || e is IOException)
+                {
+                    // Fall through to a symbol-less load.
+                }
+            }
+            return Assembly.Load(compiled.Bytes);
+        }
+
+        private const int MaxDepth = 6;
+        private const int MaxCollectionItems = 100;
+        private const string TruncatedMarker = "... (truncated at 100)";
+
+        /// <summary>
+        /// Reference equality is the cycle test: value equality would call arbitrary user
+        /// Equals overrides (and Unity's destroyed-object equality) while walking a graph.
+        /// </summary>
+        private sealed class ReferenceComparer : IEqualityComparer<object>
+        {
+            internal static readonly ReferenceComparer Instance = new ReferenceComparer();
+
+            public bool Equals(object x, object y) => ReferenceEquals(x, y);
+            public int GetHashCode(object obj) => RuntimeHelpers.GetHashCode(obj);
+        }
+
+        private sealed class SerializeContext
+        {
+            internal readonly HashSet<object> Path = new HashSet<object>(ReferenceComparer.Instance);
+            /// Set when a value had to be reported as ToString() because it exposed no members.
+            internal string Fallback;
+        }
+
+        internal static object Serialize(object obj)
+        {
+            string ignored;
+            return Serialize(obj, out ignored);
+        }
+
+        internal static object Serialize(object obj, out string serializationError)
+        {
+            return Serialize(obj, 0, out serializationError);
+        }
+
+        private static object Serialize(object obj, int depth, out string serializationError)
+        {
+            serializationError = null;
+            var context = new SerializeContext();
+            try
+            {
+                var value = SerializeValue(obj, depth, context);
+                // The issue's second half: a ToString() fallback must be visible in meta,
+                // not only an exception escaping the walk.
+                serializationError = context.Fallback;
+                return value;
+            }
+            catch (Exception ex)
+            {
+                // Serialization is a reporting convenience; it must never turn a successful
+                // snippet into an error response. Callers still get a readable value and the
+                // reason travels in meta instead of being swallowed.
+                serializationError = ErrorText(ex);
+                return SafeToString(obj);
+            }
+        }
+
+        private static object FallbackToToString(object obj, SerializeContext context)
+        {
+            if (context.Fallback == null)
+                context.Fallback = "no serializable members on " + obj.GetType().FullName +
+                    "; returned ToString()";
+            return SafeToString(obj);
+        }
+
+        private static object SerializeValue(object obj, int depth, SerializeContext context)
         {
             if (obj == null) return null;
-            if (depth > 4) return obj.ToString();
+
             var type = obj.GetType();
             if (type.IsPrimitive || type == typeof(string) || type == typeof(decimal)) return obj;
             if (type.IsEnum) return obj.ToString();
-            if (type.Name.StartsWith("FixedString")) return obj.ToString();
-            // A Task still reachable here was never awaited (nested inside a collection
-            // or a field). Reflecting over it yields AsyncState/Status noise, so name
-            // the state instead.
-            if (obj is Task task)
+            if (type.Name.StartsWith("FixedString", StringComparison.Ordinal)) return obj.ToString();
+            if (obj is DateTime || obj is DateTimeOffset || obj is TimeSpan || obj is Guid)
+                return obj.ToString();
+            if (obj is Type typeValue) return typeValue.FullName ?? typeValue.Name;
+
+            // A Unity object's ToString already carries the useful identity ("Main Camera
+            // (UnityEngine.Camera)"). Dumping its properties would walk the scene graph, and
+            // Transform/GameObject graphs contain cycles.
+            if (obj is UnityEngine.Object) return SafeToString(obj);
+
+            // JToken is IEnumerable<JToken>, so the enumerable branch would emit its
+            // JProperty wrappers as nested arrays and lose the payload. Its ToString is
+            // the JSON text the caller returned.
+            if (obj is JToken) return SafeToString(obj);
+
+            var tracked = !type.IsValueType;
+            if (tracked)
             {
-                if (task.IsCompleted && !task.IsFaulted && !task.IsCanceled)
-                {
-                    var inner = TaskResultOf(task);
-                    return inner == null ? "<completed>" : Serialize(inner, depth + 1);
-                }
-                return $"<task {task.Status}>";
+                if (context.Path.Contains(obj)) return "<cycle: " + type.Name + ">";
+                context.Path.Add(obj);
             }
-            if (obj is IDictionary dict)
+
+            try
             {
-                var r = new Dictionary<string, object>();
-                foreach (DictionaryEntry e in dict)
-                    r[e.Key.ToString()] = Serialize(e.Value, depth + 1);
-                return r;
-            }
-            if (obj is IEnumerable enumerable)
-            {
-                var list = new List<object>();
-                int count = 0;
-                foreach (var item in enumerable)
+                // A Task still reachable here was never awaited (nested inside a collection
+                // or a member). Reflecting over it yields AsyncState/Status noise, so name
+                // the state instead.
+                if (obj is Task task)
                 {
-                    if (count++ >= 100) { list.Add("... (truncated at 100)"); break; }
-                    list.Add(Serialize(item, depth + 1));
-                }
-                return list;
-            }
-            if (type.IsValueType || type.IsClass)
-            {
-                var fields = type.GetFields(BindingFlags.Public | BindingFlags.Instance);
-                if (fields.Length > 0)
-                {
-                    var r = new Dictionary<string, object>();
-                    foreach (var f in fields)
+                    if (task.IsCompleted && !task.IsFaulted && !task.IsCanceled)
                     {
-                        try { r[f.Name] = Serialize(f.GetValue(obj), depth + 1); }
-                        catch { r[f.Name] = "<error>"; }
+                        var inner = TaskResultOf(task);
+                        return inner == null ? "<completed>" : SerializeValue(inner, depth + 1, context);
                     }
-                    return r;
+                    return $"<task {task.Status}>";
+                }
+
+                if (depth >= MaxDepth) return "<truncated at depth " + MaxDepth + ">";
+
+                if (obj is IDictionary dict) return SerializeDictionary(dict, depth, context);
+                if (obj is IEnumerable enumerable) return SerializeEnumerable(enumerable, depth, context);
+
+                var mathMembers = MathMemberNames(type);
+                if (mathMembers != null)
+                    return SerializeMath(obj, type, mathMembers, depth, context);
+
+                if (type.IsValueType || type.IsClass)
+                    return SerializeMembers(obj, type, depth, context);
+
+                return FallbackToToString(obj, context);
+            }
+            finally
+            {
+                if (tracked) context.Path.Remove(obj);
+            }
+        }
+
+        private static object SerializeDictionary(IDictionary dict, int depth, SerializeContext context)
+        {
+            var result = new Dictionary<string, object>();
+            var count = 0;
+            foreach (DictionaryEntry entry in dict)
+            {
+                if (count++ >= MaxCollectionItems)
+                {
+                    result[TruncatedMarker] = TruncatedMarker;
+                    break;
+                }
+
+                var key = entry.Key == null ? "null" : SafeToString(entry.Key);
+                if (key == null) key = "null";
+                try { result[key] = SerializeValue(entry.Value, depth + 1, context); }
+                catch (Exception ex) { result[key] = ErrorText(ex); }
+            }
+            return result;
+        }
+
+        private static object SerializeEnumerable(IEnumerable enumerable, int depth, SerializeContext context)
+        {
+            var result = new List<object>();
+            var count = 0;
+            foreach (var item in enumerable)
+            {
+                if (count++ >= MaxCollectionItems)
+                {
+                    result.Add(TruncatedMarker);
+                    break;
+                }
+
+                try { result.Add(SerializeValue(item, depth + 1, context)); }
+                catch (Exception ex) { result.Add(ErrorText(ex)); }
+            }
+            return result;
+        }
+
+        private static object SerializeMath(object obj, Type type, string[] memberNames, int depth,
+            SerializeContext context)
+        {
+            var result = new Dictionary<string, object>();
+            foreach (var name in memberNames)
+            {
+                var property = type.GetProperty(name, BindingFlags.Public | BindingFlags.Instance);
+                if (property != null && property.CanRead && property.GetIndexParameters().Length == 0)
+                {
+                    try { result[name] = SerializeValue(property.GetValue(obj, null), depth + 1, context); }
+                    catch (Exception ex) { result[name] = ErrorText(ex); }
+                    continue;
+                }
+
+                var field = type.GetField(name, BindingFlags.Public | BindingFlags.Instance);
+                if (field == null) continue;
+                try { result[name] = SerializeValue(field.GetValue(obj), depth + 1, context); }
+                catch (Exception ex) { result[name] = ErrorText(ex); }
+            }
+            return result.Count > 0 ? (object)result : FallbackToToString(obj, context);
+        }
+
+        private static object SerializeMembers(object obj, Type type, int depth, SerializeContext context)
+        {
+            var result = new Dictionary<string, object>();
+            var count = 0;
+            var truncated = false;
+
+            foreach (var property in type.GetProperties(BindingFlags.Public | BindingFlags.Instance))
+            {
+                if (count >= MaxCollectionItems) { truncated = true; break; }
+                if (!property.CanRead || property.GetIndexParameters().Length > 0) continue;
+                var getter = property.GetGetMethod();
+                if (getter == null || getter.IsStatic) continue;
+                if (result.ContainsKey(property.Name)) continue;
+
+                count++;
+                try { result[property.Name] = SerializeValue(property.GetValue(obj, null), depth + 1, context); }
+                catch (Exception ex) { result[property.Name] = ErrorText(ex); }
+            }
+
+            if (!truncated)
+            {
+                foreach (var field in type.GetFields(BindingFlags.Public | BindingFlags.Instance))
+                {
+                    if (count >= MaxCollectionItems) { truncated = true; break; }
+                    if (field.IsStatic || result.ContainsKey(field.Name)) continue;
+
+                    count++;
+                    try { result[field.Name] = SerializeValue(field.GetValue(obj), depth + 1, context); }
+                    catch (Exception ex) { result[field.Name] = ErrorText(ex); }
                 }
             }
-            return obj.ToString();
+
+            if (truncated) result[TruncatedMarker] = TruncatedMarker;
+            return result.Count > 0 ? (object)result : FallbackToToString(obj, context);
+        }
+
+        /// <summary>
+        /// The data members of Unity's math structs. Reflecting over all their properties
+        /// would visit computed ones such as Vector3.normalized, which returns another
+        /// Vector3 and would recurse until the depth cutoff (or forever without one).
+        /// Rect and Bounds expose only properties in this Unity version, so their simple
+        /// extent members are named here rather than recursing into derived ones.
+        /// </summary>
+        private static string[] MathMemberNames(Type type)
+        {
+            if (type == typeof(Vector2)) return new[] { "x", "y" };
+            if (type == typeof(Vector2Int)) return new[] { "x", "y" };
+            if (type == typeof(Vector3)) return new[] { "x", "y", "z" };
+            if (type == typeof(Vector3Int)) return new[] { "x", "y", "z" };
+            if (type == typeof(Vector4)) return new[] { "x", "y", "z", "w" };
+            if (type == typeof(Quaternion)) return new[] { "x", "y", "z", "w" };
+            if (type == typeof(Color)) return new[] { "r", "g", "b", "a" };
+            if (type == typeof(Color32)) return new[] { "r", "g", "b", "a" };
+            if (type == typeof(Rect)) return new[] { "x", "y", "width", "height" };
+            if (type == typeof(RectInt)) return new[] { "x", "y", "width", "height" };
+            if (type == typeof(Bounds)) return new[] { "center", "extents" };
+            if (type == typeof(BoundsInt)) return new[] { "position", "size" };
+            if (type == typeof(Matrix4x4))
+                return new[]
+                {
+                    "m00", "m10", "m20", "m30",
+                    "m01", "m11", "m21", "m31",
+                    "m02", "m12", "m22", "m32",
+                    "m03", "m13", "m23", "m33",
+                };
+            return null;
+        }
+
+        private static string ErrorText(Exception ex)
+        {
+            // Reflection getters wrap the getter's own exception.
+            if (ex is System.Reflection.TargetInvocationException { InnerException: { } inner })
+                ex = inner;
+            return "<error: " + ex.GetType().Name + ": " + ex.Message + ">";
+        }
+
+        private static string SafeToString(object obj)
+        {
+            if (obj == null) return null;
+            try { return obj.ToString(); }
+            catch (Exception ex) { return ErrorText(ex); }
         }
 
         private static object TaskResultOf(Task task)

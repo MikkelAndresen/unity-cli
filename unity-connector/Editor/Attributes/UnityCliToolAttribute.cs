@@ -41,6 +41,11 @@ namespace UnityCliConnector
         public bool Required { get; set; } = false;
         public string DefaultValue { get; set; }
 
+        /// Older spellings of this parameter the handler still reads. They stay out of the schema
+        /// but the router accepts them, so a name advertised by an earlier release keeps working
+        /// instead of being rejected as a typo.
+        public string[] Aliases { get; set; }
+
         public ToolParameterAttribute(string description)
         {
             Description = description;
