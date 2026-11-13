@@ -1231,7 +1231,7 @@ own timing such as `exec`'s `compile_ms` sits inside the handler time, which sit
 | Flag | Description | Default |
 |------|-------------|---------|
 | `--port <N>` | Select Unity instance by active heartbeat port | auto |
-| `--project <path>` | Select Unity instance by project path | latest |
+| `--project <path>` | Select Unity instance by project. A path (absolute, `~/`, `./`) selects the editor whose project is that directory or contains it; a bare name matches a substring of the project path and must fit exactly one editor (a name equal to one project's folder name wins). Falls back to `$UNITY_CLI_PROJECT` when neither `--project` nor `--port` is given | cwd |
 | `--timeout <ms>` | One budget per invocation, shared by discovery, waiting for a fresh heartbeat, and the request. The remaining budget is sent to the Connector as `deadline_ms`, so it answers a queued command before this deadline does — see [Queued Commands and Server-Side Deadlines](#queued-commands-and-server-side-deadlines). A client deadline is reported as `timed out ... (the editor may still be running it)`, not as a connection failure. `test`, `verify` and `editor refresh --compile` default to 1800000 (30 min); an explicit `0` means no deadline (the Connector still answers a queued command after its 60 s default). That is a compatibility break from older releases, where `--timeout 0` made the heartbeat wait fail at once; a script that relied on the old meaning must pass a small positive value. `wait --timeout` and build polling keep their own budgets. For `editor quit`/`restart` it is also the wait-to-exit and startup budget. | 120000 |
 | `--ignore-version-mismatch` | Suppress the version-drift warning (and the refusal for a connector older than 0.7.0) | false |
 | `--meta` | Print the response's `meta` (how the call was served, e.g. `exec`'s compile cache state) to stderr. `compile_ms` is the csc subprocess only; `queue_wait_ms` is the wait before the handler started and `total_ms` the whole editor-side span, which contains both. None is a wall-clock total — see [Queued Commands and Server-Side Deadlines](#queued-commands-and-server-side-deadlines) | false |
@@ -1364,14 +1364,24 @@ When multiple Unity Editors are open, each registers on a different port (8090, 
 ls ~/.unity-cli/instances/
 
 # Select by project path
-unity-cli --project MyGame editor play
+unity-cli --project ~/Work/MyGame editor play
 
 # Select by active heartbeat port
 unity-cli --port 8091 editor play
 
-# Default: uses the most recently registered instance
+# Pin a whole session (e.g. an agent sandbox) to one project
+export UNITY_CLI_PROJECT=~/Work/MyGame
+
+# Default: the editor whose project contains the current directory
 unity-cli editor play
 ```
+
+With no selector, the CLI picks the editor whose project contains the current directory, then the only
+project below it, then the only running editor. When several editors are running and none of those
+rules applies, the command fails and lists each candidate's `--port` and path rather than guessing.
+A path given to `--project` matches by path, so `~/Work/MyGame` never selects `~/Work/MyGame-old`; a
+bare name that fits several projects is an error. Every call made while more than one editor is running
+prints the editor that answered to stderr: `editor: /Users/me/Work/MyGame (port 8092)`.
 
 ## Compared to MCP
 
