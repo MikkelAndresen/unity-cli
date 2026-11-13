@@ -296,7 +296,8 @@ func (g *versionGate) check(inst *client.Instance) error {
 func resolveKeepingEvidence(project string, port int) instanceResolver {
 	return func() (*client.Instance, error) {
 		inst, beat, err := discoverInstanceKeepingEvidence(project, port)
-		if err != nil && beat != nil {
+		var ambiguous *client.AmbiguousInstanceError
+		if err != nil && beat != nil && !errors.As(err, &ambiguous) {
 			return beat, nil
 		}
 		return inst, err

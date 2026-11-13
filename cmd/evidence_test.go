@@ -88,6 +88,23 @@ func TestAnnotateNoEditor_LockfileEvidence(t *testing.T) {
 	}
 }
 
+// An ambiguous lookup is not "no editor": several answer, and evidence read without a target would
+// describe whichever project happens to have the newest lockfile or heartbeat.
+func TestAnnotateNoEditor_AmbiguousLookupPassesThrough(t *testing.T) {
+	isolatedHome(t)
+	dir := openUnityProjectDir(t, 42*time.Second)
+	t.Chdir(dir)
+
+	amb := &client.AmbiguousInstanceError{Candidates: []client.Instance{
+		{ProjectPath: "/work/a", Port: 8090, State: "ready"},
+		{ProjectPath: "/work/b", Port: 8091, State: "ready"},
+	}}
+	err := annotateNoEditor(amb, "", 0)
+	if err != amb {
+		t.Fatalf("got %v, want the ambiguity error unchanged", err)
+	}
+}
+
 func TestAnnotateNoEditor_StaleLockfileIsFlagged(t *testing.T) {
 	isolatedHome(t)
 	dir := openUnityProjectDir(t, 6*time.Hour)

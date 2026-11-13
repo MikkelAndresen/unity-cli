@@ -225,8 +225,9 @@ func FindActiveByPort(port int) (*Instance, error) {
 
 // DiscoverInstance finds a running Unity instance from ~/.unity-cli/instances/.
 // If port > 0, matches an active instance by port.
-// If project is set, matches by project path substring.
-// Otherwise returns the most recently active instance.
+// If project is set, matches it by path (a location) or substring (a fragment); a fragment that fits
+// several projects is an error. Otherwise the cwd decides, and several candidates is an error too:
+// guessing routes commands into another project's editor.
 func DiscoverInstance(project string, port int) (*Instance, error) {
 	if port > 0 {
 		return FindActiveByPort(port)
@@ -237,7 +238,6 @@ func DiscoverInstance(project string, port int) (*Instance, error) {
 		return nil, fmt.Errorf("no Unity instances found.\nIs Unity running with the Connector package?\nExpected: %s", instancesDir())
 	}
 
-	// Filter out stopped instances
 	var alive []Instance
 	for _, inst := range instances {
 		if !isActiveInstance(inst) {
@@ -251,28 +251,9 @@ func DiscoverInstance(project string, port int) (*Instance, error) {
 	}
 
 	if project != "" {
-		best := newestMatching(alive, func(inst Instance) bool {
-			return projectMatches(inst.ProjectPath, project)
-		})
-		if best == nil {
-			return nil, fmt.Errorf("no Unity instance found for project: %s", project)
-		}
-		return best, nil
+		return selectByProject(alive, project)
 	}
-
-	// Try to match by current working directory before falling back to timestamp
-	if cwd, err := os.Getwd(); err == nil {
-		cwdNorm := filepath.ToSlash(cwd)
-		if best := newestMatching(alive, func(inst Instance) bool {
-			projNorm := filepath.ToSlash(inst.ProjectPath)
-			return cwdNorm == projNorm || strings.HasPrefix(cwdNorm, projNorm+"/")
-		}); best != nil {
-			return best, nil
-		}
-	}
-
-	// Return the most recently updated
-	return newestMatching(alive, func(Instance) bool { return true }), nil
+	return selectByWorkingDir(alive)
 }
 
 // DiscoverInstanceKeepingEvidence is DiscoverInstance plus the newest heartbeat read before the

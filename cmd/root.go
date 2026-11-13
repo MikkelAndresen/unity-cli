@@ -48,6 +48,9 @@ func Execute() error {
 		printHelp()
 		return nil
 	}
+	if flagProject == "" && flagPort == 0 {
+		flagProject = os.Getenv(client.ProjectEnvVar)
+	}
 
 	category := cmdArgs[0]
 	subArgs := cmdArgs[1:]
@@ -194,6 +197,9 @@ func Execute() error {
 	}
 	if category != modalCommand && isModal(alive) {
 		return noEditor(modalBlockedError(alive, category, false))
+	}
+	if client.LiveProjectCount() > 1 {
+		fmt.Fprintf(os.Stderr, "editor: %s (port %d)\n", alive.ProjectPath, alive.Port)
 	}
 
 	send := sendWatchingModal(func(command string, params interface{}) (*client.CommandResponse, error) {
@@ -1063,7 +1069,10 @@ Update:
 
 Global Options:
   --port <N>          Select Unity instance by active heartbeat port
-  --project <path>    Select Unity instance by project path
+  --project <path>    Select Unity instance by project. A path (absolute, ~/, ./) selects the
+                      editor whose project is that directory or contains it; a bare name matches
+                      a substring of the project path and must fit exactly one editor.
+                      Defaults to $UNITY_CLI_PROJECT when neither --project nor --port is given.
   --timeout <ms>      One budget per invocation, in ms, shared by discovery, waiting for a fresh
                       heartbeat, and the request (default: 120000). A client deadline says
                       "timed out ... (the editor may still be running it)", not "cannot connect".
@@ -1088,7 +1097,9 @@ Use "unity-cli <command> --help" for more information about a command.
 
 Notes:
   - Unity must be open with the Connector package installed
-  - Multiple Unity instances: use --port or --project to select
+  - Multiple Unity instances: with no --port/--project, the editor whose project contains the
+    current directory answers; when none does and several are running, the command fails with the
+    candidates instead of guessing. The answering editor is printed to stderr ("editor: <path> (port N)").
   - Custom tools: any [UnityCliTool] class is auto-discovered
   - A subcommand flag other than --params may be given once; repeating it is an error, not a silent overwrite
   - A subcommand flag must be one the command takes; an unknown flag is an error (exit 1) instead of

@@ -48,7 +48,8 @@ func annotateNoEditorWith(beat *client.Instance, err error, project string, port
 		return nil
 	}
 	var already *crashError
-	if errors.As(err, &already) {
+	var ambiguous *client.AmbiguousInstanceError
+	if errors.As(err, &already) || errors.As(err, &ambiguous) {
 		return err
 	}
 	if beat != nil {

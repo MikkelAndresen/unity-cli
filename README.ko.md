@@ -989,7 +989,7 @@ unity-cli exec --params '{"code":"AssetDatabase.Refresh(); return 1;","queue_dea
 | 플래그 | 설명 | 기본값 |
 |--------|------|--------|
 | `--port <N>` | 활성 heartbeat 포트로 Unity 인스턴스 선택 | auto |
-| `--project <path>` | 프로젝트 경로로 Unity 인스턴스 선택 | latest |
+| `--project <path>` | 프로젝트로 Unity 인스턴스 선택. 경로(절대 경로, `~/`, `./`)는 그 디렉터리이거나 그 디렉터리를 포함하는 프로젝트의 에디터를 고르고, 이름만 주면 프로젝트 경로의 부분 문자열로 매칭하되 에디터 하나에만 맞아야 합니다(한 프로젝트의 폴더 이름과 같으면 그 프로젝트). `--project`와 `--port`가 모두 없으면 `$UNITY_CLI_PROJECT`를 씁니다 | cwd |
 | `--timeout <ms>` | 호출당 하나의 예산으로, 인스턴스 탐색, 새 heartbeat 대기, 요청이 함께 씁니다. 남은 예산은 `deadline_ms`로 커넥터에 전달되므로, 커넥터가 이 deadline보다 먼저 큐에 걸린 명령에 답합니다 — [큐에 걸린 명령과 서버 측 deadline](#큐에-걸린-명령과-서버-측-deadline) 참고. 클라이언트 deadline은 연결 실패가 아니라 `timed out ... (the editor may still be running it)`으로 보고됩니다. `test`, `verify`, `editor refresh --compile`은 1800000(30분)이 기본이고, 명시적 `0`은 deadline 없음을 뜻합니다(그래도 커넥터는 큐에 걸린 명령에 60초 기본값 뒤 답합니다). 이는 이전 릴리스와의 호환성 변경입니다: 예전에는 `--timeout 0`이면 heartbeat 대기가 즉시 실패했으므로, 그 의미에 의존하던 스크립트는 작은 양수를 넘겨야 합니다. `wait --timeout`과 build 폴링은 각자의 예산을 유지합니다. `editor quit`/`restart`에서는 종료 대기와 시작 예산이기도 합니다. | 120000 |
 | `--ignore-version-mismatch` | 버전 불일치 경고(및 0.7.0보다 오래된 커넥터에 대한 거부)를 숨김 | false |
 | `--meta` | 응답의 `meta`(호출이 어떻게 처리됐는지, 예: `exec`의 컴파일 캐시 상태)를 stderr로 출력. `compile_ms`는 csc subprocess만의 시간이고, `queue_wait_ms`는 핸들러가 시작되기 전까지의 대기, `total_ms`는 그 둘을 모두 포함하는 에디터 측 전체 구간입니다. 어느 것도 wall-clock 총합이 아닙니다 | false |
@@ -1111,14 +1111,23 @@ unity-cli spawn --params '{"x":1,"y":0,"z":5,"prefab":"Goblin"}'
 ls ~/.unity-cli/instances/
 
 # 프로젝트 경로로 선택
-unity-cli --project MyGame editor play
+unity-cli --project ~/Work/MyGame editor play
 
 # 활성 heartbeat 포트로 선택
 unity-cli --port 8091 editor play
 
-# 기본: 가장 최근 등록된 인스턴스 사용
+# 세션 전체(예: 에이전트 샌드박스)를 한 프로젝트에 고정
+export UNITY_CLI_PROJECT=~/Work/MyGame
+
+# 기본: 현재 디렉터리를 포함하는 프로젝트의 에디터
 unity-cli editor play
 ```
+
+선택자가 없으면 CLI는 현재 디렉터리를 포함하는 프로젝트의 에디터, 그다음 현재 디렉터리 아래의 유일한 프로젝트,
+그다음 실행 중인 유일한 에디터를 고릅니다. 에디터가 여러 개 실행 중이고 어느 규칙도 맞지 않으면 추측하지 않고
+실패하며 각 후보의 `--port`와 경로를 보여 줍니다. `--project`에 준 경로는 경로로 매칭하므로 `~/Work/MyGame`이
+`~/Work/MyGame-old`를 고르는 일은 없고, 여러 프로젝트에 맞는 이름은 에러입니다. 에디터가 둘 이상 실행 중이면
+모든 호출이 응답한 에디터를 stderr에 출력합니다: `editor: /Users/me/Work/MyGame (port 8092)`.
 
 ## MCP와 비교
 

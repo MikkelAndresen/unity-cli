@@ -291,10 +291,6 @@ func ReconnectInstance(old *Instance) *Instance {
 	})
 }
 
-func projectMatches(projectPath, needle string) bool {
-	return strings.Contains(filepath.ToSlash(projectPath), filepath.ToSlash(needle))
-}
-
 // sameProject compares two heartbeat project paths for identity. projectMatches answers the
 // --project substring question; reusing it here would let "/work/Game2" pass as "/work/Game"
 // and send a retry into a different editor.
