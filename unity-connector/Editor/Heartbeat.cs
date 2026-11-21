@@ -22,7 +22,7 @@ namespace UnityCliConnector
         // it for longer than the CLI's silence threshold). Disposed by the first Tick.
         static Timer s_StartupBeater;
         const double INTERVAL = 0.5;
-        const string CONNECTOR_VERSION = "0.7.0";
+        const string CONNECTOR_VERSION = "0.9.2";
         // A requested compile that never starts must not keep the state "compiling" forever; the
         // CLI's nothing_to_compile grace is shorter than this, so an expiry only bounds a rare
         // queued-behind-import case, it is not the normal path.
